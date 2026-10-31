@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Notion 工具",
+    "description": "基于官方 ntn CLI 的四个 Notion 工具（搜索、读取、写页面、查询数据库）。"
+  }
+}

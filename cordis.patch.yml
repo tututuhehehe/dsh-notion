@@ -1,0 +1,13 @@
+# dsh-notion bundle: registers the four notion_* tools on the DeepSeek Harness Host.
+#
+# Token (never stored here):
+#   - NOTION_API_TOKEN environment variable, or
+#   - ./notion-token next to this plugin, or
+#   - `ntn login` credentials.
+# See README for all options.
+- insert:
+    - id: notion-tools
+      name: dsh-notion
+      config:
+        tokenFile: notion-token
+        timeoutMs: 60000

@@ -1,0 +1,4 @@
+node_modules/
+notion-token
+.DS_Store
+*.log
