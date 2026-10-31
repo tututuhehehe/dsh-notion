@@ -2611,19 +2611,8 @@ function normalizeQuery(query) {
   return value;
 }
 function normalizeLimit(limit) {
-  if (limit === void 0) return DEFAULT_LIMIT;
-  if (typeof limit !== "number" || !Number.isFinite(limit)) {
-    throw inputError(
-      `notion_search limit must be a positive integer (got ${String(limit)}). Default ${DEFAULT_LIMIT}, max ${MAX_LIMIT}.`
-    );
-  }
-  const value = Math.trunc(limit);
-  if (value <= 0) {
-    throw inputError(
-      `notion_search limit must be >= 1 (got ${limit}). Default ${DEFAULT_LIMIT}, max ${MAX_LIMIT}.`
-    );
-  }
-  return Math.min(value, MAX_LIMIT);
+  if (limit === void 0 || limit === null) return DEFAULT_LIMIT;
+  return readInteger(limit, `notion_search limit (default ${DEFAULT_LIMIT}, max ${MAX_LIMIT})`, 1, MAX_LIMIT);
 }
 function buildSearchBody(params) {
   const body = { query: params.query, page_size: params.limit };

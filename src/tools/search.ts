@@ -11,7 +11,16 @@
  *   data_source，所以只在**发请求时**翻译（`value: "data_source"`），返回里再翻回 `database`。
  * - 依赖注入 runner：单测拿假 runner 顶替 runNtn，不需要 PATH 上的 ntn、不需要真 Notion 账号。
  */
-import { abortError, bindSignal, codedError, defineNotionTool, inputError, textBlocks, TOOL_TIMEOUTS } from "../dsh/tool.ts";
+import {
+  abortError,
+  bindSignal,
+  codedError,
+  defineNotionTool,
+  inputError,
+  readInteger,
+  textBlocks,
+  TOOL_TIMEOUTS,
+} from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
 import { parseJsonStdout, runNtn } from "../lib/runNtn.ts";
 import type { RunNtnOptions, RunNtnResult } from "../lib/runNtn.ts";
@@ -85,20 +94,12 @@ export function normalizeQuery(query: unknown): string {
 }
 
 /** limit：缺省 10，`<= 0` 直接拒绝，超过 25 夹到 25（不静默放大到 Notion 的 100） */
-export function normalizeLimit(limit: number | undefined): number {
-  if (limit === undefined) return DEFAULT_LIMIT;
-  if (typeof limit !== "number" || !Number.isFinite(limit)) {
-    throw inputError(
-      `notion_search limit must be a positive integer (got ${String(limit)}). Default ${DEFAULT_LIMIT}, max ${MAX_LIMIT}.`
-    );
-  }
-  const value = Math.trunc(limit);
-  if (value <= 0) {
-    throw inputError(
-      `notion_search limit must be >= 1 (got ${limit}). Default ${DEFAULT_LIMIT}, max ${MAX_LIMIT}.`
-    );
-  }
-  return Math.min(value, MAX_LIMIT);
+export function normalizeLimit(limit: unknown): number {
+  if (limit === undefined || limit === null) return DEFAULT_LIMIT;
+  // Same tolerance as notion_query: a numeric string or a fraction is a phrasing
+  // difference, not a mistake, so it is read and truncated rather than rejected.
+  // Only a size no caller means (`<= 0`, non-numeric) is an error.
+  return readInteger(limit, `notion_search limit (default ${DEFAULT_LIMIT}, max ${MAX_LIMIT})`, 1, MAX_LIMIT);
 }
 
 /**

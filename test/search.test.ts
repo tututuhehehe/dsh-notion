@@ -94,13 +94,20 @@ describe("normalizeLimit", () => {
     assert.equal(normalizeLimit(26), MAX_LIMIT);
     assert.equal(normalizeLimit(1000), MAX_LIMIT);
   });
-  it("rejects <= 0 and non-numbers", () => {
+  it("rejects <= 0 and non-numeric values", () => {
     assert.throws(() => normalizeLimit(0), /must be >= 1/);
     assert.throws(() => normalizeLimit(-2), /must be >= 1/);
-    assert.throws(() => normalizeLimit(Number.NaN), /positive integer/);
+    assert.throws(() => normalizeLimit("abc"), /must be an integer/);
+    assert.throws(() => normalizeLimit(Number.NaN), /must be an integer/);
   });
   it("truncates fractions instead of sending them to Notion", () => {
     assert.equal(normalizeLimit(2.9), 2);
+  });
+  it("accepts a numeric string, like notion_query does", () => {
+    assert.equal(normalizeLimit("7"), 7);
+  });
+  it("clamps above the documented maximum", () => {
+    assert.equal(normalizeLimit(999), MAX_LIMIT);
   });
 });
 
@@ -344,7 +351,7 @@ describe("createNotionSearchTool", () => {
     const tool = mountWith(runnerReturning("{}", calls));
     const result = await tool.execute("call-3", { query: "notion", limit: 0 });
     assert.equal(result.isError, true);
-    assert.match(text(result), /limit must be >= 1/);
+    assert.match(text(result), /must be >= 1/);
     assert.equal(calls.length, 0);
   });
 });
