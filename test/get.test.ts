@@ -353,6 +353,60 @@ describe("notion_get: pages", () => {
   });
 });
 
+describe("notion_get: three-level fallback", () => {
+  const DS_ID = "716f546f-1824-45f0-b73a-481bf8b5f5db";
+
+  it("reads a data source id directly when it is neither a page nor a database", async () => {
+    // This is the level the fallback exists for: a data source id is a plain UUID,
+    // so pages get and datasources resolve both reject it while the schema is one
+    // call away.
+    const calls: string[][] = [];
+    const { run } = mockNtn((args) => {
+      if (args[0] === "pages") return notFound("page");
+      if (args[0] === "datasources") return notFound("database");
+      if (args[0] === "api" && args[1] === `v1/data_sources/${DS_ID}`) {
+        return ok(DS_1_SCHEMA_JSON);
+      }
+      throw new Error(`unexpected ntn args: ${args.join(" ")}`);
+    });
+    const traced = (options: Parameters<typeof run>[0]) => {
+      calls.push(options.args);
+      return run(options);
+    };
+
+    const result = await executeNotionGet({ id_or_url: DS_ID }, traced);
+    assert.deepEqual(calls.map((args) => args[0]), ["pages", "datasources", "api"]);
+    assert.equal(result.type, "database");
+    // Shaped like a single-data-source database, so callers see one schema contract.
+    assert.deepEqual(result.data_source_ids, [DS_ID]);
+    assert.equal(result.properties.length > 0, true);
+  });
+
+  it("does not run the data source probe when the database level succeeds", async () => {
+    const calls: string[][] = [];
+    const scripted: Record<string, RunNtnResult> = {};
+    const { run } = mockNtn((args) => {
+      if (args[0] === "pages") return notFound("page");
+      if (args[0] === "datasources" && args[1] === "resolve") return ok(RESOLVE_JSON);
+      if (args[0] === "api" && args[1] === `v1/databases/${DB_ID}`) return ok(DB_META_JSON);
+      if (args[0] === "api" && args[1]?.startsWith("v1/data_sources/")) return ok(DS_1_SCHEMA_JSON);
+      throw new Error(`unexpected ntn args: ${args.join(" ")}`);
+    });
+    const traced = (options: Parameters<typeof run>[0]) => {
+      calls.push(options.args);
+      return run(options);
+    };
+    void scripted;
+    await executeNotionGet({ id_or_url: DB_ID }, traced);
+    // The database path must not pay for the extra probe.
+    assert.equal(
+      calls.some((args) => args[0] === "pages" && args[1]?.includes("/children")),
+      false
+    );
+    assert.equal(calls.filter((args) => args[0] === "datasources").length, 1);
+  });
+});
+
 describe("notion_get: databases", () => {
   function databaseScript(options?: { failSchemaFor?: string }): (args: string[]) => RunNtnResult {
     return (args) => {

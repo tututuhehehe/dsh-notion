@@ -1231,7 +1231,6 @@ describe("notion_page create atomicity", () => {
     assert.equal(result.isError, true);
     assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
     assert.match(result.content[0].text, /parent not found/);
-    assert.equal(THIRD_ROW_ID.length, 36);
   });
 });
 
@@ -1593,7 +1592,11 @@ describe("notion_page trash target classification", () => {
     });
 
     assert.equal(result.isError, true);
-    assert.equal(result.details.code === undefined || true, true);
+    // This path rethrows the ntn failure, so the code is NTN_FAILED and the message
+    // carries exactly one prefix (a nested [INVALID_INPUT] would mean the auth failure
+    // was rewritten as the caller's mistake).
+    assert.match(result.content[0].text, /^Error: \[NTN_FAILED\] /);
+    assert.equal((result.content[0].text.match(/\[[A-Z_]+\]/g) ?? []).length, 1);
     assert.match(result.content[0].text, /invalid API token/);
     // Only the first probe ran; no fallthrough to database/data-source, no trash.
     assert.equal(calls.filter((args) => args[0] === "api").length, 1);
@@ -1719,7 +1722,17 @@ describe("notion_page trash guards", () => {
     assert.deepEqual(refused.details.children, [childA, childB]);
     assert.equal(trashed, false);
 
-    // Consent still requires yes:true; recursive alone is not consent to skip it.
+    // `recursive` widens what may be deleted; it is not consent to delete. Without
+    // `yes:true` the call must still be refused before touching ntn.
+    const recursiveOnly = await tool.execute("call-child-0", {
+      action: "trash",
+      id: EDIT_PAGE_ID,
+      recursive: true,
+    });
+    assert.equal(recursiveOnly.isError, true);
+    assert.match(recursiveOnly.content[0].text, /yes/);
+    assert.equal(trashed, false);
+
     const withRecursive = await tool.execute("call-child-2", {
       action: "trash",
       id: EDIT_PAGE_ID,

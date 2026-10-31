@@ -103,3 +103,92 @@ describe("output values satisfy their declared schema", () => {
     assert.doesNotThrow(() => assertOutput(tool, value));
   });
 });
+
+describe("argument guards: no internal TypeError may reach the model", () => {
+  // The DSH registry does not validate arguments against `parameters`, so a missing or
+  // mistyped value would otherwise surface as "Cannot read properties of undefined" —
+  // an implementation detail with nothing the caller can act on.
+  const cases: { tool: string; factory: () => ReturnType<typeof createNotionGetTool>; args: Record<string, unknown> }[] = [];
+
+  it("notion_get without id_or_url", async () => {
+    const result = await mount(createNotionGetTool(inertRun)).execute("c1", {});
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+    assert.doesNotMatch(result.content[0].text, /Cannot read|is not a function/);
+  });
+
+  it("notion_get with a non-string id", async () => {
+    const result = await mount(createNotionGetTool(inertRun)).execute("c2", { id_or_url: 123 });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+  });
+
+  it("notion_query with a numeric data source", async () => {
+    const result = await mount(createNotionQueryTool({ runNtn: inertRun })).execute("c3", {
+      database_or_data_source: 5,
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+  });
+
+  it("notion_query with a non-string sort entry", async () => {
+    const result = await mount(createNotionQueryTool({ runNtn: inertRun })).execute("c4", {
+      database_or_data_source: "ds-1",
+      sort: 5,
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+    assert.doesNotMatch(result.content[0].text, /is not a function/);
+  });
+
+  it("notion_search with a non-string query", async () => {
+    const result = await mount(createNotionSearchTool({ run: inertRun })).execute("c5", {
+      query: null,
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+  });
+
+  it("notion_page without an action", async () => {
+    const result = await mount(createNotionPageTool({ runNtn: inertRun })).execute("c6", {});
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+  });
+
+  it("notion_page with a non-boolean yes", async () => {
+    const result = await mount(createNotionPageTool({ runNtn: inertRun })).execute("c7", {
+      action: "trash",
+      id: "11111111-1111-4111-8111-111111111111",
+      yes: "maybe",
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+  });
+
+  it("accepts the documented boolean spellings for yes", async () => {
+    // "true"/"yes"/1 must all count as consent; only a genuinely false value stops.
+    for (const yes of [true, "true", "yes", 1, "1", "YES"]) {
+      const seen: string[][] = [];
+      const tool = createNotionPageTool({
+        runNtn: async (options) => {
+          seen.push(options.args);
+          if (options.args[0] === "api" && options.args[1]?.startsWith("v1/pages/")) {
+            return { ok: true, stdout: JSON.stringify({ archived: false }), stderr: "", code: 0 };
+          }
+          if (options.args[0] === "api" && options.args[1]?.includes("/children")) {
+            return { ok: true, stdout: JSON.stringify({ results: [], has_more: false }), stderr: "", code: 0 };
+          }
+          return { ok: true, stdout: "{}", stderr: "", code: 0 };
+        },
+      });
+      const result = await mount(tool).execute("c8", {
+        action: "trash",
+        id: "11111111-1111-4111-8111-111111111111",
+        yes,
+      });
+      assert.equal(result.isError, false, `yes=${JSON.stringify(yes)}: ${result.content[0].text}`);
+    }
+  });
+
+  void cases;
+});

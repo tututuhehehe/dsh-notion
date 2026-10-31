@@ -8,7 +8,7 @@
 
 ## 为什么是 4 个工具，而不是 67 个
 
-Notion 官方 MCP 暴露约 **67 个工具**，其中大量能力重叠、命名分散。工具越多，模型每轮吃的 schema 越多、选错工具的概率越高，实际干活反而更慢。
+Notion 官方 MCP 暴露**数十个**工具（数量随版本变动，60+），其中大量能力重叠、命名分散。工具越多，模型每轮吃的 schema 越多、选错工具的概率越高，实际干活反而更慢。
 
 dsh-notion 的做法是**收敛工具面**：
 
@@ -124,7 +124,7 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
 { "action": "trash", "id": "<page-id>", "yes": true }
 ```
 
-`props` 是**属性名 → 值**的对象 map，按列类型自动转换（title/rich_text、number、select/status、multi_select、date、checkbox、url/email/phone、people/relation）。非列名的保留键有两个：
+`props` 是**属性名 → 值**的对象 map，按列类型自动转换（title/rich_text、number、select/status、multi_select、date、checkbox、url/email/phone、people/relation）。失败时分两种：**未知列名 / 只读列 / 保留键冲突**会返回可写列清单（写进消息文本）；**值类型不符**只指出属性名与期望类型，不列清单。非列名的保留键有两个：
 
 | 保留键 | 含义 | 取值 |
 | --- | --- | --- |
@@ -152,7 +152,7 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
 | 情况 | 行为 |
 | --- | --- |
 | 目标是 **database / data source** | **直接拒绝**，即使 `yes: true`。删除数据库会连带它的数据源和全部行，破坏性远超删页面，所以交给用户手动确认。 |
-| 目标**已在回收站/已归档** | 返回**成功**（`already_linked: true`），不报错。`ntn` 对已归档对象会返回 `400 Can't edit block that is archived`，那看起来像故障并诱导重试，而删除本来就应当幂等。 |
+| 目标**已在回收站/已归档** | 返回**成功**（`already_archived: true`，且 `changed: []`），不报错。`ntn` 对已归档对象会返回 `400 Can't edit block that is archived`，那看起来像故障并诱导重试，而删除本来就应当幂等。**注意：什么都没写，所以 `changed` 为空**，不要把 `changed` 非空当成已执行删除。 |
 | 目标页面**有子页面** | **默认拒绝**，返回子页面 id 列表，提示需要 `recursive: true`。Notion 归档父页面会连带归档整棵子树，调用方必须先看到还会删掉什么。 |
 | 目标页面**无子页面** | 正常删除。 |
 
@@ -184,7 +184,7 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
 
 **不做的事**：拼写错误不做模糊匹配（`trsh` 不会被猜成 `trash`）。猜错可能执行成另一个真实存在的写操作，风险大于收益。
 
-**id 类型不需要记**：`notion_get` 按 page → database → data source 三级回退，`notion_query` 对 database id 自动 resolve；所以 `notion_search` 返回的任何 id 都能直接喂给任一工具。
+**id 类型基本不用记**：`notion_get` 按 page → database → data source 三级回退，`notion_query` 对 database id 自动 resolve，所以 `notion_search` 返回的 id 可以直接给这两个工具。但 `notion_page` 只接受**页面** id（或数据库行 id）：拿 database/data source id 去 edit 会失败，要把容器写成 `database:<id>` / `data-source:<id>` 传给 `parent`。
 
 ## 设计取舍
 
@@ -207,9 +207,11 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
 }
 ```
 
-因此模型的全部认知只来自 **description + 参数描述**——DSH 没有独立的 prompt/guideline 通道。插件把使用规则（保留键、必填项、回滚语义、分页方式）写在这两处，而不是散落在别处；错误信息里的 `hint_properties` 是纠正错误的第三条通道。
+因此模型的全部认知只来自 **description + 参数描述**——**单个工具定义**没有独立的 prompt/guideline 字段（pi 的 `promptSnippet`/`promptGuidelines` 在这套接口里不存在）。DSH 另有 `ctx.systemPrompt.section()` 可以在系统提示里加段落，本插件故意不用：4 个工具的规则放在各自的 description 里更贴近使用现场。插件把使用规则（保留键、必填项、回滚语义、分页方式）写在这两处，而不是散落在别处。
 
 `execute` 返回的是领域值（如 `{ ok, action, id, url, parent, properties, changed }`），文本由 `output.render` 派生，因此同一个定义在原生 function calling 和 PTC（`run_code`）两种呈现方式下都成立。
+
+**注意 `details` 不会到模型**：DSH 只把抛出的 `message` 渲染成 `Error: <message>`，错误对象上的 `.details`（含 `hint_properties`）仅用于测试和日志。所以可写列清单是被**写进消息文本**的，不是靠 `details` 传递。
 
 ### 错误码
 
@@ -219,7 +221,7 @@ DSH 把抛出的错误渲染成 `Error: <message>`，只对它自己的 `Harness
 | --- | --- | --- |
 | `[INVALID_INPUT]` | 参数不可用（未知列名、只读列、保留键冲突、id 非法…） | 读消息里的可写列清单，改参数重试 |
 | `[NTN_FAILED]` | `ntn` 本身失败（未登录、无效 token、Notion API 报错、exit ≠ 0） | 检查 token / workspace / 权限，或原样上报 |
-| `[ABORTED]` | 调用被取消或超时，子进程已被杀掉 | 通常无需重试，或换更小的查询 |
+| `[ABORTED]` | 调用**被取消**（子进程已被 SIGTERM）。注意：DSH 层超时不走这个码——`dsh-tool-call-timeout-policy` 会报 `TOOL_TIMEOUT`；`ntn` 自己的进程超时归入 `[NTN_FAILED]` | 通常无需重试，或换更小的查询 |
 | `[PARTIAL_WRITE]` | 后续写入失败且回滚也失败，工作区留下了半成品 | 用消息中给出的 id 手动 `trash` 或 `edit` 清理 |
 
 成功回滚的 create 不报 `[PARTIAL_WRITE]`，而是保留真正失败的那个类别（`[NTN_FAILED]` / `[INVALID_INPUT]`），并附带 `partial: false`。
@@ -260,7 +262,7 @@ MIT
 
 **Four consolidated Notion tools for DeepSeek Harness**, built on Notion's official `ntn` CLI instead of the official Notion MCP server.
 
-The official Notion MCP ships ~67 overlapping tools. This plugin keeps the high-frequency surface to four tools — **search, get, page, query** — so the model carries less schema, picks the right call more reliably, and still covers everyday page/database work. Writes are safe by construction: property values are validated against the data-source schema, a failed post-create PATCH trashes the new page, and `attach` refuses cycles and silent parent overwrites.
+The official Notion MCP ships dozens of overlapping tools. This plugin keeps the high-frequency surface to four tools — **search, get, page, query** — so the model carries less schema, picks the right call more reliably, and still covers everyday page/database work. Writes are safe by construction: property values are validated against the data-source schema, a failed post-create PATCH trashes the new page, and `attach` refuses cycles and silent parent overwrites.
 
 ### Install
 
@@ -301,7 +303,7 @@ DSH renders a thrown error as `Error: <message>` and keeps a structured `{ name,
 `notion_page action="trash"` classifies its target before calling `ntn pages trash`:
 
 - **A database or data source is refused outright**, even with `yes: true` — removing one destroys its data sources and every row, which stays a human decision.
-- **An already-archived target reports success** (`already_linked: true`) instead of surfacing Notion's `400 Can't edit block that is archived`, so a retry is harmless.
+- **An already-archived target reports success** (`already_archived: true`, `changed: []`) instead of surfacing Notion's `400 Can't edit block that is archived`, so a retry is harmless. Nothing is written, so `changed` stays empty.
 - **A page with child pages is refused** with the child ids unless `recursive: true` is also passed, because Notion archives the whole subtree. `yes` and `recursive` are separate consents. The child list is read from `GET v1/blocks/{id}/children` following `next_cursor` to the end: that endpoint pages over **blocks**, so one page of 100 blocks can hide child pages behind paragraphs, and a truncated read would under-report the subtree. The page cap is a runaway guard only, and reaching it refuses the delete rather than guessing.
 
 ### Tolerant arguments
