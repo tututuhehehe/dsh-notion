@@ -16,7 +16,17 @@
  * `ntn pages get`; only non-recoverable errors (auth/config, timeouts, 5xx/429) skip the fallback.
  */
 
-import { abortError, bindSignal, codedError, defineNotionTool, textBlocks, TOOL_TIMEOUTS } from "../dsh/tool.ts";
+import {
+  abortError,
+  bindSignal,
+  codedError,
+  defineNotionTool,
+  inputError,
+  readEnum,
+  readString,
+  textBlocks,
+  TOOL_TIMEOUTS,
+} from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
 import { extractNotionId } from "../lib/ids.ts";
 import {
@@ -210,41 +220,115 @@ export async function executeNotionGet(
   params: NotionGetParams,
   run: NtnRunner = runNtn
 ): Promise<NotionGetResult> {
-  const format = params.format ?? "md";
-  if (format !== "md" && format !== "json") {
-    throw new Error(`Unsupported format "${String(format)}". Use "md" (default) or "json".`);
-  }
+  // Guard the arguments here rather than trusting the schema: the DSH registry
+  // does not validate tool arguments, and an unguarded `undefined` would surface
+  // as "Cannot read properties of undefined" instead of a fixable message.
+  const raw = readString((params as { id_or_url?: unknown }).id_or_url, "id_or_url");
+  const format =
+    params.format === undefined
+      ? "md"
+      : readEnum(params.format, "format", [
+          { value: "md" as const, aliases: ["markdown", "text", "md"] },
+          { value: "json" as const, aliases: ["json"] },
+        ]);
 
-  const id = extractNotionId(params.id_or_url);
+  const id = extractNotionId(raw);
   if (!id) {
-    throw new Error(
-      `Could not find a Notion ID in "${params.id_or_url}". Pass a 32-character id ` +
-        `(with or without dashes) or a notion.so / app.notion.com URL.`
+    throw inputError(
+      `Could not find a Notion ID in "${raw}". Pass a 32-character id ` +
+        `(with or without dashes) or a notion.so / app.notion.com URL.`,
+      { id_or_url: raw }
     );
   }
 
+  // Three levels, because a Notion id carries no type information: page, data
+  // source and database ids are all plain UUIDs. A caller holding ids from
+  // notion_search should not have to know which kind it received.
   const page = await runPage(id, format, run);
   if (page.ok) return page.value;
 
-  const pageError = errorSummary(page.res);
   if (isFatalCliError(page.res)) throw new Error(fatalCliMessage(page.res));
-  if (!shouldTryDatabase(page.res)) {
-    throw new Error(`Could not read page ${id}: ${pageError}`);
+
+  const pageError = errorSummary(page.res);
+  if (shouldTryDatabase(page.res)) {
+    // A database id resolves through `datasources resolve`; try it before the
+    // data source probe so the common database read keeps its call count. A data
+    // source id fails resolve (ntn suggests querying it directly) and lands on the
+    // probe, which costs one extra request only for that id kind.
+    const database = await runDatabase(id, run);
+    if (database.ok) return database.value;
+
+    if (isFatalCliError(database.res)) throw new Error(fatalCliMessage(database.res));
+
+    const databaseError = errorSummary(database.res);
+    const dataSource = await runDataSourceSchema(id, run);
+    if (dataSource.ok) return dataSource.value;
+
+    // Report what ntn actually said. Its own hint names the fix (for example
+    // "pass the ID of the database itself"), which our paraphrase would lose.
+    throw new Error(
+      `Could not read ${id} as a page, database or data source.\n` +
+        `- ntn pages get: ${pageError}\n` +
+        `- ntn datasources resolve: ${databaseError}\n` +
+        `- ntn api v1/data_sources: ${dataSource.excerpt}\n` +
+        `Make sure the target is shared with the Notion integration ` +
+        `(in Notion: ••• → Connections).`
+    );
   }
 
-  const database = await runDatabase(id, run);
-  if (database.ok) return database.value;
+  throw new Error(`Could not read page ${id}: ${pageError}`);
+}
 
-  const databaseError = errorSummary(database.res);
-  if (isFatalCliError(database.res)) throw new Error(fatalCliMessage(database.res));
+/**
+ * Read one data source's schema directly (`GET v1/data_sources/{id}`).
+ *
+ * This is the level notion_get used to miss: a data source id is neither a page
+ * nor a database id, so both existing branches rejected it even though the schema
+ * is one API call away. The result is shaped like a single-data-source database,
+ * so callers see one schema contract regardless of which id kind they hold.
+ */
+async function runDataSourceSchema(
+  id: string,
+  run: NtnRunner
+): Promise<{ ok: true; value: NotionDatabaseResult } | { ok: false; excerpt: string }> {
+  let res: RunNtnResult;
+  try {
+    res = await run({ args: ["api", `v1/data_sources/${id}`], env: NTN_ENV });
+  } catch (error) {
+    return { ok: false, excerpt: error instanceof Error ? error.message : String(error) };
+  }
+  if (!res.ok) return { ok: false, excerpt: errorSummary(res) };
 
-  throw new Error(
-    `Could not read ${id} as a Notion page or database.\n` +
-      `- page: ${pageError}\n` +
-      `- database: ${databaseError}\n` +
-      `Check the id/URL, and make sure the page or database is shared with the Notion integration ` +
-      `(in Notion: ••• → Connections).`
-  );
+  const parsed = tryParseJson(res.stdout);
+  if (!isRecord(parsed)) return { ok: false, excerpt: "unexpected JSON from v1/data_sources" };
+
+  const properties = readProperties(parsed, id);
+  if (properties.length === 0) {
+    return { ok: false, excerpt: "v1/data_sources returned no properties" };
+  }
+
+  const title = plainText(parsed.title);
+  const url = typeof parsed.url === "string" && parsed.url ? parsed.url : undefined;
+  const dataSource: DataSourceInfo = {
+    id,
+    ...(title ? { name: title } : {}),
+    properties,
+  };
+  const candidates = parentItemCandidates([dataSource]);
+
+  return {
+    ok: true,
+    value: {
+      type: "database",
+      id,
+      ...(title ? { title } : {}),
+      ...(url ? { url } : {}),
+      data_source_ids: [id],
+      properties,
+      data_sources: [dataSource],
+      ...(candidates.length > 0 ? { parent_item_candidates: candidates } : {}),
+    },
+  };
 }
 
 async function runPage(

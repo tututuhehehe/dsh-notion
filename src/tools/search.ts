@@ -285,10 +285,12 @@ export function createNotionSearchTool(deps: Partial<SearchDeps> = {}): NotionTo
     name: "notion_search",
     description:
       "Search the Notion workspace by title and return every hit's id, title, URL and object type " +
-      "(page|database). Titles only: page body text is never searched, so pass a short keyword rather " +
-      "than a sentence, and use filter_object to cut noise. Read a hit with notion_get; a returned " +
-      "database's id is a data source id for notion_query. Refine the query instead of raising limit, " +
-      "which is capped at 25.",
+      "(page|database). The match is FUZZY, not exact: Notion matches words inside the title " +
+      "(case-insensitive), a hit can be loosely related, and an empty result does NOT prove the object " +
+      "is missing — try a shorter or different keyword first. Titles only: page body text is never " +
+      "searched. Use filter_object to cut noise. Any hit's id can be passed straight to notion_get or " +
+      "notion_query (both accept page, data source and database ids). Refine the query instead of " +
+      "raising limit, which is capped at 25.",
     timeoutMs: TOOL_TIMEOUTS.search,
     // Read-only and independent of every other call: safe to run alongside siblings.
     isConcurrencySafe: () => true,
@@ -298,7 +300,10 @@ export function createNotionSearchTool(deps: Partial<SearchDeps> = {}): NotionTo
         query: {
           type: "string",
           description:
-            "Title keyword to match, searched verbatim (not full-text page search).",
+            "Keyword to match against object titles. This is a FUZZY match: Notion matches " +
+            "words inside the title, case-insensitively, and returns related hits — so a miss " +
+            "does NOT prove the page is absent, and a hit may be only loosely related. It never " +
+            "searches page body text.",
         },
         limit: {
           type: "integer",

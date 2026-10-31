@@ -145,6 +145,47 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
 }
 ```
 
+## 删除（trash）的三重保护
+
+`notion_page action="trash"` 不是对 `ntn pages trash` 的薄包装，它在调用前先判定目标类型：
+
+| 情况 | 行为 |
+| --- | --- |
+| 目标是 **database / data source** | **直接拒绝**，即使 `yes: true`。删除数据库会连带它的数据源和全部行，破坏性远超删页面，所以交给用户手动确认。 |
+| 目标**已在回收站/已归档** | 返回**成功**（`already_linked: true`），不报错。`ntn` 对已归档对象会返回 `400 Can't edit block that is archived`，那看起来像故障并诱导重试，而删除本来就应当幂等。 |
+| 目标页面**有子页面** | **默认拒绝**，返回子页面 id 列表，提示需要 `recursive: true`。Notion 归档父页面会连带归档整棵子树，调用方必须先看到还会删掉什么。 |
+| 目标页面**无子页面** | 正常删除。 |
+
+```jsonc
+// 有子页面时，需要显式同意连带删除
+{ "action": "trash", "id": "<page-id>", "yes": true, "recursive": true }
+```
+
+`yes` 与 `recursive` 是两件事：`yes` 表示「我确认要删除」，`recursive` 表示「我确认连同子页面一起删除」。只有 `recursive` 而没有 `yes` 仍然会被拒绝。
+
+子页面检查走 `GET v1/blocks/{id}/children`，最多翻 4 页（200 个子块）——正常页面树远小于这个量。
+
+## 包容输入
+
+模型不需要记住精确拼写。插件在参数层做**同义词与类型宽容**，只有无法对应到任何明确意图的输入才报错。
+
+**同义词**（`action` 字段）：
+
+| 说成 | 归一为 |
+| --- | --- |
+| `delete` / `remove` / `archive` / `destroy` | `trash` |
+| `update` / `modify` / `change` / `set` / `patch` | `edit` |
+| `move` / `reparent` / `link` | `attach` |
+| `new` / `add` / `make` / `insert` | `create` |
+
+大小写、连字符、下划线、空格都不敏感（`"Delete"`、`"re-parent"` 都可以）。
+
+**类型宽容**：`yes` 接受 `true` / `"true"` / `"yes"` / `1` / `"1"`；`limit` 接受数字字符串，小数会被截断（`2.5` → `2`，但 `<= 0` 仍报错）；`id` 接受 UUID、32 位 hex 或**整条 Notion URL**。
+
+**不做的事**：拼写错误不做模糊匹配（`trsh` 不会被猜成 `trash`）。猜错可能执行成另一个真实存在的写操作，风险大于收益。
+
+**id 类型不需要记**：`notion_get` 按 page → database → data source 三级回退，`notion_query` 对 database id 自动 resolve；所以 `notion_search` 返回的任何 id 都能直接喂给任一工具。
+
 ## 设计取舍
 
 - **更少、更稳的 schema**：四个工具的参数都是小对象，减少模型在工具选择上的犹豫和 token 开销。
@@ -254,6 +295,20 @@ Each tool declares a per-call `timeoutMs` (enforced by `dsh-tool-call-timeout-po
 ### Error codes
 
 DSH renders a thrown error as `Error: <message>` and keeps a structured `{ name, code }` only for its own `HarnessError`; a plain Error's `code` is dropped. This plugin therefore puts the category at the front of the message: `[INVALID_INPUT]`, `[NTN_FAILED]`, `[ABORTED]`, `[PARTIAL_WRITE]` (a failed write whose rollback also failed, so a half-made page remains — the message carries the id to clean up).
+
+### Trash safety
+
+`notion_page action="trash"` classifies its target before calling `ntn pages trash`:
+
+- **A database or data source is refused outright**, even with `yes: true` — removing one destroys its data sources and every row, which stays a human decision.
+- **An already-archived target reports success** (`already_linked: true`) instead of surfacing Notion's `400 Can't edit block that is archived`, so a retry is harmless.
+- **A page with child pages is refused** with the child ids unless `recursive: true` is also passed, because Notion archives the whole subtree. `yes` and `recursive` are separate consents.
+
+### Tolerant arguments
+
+The model does not have to memorize exact spellings. Action synonyms (`delete`→`trash`, `update`→`edit`, `move`→`attach`, `new`→`create`), case/hyphen/underscore folding, `"true"`/`"yes"`/`1` for `yes`, numeric strings for `limit`, and full Notion URLs for `id` are all accepted. Misspellings are **not** fuzzy-matched: guessing could perform a different real write.
+
+Any id from `notion_search` works with any tool: `notion_get` falls back page → database → data source, and `notion_query` resolves a database id automatically.
 
 ### License
 

@@ -64,9 +64,21 @@
  * the workspace is clean again), `created_id`, and `rollback` ("trashed" | "trash_failed"
  * | "unknown_id"). Only a structured JSON page id is ever used as a trash target.
  */
-import { abortError, bindSignal, defineNotionTool, NOTION_ERROR_CODES, NotionToolError, textBlocks, TOOL_TIMEOUTS } from "../dsh/tool.ts";
+import {
+  abortError,
+  bindSignal,
+  defineNotionTool,
+  inputError,
+  NOTION_ERROR_CODES,
+  NotionToolError,
+  readBoolean,
+  readEnum,
+  textBlocks,
+  TOOL_TIMEOUTS,
+} from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
 import { parseResolveDataSources } from "../lib/datasources.ts";
+import { extractNotionId } from "../lib/ids.ts";
 import {
   canonicalNotionId,
   isWritablePropertyType,
@@ -103,6 +115,11 @@ export interface NotionPageParams {
   title?: string;
   props?: Record<string, unknown>;
   yes?: boolean;
+  /**
+   * trash only: consent to delete a page together with its child pages. Notion
+   * archives the whole subtree, so this must be explicit.
+   */
+  recursive?: boolean;
 }
 
 interface ParsedParent {
@@ -436,17 +453,55 @@ function parseParentSpec(raw: unknown, action: "create" | "attach"): ParentSpec 
   return { bare: false, kind, id };
 }
 
+/**
+ * Resolve an `id` argument from an id, a bare 32-character hex, or a Notion URL.
+ *
+ * A caller holding a link hands over the link; that is one intent, not an error,
+ * so the id is extracted rather than the call rejected. `extractNotionId` lives in
+ * src/lib/ids.ts and already understands every Notion URL shape.
+ */
 function requireId(raw: unknown, action: "edit" | "attach" | "trash"): string {
   if (typeof raw !== "string" || !raw.trim()) {
-    throw new InputError(`${action} 需要 id（页面 id，32 位 hex 或带连字符的 UUID）。`);
-  }
-  const id = raw.trim();
-  if (!isNotionId(id)) {
     throw new InputError(
-      `id 无效：${describeValue(raw)}。只接受 Notion 页面 id（32 位 hex 或带连字符的 UUID），不要用路径或 URL。`
+      `${action} 需要 id：页面 id（32 位 hex 或带连字符的 UUID）或该页面的 Notion URL。`
     );
   }
-  return id;
+  const text = raw.trim();
+  if (isNotionId(text)) return text;
+  const extracted = extractNotionId(text);
+  if (extracted) return extracted;
+  throw new InputError(
+    `id 无效：${describeValue(raw)}。只接受 Notion 页面 id（32 位 hex / UUID）或该页面的 Notion URL。`
+  );
+}
+
+/**
+ * Read the tolerated scalar arguments once, so every action sees a normalized shape.
+ *
+ * `yes` arrives as `true`, `"true"`, `"yes"`, `1` or `"1"` depending on the caller;
+ * all of them mean consent, and only an explicit falsy value means no consent.
+ * `title` keeps its own validation (no newlines) so it is left as authored.
+ */
+function normalizePageArgs(raw: Record<string, unknown>, action: Action): NotionPageParams {
+  const yes = raw.yes === undefined ? undefined : readBoolean(raw.yes, "yes");
+  const props = raw.props;
+  if (action === "trash" && yes !== true) {
+    throw inputError(
+      'trash 会删除（移入回收站）页面，必须显式传 yes: true（或 "true" / "yes" / 1）才会调用 ntn；本次没有调用 ntn。',
+      { action, yes: raw.yes }
+    );
+  }
+  return {
+    action,
+    ...(raw.id === undefined ? {} : { id: raw.id as string }),
+    ...(raw.parent === undefined ? {} : { parent: raw.parent as string }),
+    ...(raw.title === undefined ? {} : { title: raw.title as string }),
+    ...(props === undefined ? {} : { props: props as Record<string, unknown> }),
+    ...(yes === undefined ? {} : { yes }),
+    ...(raw.recursive === undefined
+      ? {}
+      : { recursive: readBoolean(raw.recursive, "recursive") }),
+  };
 }
 
 /** Parameters each action may carry; anything else is a caller mistake, not something to ignore. */
@@ -454,7 +509,7 @@ const ALLOWED_PARAMS: Record<Action, readonly string[]> = {
   create: ["action", "parent", "title", "props"],
   edit: ["action", "id", "title", "props"],
   attach: ["action", "id", "parent", "yes"],
-  trash: ["action", "id", "yes"],
+  trash: ["action", "id", "yes", "recursive"],
 };
 
 const UNEXPECTED_PARAMS_MESSAGE: Record<Action, string> = {
@@ -462,7 +517,7 @@ const UNEXPECTED_PARAMS_MESSAGE: Record<Action, string> = {
   edit: "edit 只接受 { action, id, title, props }（正文写在 props.body_content）。",
   attach:
     "attach 只接受 { action, id, parent, yes }，不接受 props/title（也就没有 body_content）；改内容或标题请用 edit。yes 只用于同意覆盖已有的 Parent-item 链接。",
-  trash: "trash 只接受 { action, id, yes }。",
+  trash: "trash 只接受 { action, id, yes, recursive }。",
 };
 
 function rejectUnexpectedParams(params: Record<string, unknown>, action: Action): void {
@@ -1215,7 +1270,10 @@ export type PageToolValue = {
   /** create when the parent was a database row. */
   parent_item_row_id?: string;
   parent_item_property?: string;
-  /** attach: the page/row is already under the requested parent; nothing was written. */
+  /**
+   * attach: the page/row is already under the requested parent; nothing was written.
+   * trash: the target was already archived, so the call succeeded without a write.
+   */
   already_linked?: boolean;
   /** attach row→row: the Parent-item values that were replaced. */
   replaced_parent_ids?: string[];
@@ -1801,6 +1859,82 @@ async function attachPage(
   });
 }
 
+/**
+ * What a trash target turned out to be. `canonicalNotionId` probing is not usable
+ * here: page and data-source ids are both plain UUIDs, so the type comes from an
+ * API read, not from the string.
+ */
+type TrashTarget =
+  | { kind: "page"; archived: boolean }
+  | { kind: "database" }
+  | { kind: "unknown" };
+
+/** Classify a trash target by asking the API; never guesses from the id string. */
+async function classifyTrashTarget(
+  runner: NtnRunner,
+  id: string
+): Promise<TrashTarget> {
+  const page = await runner({ args: ["api", `v1/pages/${id}`] });
+  if (page.ok) {
+    const raw = parseJsonMaybe(page.stdout);
+    const archived =
+      isPlainObject(raw) && (raw.archived === true || raw.in_trash === true);
+    return { kind: "page", archived };
+  }
+  const database = await runner({ args: ["api", `v1/databases/${id}`] });
+  if (database.ok) return { kind: "database" };
+  const dataSource = await runner({ args: ["api", `v1/data_sources/${id}`] });
+  if (dataSource.ok) return { kind: "database" };
+  return { kind: "unknown" };
+}
+
+/** Direct child pages of one page, from `GET v1/blocks/{id}/children`. */
+async function listChildPages(
+  runner: NtnRunner,
+  pageId: string
+): Promise<{ id: string; title: string }[]> {
+  const children: { id: string; title: string }[] = [];
+  let cursor: string | undefined;
+  // Bounded: a page with a huge child list is pathological, and the caller only
+  // needs enough ids to decide. 200 children is far beyond a normal tree.
+  for (let page = 0; page < 4; page += 1) {
+    const query = cursor ? `?start_cursor=${encodeURIComponent(cursor)}` : "";
+    const result = await runner({ args: ["api", `v1/blocks/${pageId}/children${query}`] });
+    if (!result.ok) {
+      throw ntnFailure(`列出页面 ${pageId} 的子块`, result);
+    }
+    const parsed = parseJsonMaybe(result.stdout);
+    if (!isPlainObject(parsed)) break;
+    const results = Array.isArray(parsed.results) ? parsed.results : [];
+    for (const block of results) {
+      if (!isPlainObject(block)) continue;
+      if (block.type !== "child_page") continue;
+      if (typeof block.id !== "string") continue;
+      const title =
+        isPlainObject(block.child_page) && typeof block.child_page.title === "string"
+          ? block.child_page.title
+          : "(untitled)";
+      children.push({ id: block.id, title });
+    }
+    const hasMore = parsed.has_more === true;
+    const next = typeof parsed.next_cursor === "string" ? parsed.next_cursor : undefined;
+    if (!hasMore || !next) break;
+    cursor = next;
+  }
+  return children;
+}
+
+/**
+ * Trash one page, with three guards that a bare `ntn pages trash` does not give us.
+ *
+ *   1. A database or data source is refused outright: deleting one is far more
+ *      destructive than deleting a page, so it stays a human decision.
+ *   2. An already-archived page reports success instead of failing: Notion answers
+ *      400 "Can't edit block that is archived", which reads like a fault and makes
+ *      a retry look broken. Trash is naturally idempotent.
+ *   3. A page with child pages is refused unless `recursive: true`, because Notion
+ *      archives the whole subtree — the caller has to see what else would go.
+ */
 async function trashPage(
   params: NotionPageParams,
   runner: NtnRunner
@@ -1808,9 +1942,50 @@ async function trashPage(
   const id = requireId(params.id, "trash");
   if (params.yes !== true) {
     throw new InputError(
-      "trash 会删除（移入回收站）页面，必须显式传 yes: true 才会调用 ntn；本次没有调用 ntn。"
+      'trash 会删除（移入回收站）页面，必须显式传 yes: true（或 "true" / "yes" / 1）才会调用 ntn；本次没有调用 ntn。'
     );
   }
+
+  const target = await classifyTrashTarget(runner, id);
+  if (target.kind === "database") {
+    // Use the global default: Notion refusal here is a policy choice of the plugin,
+    // not a malformed argument, so `inputError`'s "fix your arguments" framing
+    // would be misleading. Keep it visible to the model as an unusable request.
+    throw new InputError(
+      `notion_page cannot delete a database (id ${id}). Removing a database, its data ` +
+        "sources and every row in them is far more destructive than deleting a page, so " +
+        "this tool refuses even with yes: true. Ask the user to delete it in Notion " +
+        "(••• → Delete) if that is really intended.",
+      { id, target: "database", refused: "database_delete" }
+    );
+  }
+
+  if (target.kind === "page" && target.archived) {
+    return pageValue("trash", {
+      id,
+      url: pageUrl(id),
+      properties: [],
+      changed: ["trashed"],
+      already_linked: true,
+    });
+  }
+
+  if (target.kind === "page") {
+    const children = await listChildPages(runner, id);
+    if (children.length > 0 && params.recursive !== true) {
+      throw new InputError(
+        `页面 ${id} 有 ${children.length} 个子页面。Notion 会连带归档整棵子树，` +
+          "所以默认拒绝。确认要一起删除请加 recursive: true；只想删父页面请先在 Notion 里移走子页面。",
+        {
+          id,
+          children: children.map((child) => child.id),
+          child_pages: children,
+          recursive_required: true,
+        }
+      );
+    }
+  }
+
   const result = await runner({ args: ["pages", "trash", id, "--yes"] });
   if (!result.ok) throw ntnFailure("ntn pages trash", result);
 
@@ -1860,6 +2035,11 @@ const PAGE_PARAMETERS = {
       type: "boolean",
       description:
         "trash: must be true, otherwise the tool refuses without calling ntn. attach (row→row): consent to replacing an existing Parent-item link that points at a different parent.",
+    },
+    recursive: {
+      type: "boolean",
+      description:
+        "trash only: consent to delete a page together with its child pages (Notion archives the whole subtree). Without it a page that has child pages is refused with the child ids.",
     },
   },
   required: ["action"],
@@ -1928,17 +2108,19 @@ export function createNotionPageTool(deps: NotionPageDeps = {}): NotionTool<Page
 
     async execute(args, exec) {
       const raw = args;
-      const action = raw.action;
-      // A typo or the rejected `move` name must not fall through to trash.
-      if (typeof action !== "string" || !Object.prototype.hasOwnProperty.call(ALLOWED_PARAMS, action)) {
-        throw new InputError(
-          `未知 action ${describeValue(action)}：只支持 create / edit / attach / trash（移动/挂载用 attach，没有 move）。`
-        );
-      }
+      // Synonyms name the same intent, so they are accepted; a different WORD or a
+      // typo is not snapped to the nearest action, because doing so could perform a
+      // write the caller never asked for.
+      const action = readEnum(raw.action, "action", [
+        { value: "create" as const, aliases: ["new", "add", "make", "insert"] },
+        { value: "edit" as const, aliases: ["update", "modify", "change", "set", "patch"] },
+        { value: "attach" as const, aliases: ["move", "reparent", "re-parent", "link"] },
+        { value: "trash" as const, aliases: ["delete", "remove", "archive", "destroy", "trash"] },
+      ]);
       if (exec.signal?.aborted) throw abortError();
       const typedAction = action as Action;
       rejectUnexpectedParams(raw, typedAction);
-      const typed = args as unknown as NotionPageParams;
+      const typed = normalizePageArgs(raw, typedAction);
       // Every ntn spawn of this call observes the call's cancellation signal.
       const run = bindSignal(runner, exec.signal);
       if (typedAction === "create") return await createPage(typed, run);

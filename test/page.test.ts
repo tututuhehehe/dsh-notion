@@ -61,7 +61,7 @@ describe("notion_page registration", () => {
   it("exposes create/edit/attach/trash, no top-level content and no top-level icon", () => {
     const { tool } = harness();
     const properties = tool.parameters?.properties ?? {};
-    assert.deepEqual(Object.keys(properties).sort(), ["action", "id", "parent", "props", "title", "yes"]);
+    assert.deepEqual(Object.keys(properties).sort(), ["action", "id", "parent", "props", "recursive", "title", "yes"]);
     assert.equal("content" in properties, false);
     // icon is a reserved key inside props, never a top-level parameter.
     assert.equal("icon" in properties, false);
@@ -73,27 +73,58 @@ describe("notion_page registration", () => {
 });
 
 describe("notion_page dispatch guards", () => {
-  it("rejects an unknown action (including the rejected move name) without calling ntn", async () => {
+  it("accepts the documented synonyms for each action", async () => {
+    // Synonyms name the same intent; the caller should not have to re-learn spellings.
+    // Each case supplies only what its canonical action requires.
+    const cases: { alias: string; canonical: string; args: Record<string, unknown> }[] = [
+      { alias: "delete", canonical: "trash", args: { id: EDIT_PAGE_ID, yes: true } },
+      { alias: "remove", canonical: "trash", args: { id: EDIT_PAGE_ID, yes: "true" } },
+      { alias: "archive", canonical: "trash", args: { id: EDIT_PAGE_ID, yes: 1 } },
+      { alias: "update", canonical: "edit", args: { id: EDIT_PAGE_ID, title: "t" } },
+      { alias: "modify", canonical: "edit", args: { id: EDIT_PAGE_ID, props: { body_content: "b" } } },
+      { alias: "move", canonical: "attach", args: { id: EDIT_PAGE_ID, parent: `page:${NEW_PAGE_ID}` } },
+      { alias: "reparent", canonical: "attach", args: { id: EDIT_PAGE_ID, parent: `page:${NEW_PAGE_ID}` } },
+      { alias: "new", canonical: "create", args: { parent: `page:${NEW_PAGE_ID}`, title: "t" } },
+      { alias: "add", canonical: "create", args: { parent: `page:${NEW_PAGE_ID}`, props: { body_content: "b" } } },
+    ];
+    for (const { alias, canonical, args } of cases) {
+      const { tool } = harness((argv) => {
+        if (argv[0] === "api" && argv[1] === `v1/pages/${EDIT_PAGE_ID}`) return pageWithParent(DS_PARENT);
+        if (argv[0] === "api" && argv[1]?.startsWith("v1/data_sources/")) return ntnOk(DATA_SOURCE_SCHEMA);
+        if (argv[0] === "pages" && argv[1] === "create") return pageCreateResponse(NEW_PAGE_ID);
+        if (argv[0] === "api" && argv[1]?.includes("/children")) return ntnOk({ results: [], has_more: false });
+        if (argv[0] === "pages" && argv[1] === "trash") return ntnOk("{}");
+        if (argv[0] === "pages" && argv[1] === "edit") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
+        if (argv[2] === "-X") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
+        return ntnFail(`unexpected: ${argv.join(" ")}`);
+      });
+      const result = await tool.execute("call-alias", { action: alias, ...args });
+      assert.equal(result.isError, false, `${alias}: ${result.content[0].text}`);
+      assert.equal(result.details.action, canonical, `${alias} should normalize to ${canonical}`);
+    }
+  });
+
+  it("rejects a word that is neither an action nor a synonym, without calling ntn", async () => {
     const { tool, calls } = harness();
-    for (const action of ["move", "delete", ""]) {
+    for (const action of ["trsh", "detail", "", 42]) {
       const result = await tool.execute("call-action", {
         action,
         id: EDIT_PAGE_ID,
         parent: `page:${NEW_PAGE_ID}`,
       });
       assert.equal(result.isError, true);
-      assert.match(result.content[0].text, /未知 action/);
-      assert.match(result.content[0].text, /没有 move/);
+      assert.match(result.content[0].text, /action (must be a string|".*" is not recognized)/);
     }
     assert.equal(calls.length, 0);
   });
 
   it("rejects parameters that the action does not own instead of silently dropping them", async () => {
+    // `recursive` is trash-only; the other actions must still reject it.
     const { tool, calls } = harness();
     const cases: { params: Record<string, unknown>; expected: RegExp }[] = [
       {
         params: { action: "trash", id: EDIT_PAGE_ID, yes: true, props: { body_content: "x" } },
-        expected: /trash 只接受 \{ action, id, yes \}/,
+        expected: /trash 只接受 \{ action, id, yes, recursive \}/,
       },
       {
         params: { action: "create", id: EDIT_PAGE_ID, parent: `page:${ACCEPTANCE.parentPageId}` },
@@ -1426,6 +1457,134 @@ describe("notion_page attach guards", () => {
   });
 });
 
+describe("notion_page trash guards", () => {
+  it("refuses to trash a database even with yes:true", async () => {
+    const { tool, calls } = harness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) return ntnFail("404 page not found");
+      if (args[0] === "api" && args[1] === `v1/databases/${EDIT_PAGE_ID}`) return ntnOk({ object: "database" });
+      return ntnFail(`unexpected: ${args.join(" ")}`);
+    });
+
+    const result = await tool.execute("call-db-1", {
+      action: "trash",
+      id: EDIT_PAGE_ID,
+      yes: true,
+    });
+
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /cannot delete a database/);
+    assert.match(result.content[0].text, /delete it in Notion/);
+    // The refusal must happen before any trash call.
+    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
+  });
+
+  it("refuses to trash a data source, which is also a database-level object", async () => {
+    const { tool, calls } = harness((args) => {
+      if (args[0] === "api" && args[1]?.startsWith("v1/pages/")) return ntnFail("404");
+      if (args[0] === "api" && args[1]?.startsWith("v1/databases/")) return ntnFail("404");
+      if (args[0] === "api" && args[1]?.startsWith("v1/data_sources/")) return ntnOk({ object: "data_source" });
+      return ntnFail(`unexpected: ${args.join(" ")}`);
+    });
+
+    const result = await tool.execute("call-ds-1", {
+      action: "trash",
+      id: EDIT_PAGE_ID,
+      yes: true,
+    });
+
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /cannot delete a database/);
+    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
+  });
+
+  it("treats an already-archived page as success instead of a 400", async () => {
+    const { tool, calls } = harness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
+        return ntnOk({ object: "page", id: EDIT_PAGE_ID, archived: true, parent: DS_PARENT });
+      }
+      return ntnFail(`unexpected: ${args.join(" ")}`);
+    });
+
+    const result = await tool.execute("call-arch-1", {
+      action: "trash",
+      id: EDIT_PAGE_ID,
+      yes: true,
+    });
+
+    assert.equal(result.isError, false, result.content[0].text);
+    assert.deepEqual(result.details.changed, ["trashed"]);
+    // Idempotent: no trash call was needed.
+    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
+  });
+
+  it("refuses a page with child pages and lists them, unless recursive:true", async () => {
+    const childA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const childB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let trashed = false;
+    const { tool } = harness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
+        return ntnOk({ object: "page", id: EDIT_PAGE_ID, archived: false, parent: DS_PARENT });
+      }
+      if (args[0] === "api" && args[1] === `v1/blocks/${EDIT_PAGE_ID}/children`) {
+        return ntnOk({
+          results: [
+            { id: childA, type: "child_page", child_page: { title: "Child A" } },
+            { id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", type: "paragraph" },
+            { id: childB, type: "child_page", child_page: { title: "Child B" } },
+          ],
+          has_more: false,
+        });
+      }
+      if (args[0] === "pages" && args[1] === "trash") {
+        trashed = true;
+        return ntnOk("trashed");
+      }
+      return ntnFail(`unexpected: ${args.join(" ")}`);
+    });
+
+    const refused = await tool.execute("call-child-1", {
+      action: "trash",
+      id: EDIT_PAGE_ID,
+      yes: true,
+    });
+    assert.equal(refused.isError, true);
+    assert.match(refused.content[0].text, /子页面/);
+    assert.match(refused.content[0].text, /recursive/);
+    assert.deepEqual(refused.details.children, [childA, childB]);
+    assert.equal(trashed, false);
+
+    // Consent still requires yes:true; recursive alone is not consent to skip it.
+    const withRecursive = await tool.execute("call-child-2", {
+      action: "trash",
+      id: EDIT_PAGE_ID,
+      yes: true,
+      recursive: true,
+    });
+    assert.equal(withRecursive.isError, false, withRecursive.content[0].text);
+    assert.equal(trashed, true);
+  });
+
+  it("does not require recursive when the page has no child pages", async () => {
+    const { tool } = harness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
+        return ntnOk({ object: "page", id: EDIT_PAGE_ID, archived: false, parent: DS_PARENT });
+      }
+      if (args[0] === "api" && args[1] === `v1/blocks/${EDIT_PAGE_ID}/children`) {
+        return ntnOk({ results: [{ id: "x", type: "paragraph" }], has_more: false });
+      }
+      if (args[0] === "pages" && args[1] === "trash") return ntnOk("trashed");
+      return ntnFail(`unexpected: ${args.join(" ")}`);
+    });
+
+    const result = await tool.execute("call-child-3", {
+      action: "trash",
+      id: EDIT_PAGE_ID,
+      yes: true,
+    });
+    assert.equal(result.isError, false, result.content[0].text);
+  });
+});
+
 describe("notion_page trash", () => {
   it("rejects a malformed id without building an API path", async () => {
     const { tool, calls } = harness();
@@ -1451,8 +1610,17 @@ describe("notion_page trash", () => {
     assert.match(result.content[0].text, /yes: true/);
   });
 
-  it("trashes with yes:true", async () => {
-    const { tool, calls } = harness(() => ntnOk("trashed"));
+  it("trashes a page with no children: classifies, then trashes", async () => {
+    const { tool, calls } = harness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
+        return pageWithParent(DS_PARENT);
+      }
+      if (args[0] === "api" && args[1] === `v1/blocks/${EDIT_PAGE_ID}/children`) {
+        return ntnOk({ results: [], has_more: false });
+      }
+      if (args[0] === "pages" && args[1] === "trash") return ntnOk("trashed");
+      return ntnFail(`unexpected: ${args.join(" ")}`);
+    });
 
     const result = await tool.execute("call-30", {
       action: "trash",
@@ -1460,8 +1628,8 @@ describe("notion_page trash", () => {
       yes: true,
     });
 
-    assert.equal(result.isError, false);
-    assert.deepEqual(calls, [["pages", "trash", EDIT_PAGE_ID, "--yes"]]);
+    assert.equal(result.isError, false, result.content[0].text);
+    assert.deepEqual(calls.at(-1), ["pages", "trash", EDIT_PAGE_ID, "--yes"]);
     assert.deepEqual(result.details.changed, ["trashed"]);
   });
 });

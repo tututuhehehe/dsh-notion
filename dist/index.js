@@ -1,39 +1,4 @@
 // src/dsh/tool.ts
-var TOOL_TIMEOUTS = {
-  search: 12e4,
-  get: 12e4,
-  page: 18e4,
-  query: 3e5
-};
-function defineNotionTool(tool) {
-  return tool;
-}
-function bindSignal(run, signal) {
-  if (!signal) return run;
-  return async (options) => {
-    if (signal.aborted) throw abortError();
-    const result = await run({ ...options, signal });
-    if (signal.aborted) throw abortError();
-    return result;
-  };
-}
-function abortError() {
-  return new NotionToolError("tool call aborted", { code: NOTION_ERROR_CODES.aborted });
-}
-function codedError(error) {
-  if (error instanceof NotionToolError) return error;
-  const message = error instanceof Error ? error.message : String(error);
-  return new NotionToolError(message, { code: NOTION_ERROR_CODES.ntnFailed });
-}
-function inputError(message, details) {
-  return new NotionToolError(message, {
-    code: NOTION_ERROR_CODES.invalidInput,
-    ...details ? { details } : {}
-  });
-}
-function textBlocks(text2) {
-  return [{ type: "text", text: text2 }];
-}
 var NOTION_ERROR_CODES = {
   /** The caller's arguments cannot be acted on; re-read the message and retry. */
   invalidInput: "INVALID_INPUT",
@@ -60,6 +25,112 @@ var NotionToolError = class extends Error {
     this.details = options.details ?? {};
   }
 };
+var TOOL_TIMEOUTS = {
+  search: 12e4,
+  get: 12e4,
+  page: 18e4,
+  query: 3e5
+};
+function defineNotionTool(tool) {
+  return tool;
+}
+function textBlocks(text2) {
+  return [{ type: "text", text: text2 }];
+}
+function inputError(message, details) {
+  return new NotionToolError(message, {
+    code: NOTION_ERROR_CODES.invalidInput,
+    ...details ? { details } : {}
+  });
+}
+function codedError(error) {
+  if (error instanceof NotionToolError) return error;
+  const message = error instanceof Error ? error.message : String(error);
+  return new NotionToolError(message, { code: NOTION_ERROR_CODES.ntnFailed });
+}
+function abortError() {
+  return new NotionToolError("tool call aborted", { code: NOTION_ERROR_CODES.aborted });
+}
+function bindSignal(run, signal) {
+  if (!signal) return run;
+  return async (options) => {
+    if (signal.aborted) throw abortError();
+    const result = await run({ ...options, signal });
+    if (signal.aborted) throw abortError();
+    return result;
+  };
+}
+function readEnum(raw, field, spellings) {
+  if (typeof raw !== "string") {
+    throw inputError(
+      `${field} must be a string, got ${describe(raw)}. Accepted: ${spellingList(spellings)}.`,
+      { field, value: raw }
+    );
+  }
+  const folded = fold(raw);
+  for (const spelling of spellings) {
+    if (fold(spelling.value) === folded) return spelling.value;
+    if (spelling.aliases.some((alias) => fold(alias) === folded)) return spelling.value;
+  }
+  throw inputError(
+    `${field} "${raw}" is not recognized. Accepted: ${spellingList(spellings)}.`,
+    { field, value: raw }
+  );
+}
+function spellingList(spellings) {
+  return spellings.map(
+    (spelling) => spelling.aliases.length === 0 ? spelling.value : `${spelling.value} (also ${spelling.aliases.map((a) => `"${a}"`).join(", ")})`
+  ).join(" | ");
+}
+function fold(value) {
+  return value.trim().toLowerCase().replace(/[\s_-]+/g, "");
+}
+function readInteger(raw, field, min, max) {
+  let value;
+  if (typeof raw === "number" && Number.isFinite(raw)) value = Math.trunc(raw);
+  else if (typeof raw === "string" && /^\s*-?\d+\s*$/.test(raw)) value = Number(raw.trim());
+  else {
+    throw inputError(
+      `${field} must be an integer${max === void 0 ? "" : ` between ${min} and ${max}`}, got ${describe(raw)}.`,
+      { field, value: raw }
+    );
+  }
+  if (value < min) {
+    throw inputError(`${field} must be >= ${min}, got ${value}.`, { field, value: raw });
+  }
+  if (max !== void 0 && value > max) return max;
+  return value;
+}
+function readBoolean(raw, field) {
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw === "number" && (raw === 1 || raw === 0)) return raw === 1;
+  if (typeof raw === "string") {
+    const folded = fold(raw);
+    if (folded === "true" || folded === "yes" || folded === "1") return true;
+    if (folded === "false" || folded === "no" || folded === "0") return false;
+  }
+  throw inputError(`field ${field} must be a boolean, got ${describe(raw)}.`, {
+    field,
+    value: raw
+  });
+}
+function readString(raw, field) {
+  if (typeof raw !== "string" || raw.trim() === "") {
+    throw inputError(`${field} must be a non-empty string, got ${describe(raw)}.`, {
+      field,
+      value: raw
+    });
+  }
+  return raw.trim();
+}
+function describe(value) {
+  try {
+    const text2 = JSON.stringify(value);
+    return (text2 ?? String(value)).slice(0, 80);
+  } catch {
+    return String(value);
+  }
+}
 
 // src/lib/ids.ts
 var UUID_TOKEN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
@@ -278,33 +349,74 @@ function createNotionGetTool(run = runNtn) {
   });
 }
 async function executeNotionGet(params, run = runNtn) {
-  const format = params.format ?? "md";
-  if (format !== "md" && format !== "json") {
-    throw new Error(`Unsupported format "${String(format)}". Use "md" (default) or "json".`);
-  }
-  const id = extractNotionId(params.id_or_url);
+  const raw = readString(params.id_or_url, "id_or_url");
+  const format = params.format === void 0 ? "md" : readEnum(params.format, "format", [
+    { value: "md", aliases: ["markdown", "text", "md"] },
+    { value: "json", aliases: ["json"] }
+  ]);
+  const id = extractNotionId(raw);
   if (!id) {
-    throw new Error(
-      `Could not find a Notion ID in "${params.id_or_url}". Pass a 32-character id (with or without dashes) or a notion.so / app.notion.com URL.`
+    throw inputError(
+      `Could not find a Notion ID in "${raw}". Pass a 32-character id (with or without dashes) or a notion.so / app.notion.com URL.`,
+      { id_or_url: raw }
     );
   }
   const page = await runPage(id, format, run);
   if (page.ok) return page.value;
-  const pageError = errorSummary(page.res);
   if (isFatalCliError(page.res)) throw new Error(fatalCliMessage(page.res));
-  if (!shouldTryDatabase(page.res)) {
-    throw new Error(`Could not read page ${id}: ${pageError}`);
+  const pageError = errorSummary(page.res);
+  if (shouldTryDatabase(page.res)) {
+    const database = await runDatabase(id, run);
+    if (database.ok) return database.value;
+    if (isFatalCliError(database.res)) throw new Error(fatalCliMessage(database.res));
+    const databaseError = errorSummary(database.res);
+    const dataSource = await runDataSourceSchema(id, run);
+    if (dataSource.ok) return dataSource.value;
+    throw new Error(
+      `Could not read ${id} as a page, database or data source.
+- ntn pages get: ${pageError}
+- ntn datasources resolve: ${databaseError}
+- ntn api v1/data_sources: ${dataSource.excerpt}
+Make sure the target is shared with the Notion integration (in Notion: \u2022\u2022\u2022 \u2192 Connections).`
+    );
   }
-  const database = await runDatabase(id, run);
-  if (database.ok) return database.value;
-  const databaseError = errorSummary(database.res);
-  if (isFatalCliError(database.res)) throw new Error(fatalCliMessage(database.res));
-  throw new Error(
-    `Could not read ${id} as a Notion page or database.
-- page: ${pageError}
-- database: ${databaseError}
-Check the id/URL, and make sure the page or database is shared with the Notion integration (in Notion: \u2022\u2022\u2022 \u2192 Connections).`
-  );
+  throw new Error(`Could not read page ${id}: ${pageError}`);
+}
+async function runDataSourceSchema(id, run) {
+  let res;
+  try {
+    res = await run({ args: ["api", `v1/data_sources/${id}`], env: NTN_ENV });
+  } catch (error) {
+    return { ok: false, excerpt: error instanceof Error ? error.message : String(error) };
+  }
+  if (!res.ok) return { ok: false, excerpt: errorSummary(res) };
+  const parsed = tryParseJson(res.stdout);
+  if (!isRecord(parsed)) return { ok: false, excerpt: "unexpected JSON from v1/data_sources" };
+  const properties = readProperties(parsed, id);
+  if (properties.length === 0) {
+    return { ok: false, excerpt: "v1/data_sources returned no properties" };
+  }
+  const title = plainText(parsed.title);
+  const url = typeof parsed.url === "string" && parsed.url ? parsed.url : void 0;
+  const dataSource = {
+    id,
+    ...title ? { name: title } : {},
+    properties
+  };
+  const candidates = parentItemCandidates([dataSource]);
+  return {
+    ok: true,
+    value: {
+      type: "database",
+      id,
+      ...title ? { title } : {},
+      ...url ? { url } : {},
+      data_source_ids: [id],
+      properties,
+      data_sources: [dataSource],
+      ...candidates.length > 0 ? { parent_item_candidates: candidates } : {}
+    }
+  };
 }
 async function runPage(id, format, run) {
   const args = ["pages", "get", id];
@@ -885,27 +997,48 @@ function parseParentSpec(raw, action) {
 }
 function requireId(raw, action) {
   if (typeof raw !== "string" || !raw.trim()) {
-    throw new InputError(`${action} \u9700\u8981 id\uFF08\u9875\u9762 id\uFF0C32 \u4F4D hex \u6216\u5E26\u8FDE\u5B57\u7B26\u7684 UUID\uFF09\u3002`);
-  }
-  const id = raw.trim();
-  if (!isNotionId(id)) {
     throw new InputError(
-      `id \u65E0\u6548\uFF1A${describeValue(raw)}\u3002\u53EA\u63A5\u53D7 Notion \u9875\u9762 id\uFF0832 \u4F4D hex \u6216\u5E26\u8FDE\u5B57\u7B26\u7684 UUID\uFF09\uFF0C\u4E0D\u8981\u7528\u8DEF\u5F84\u6216 URL\u3002`
+      `${action} \u9700\u8981 id\uFF1A\u9875\u9762 id\uFF0832 \u4F4D hex \u6216\u5E26\u8FDE\u5B57\u7B26\u7684 UUID\uFF09\u6216\u8BE5\u9875\u9762\u7684 Notion URL\u3002`
     );
   }
-  return id;
+  const text2 = raw.trim();
+  if (isNotionId(text2)) return text2;
+  const extracted = extractNotionId(text2);
+  if (extracted) return extracted;
+  throw new InputError(
+    `id \u65E0\u6548\uFF1A${describeValue(raw)}\u3002\u53EA\u63A5\u53D7 Notion \u9875\u9762 id\uFF0832 \u4F4D hex / UUID\uFF09\u6216\u8BE5\u9875\u9762\u7684 Notion URL\u3002`
+  );
+}
+function normalizePageArgs(raw, action) {
+  const yes = raw.yes === void 0 ? void 0 : readBoolean(raw.yes, "yes");
+  const props = raw.props;
+  if (action === "trash" && yes !== true) {
+    throw inputError(
+      'trash \u4F1A\u5220\u9664\uFF08\u79FB\u5165\u56DE\u6536\u7AD9\uFF09\u9875\u9762\uFF0C\u5FC5\u987B\u663E\u5F0F\u4F20 yes: true\uFF08\u6216 "true" / "yes" / 1\uFF09\u624D\u4F1A\u8C03\u7528 ntn\uFF1B\u672C\u6B21\u6CA1\u6709\u8C03\u7528 ntn\u3002',
+      { action, yes: raw.yes }
+    );
+  }
+  return {
+    action,
+    ...raw.id === void 0 ? {} : { id: raw.id },
+    ...raw.parent === void 0 ? {} : { parent: raw.parent },
+    ...raw.title === void 0 ? {} : { title: raw.title },
+    ...props === void 0 ? {} : { props },
+    ...yes === void 0 ? {} : { yes },
+    ...raw.recursive === void 0 ? {} : { recursive: readBoolean(raw.recursive, "recursive") }
+  };
 }
 var ALLOWED_PARAMS = {
   create: ["action", "parent", "title", "props"],
   edit: ["action", "id", "title", "props"],
   attach: ["action", "id", "parent", "yes"],
-  trash: ["action", "id", "yes"]
+  trash: ["action", "id", "yes", "recursive"]
 };
 var UNEXPECTED_PARAMS_MESSAGE = {
   create: "create \u53EA\u63A5\u53D7 { action, parent, title, props }\uFF08\u6B63\u6587\u5199\u5728 props.body_content\uFF09\u3002",
   edit: "edit \u53EA\u63A5\u53D7 { action, id, title, props }\uFF08\u6B63\u6587\u5199\u5728 props.body_content\uFF09\u3002",
   attach: "attach \u53EA\u63A5\u53D7 { action, id, parent, yes }\uFF0C\u4E0D\u63A5\u53D7 props/title\uFF08\u4E5F\u5C31\u6CA1\u6709 body_content\uFF09\uFF1B\u6539\u5185\u5BB9\u6216\u6807\u9898\u8BF7\u7528 edit\u3002yes \u53EA\u7528\u4E8E\u540C\u610F\u8986\u76D6\u5DF2\u6709\u7684 Parent-item \u94FE\u63A5\u3002",
-  trash: "trash \u53EA\u63A5\u53D7 { action, id, yes }\u3002"
+  trash: "trash \u53EA\u63A5\u53D7 { action, id, yes, recursive }\u3002"
 };
 function rejectUnexpectedParams(params, action) {
   const allowed = ALLOWED_PARAMS[action];
@@ -1894,12 +2027,81 @@ async function attachPage(params, runner) {
     changed: ["parent_item_relation"]
   });
 }
+async function classifyTrashTarget(runner, id) {
+  const page = await runner({ args: ["api", `v1/pages/${id}`] });
+  if (page.ok) {
+    const raw = parseJsonMaybe(page.stdout);
+    const archived = isPlainObject(raw) && (raw.archived === true || raw.in_trash === true);
+    return { kind: "page", archived };
+  }
+  const database = await runner({ args: ["api", `v1/databases/${id}`] });
+  if (database.ok) return { kind: "database" };
+  const dataSource = await runner({ args: ["api", `v1/data_sources/${id}`] });
+  if (dataSource.ok) return { kind: "database" };
+  return { kind: "unknown" };
+}
+async function listChildPages(runner, pageId) {
+  const children = [];
+  let cursor;
+  for (let page = 0; page < 4; page += 1) {
+    const query = cursor ? `?start_cursor=${encodeURIComponent(cursor)}` : "";
+    const result = await runner({ args: ["api", `v1/blocks/${pageId}/children${query}`] });
+    if (!result.ok) {
+      throw ntnFailure(`\u5217\u51FA\u9875\u9762 ${pageId} \u7684\u5B50\u5757`, result);
+    }
+    const parsed = parseJsonMaybe(result.stdout);
+    if (!isPlainObject(parsed)) break;
+    const results = Array.isArray(parsed.results) ? parsed.results : [];
+    for (const block of results) {
+      if (!isPlainObject(block)) continue;
+      if (block.type !== "child_page") continue;
+      if (typeof block.id !== "string") continue;
+      const title = isPlainObject(block.child_page) && typeof block.child_page.title === "string" ? block.child_page.title : "(untitled)";
+      children.push({ id: block.id, title });
+    }
+    const hasMore = parsed.has_more === true;
+    const next = typeof parsed.next_cursor === "string" ? parsed.next_cursor : void 0;
+    if (!hasMore || !next) break;
+    cursor = next;
+  }
+  return children;
+}
 async function trashPage(params, runner) {
   const id = requireId(params.id, "trash");
   if (params.yes !== true) {
     throw new InputError(
-      "trash \u4F1A\u5220\u9664\uFF08\u79FB\u5165\u56DE\u6536\u7AD9\uFF09\u9875\u9762\uFF0C\u5FC5\u987B\u663E\u5F0F\u4F20 yes: true \u624D\u4F1A\u8C03\u7528 ntn\uFF1B\u672C\u6B21\u6CA1\u6709\u8C03\u7528 ntn\u3002"
+      'trash \u4F1A\u5220\u9664\uFF08\u79FB\u5165\u56DE\u6536\u7AD9\uFF09\u9875\u9762\uFF0C\u5FC5\u987B\u663E\u5F0F\u4F20 yes: true\uFF08\u6216 "true" / "yes" / 1\uFF09\u624D\u4F1A\u8C03\u7528 ntn\uFF1B\u672C\u6B21\u6CA1\u6709\u8C03\u7528 ntn\u3002'
     );
+  }
+  const target = await classifyTrashTarget(runner, id);
+  if (target.kind === "database") {
+    throw new InputError(
+      `notion_page cannot delete a database (id ${id}). Removing a database, its data sources and every row in them is far more destructive than deleting a page, so this tool refuses even with yes: true. Ask the user to delete it in Notion (\u2022\u2022\u2022 \u2192 Delete) if that is really intended.`,
+      { id, target: "database", refused: "database_delete" }
+    );
+  }
+  if (target.kind === "page" && target.archived) {
+    return pageValue("trash", {
+      id,
+      url: pageUrl(id),
+      properties: [],
+      changed: ["trashed"],
+      already_linked: true
+    });
+  }
+  if (target.kind === "page") {
+    const children = await listChildPages(runner, id);
+    if (children.length > 0 && params.recursive !== true) {
+      throw new InputError(
+        `\u9875\u9762 ${id} \u6709 ${children.length} \u4E2A\u5B50\u9875\u9762\u3002Notion \u4F1A\u8FDE\u5E26\u5F52\u6863\u6574\u68F5\u5B50\u6811\uFF0C\u6240\u4EE5\u9ED8\u8BA4\u62D2\u7EDD\u3002\u786E\u8BA4\u8981\u4E00\u8D77\u5220\u9664\u8BF7\u52A0 recursive: true\uFF1B\u53EA\u60F3\u5220\u7236\u9875\u9762\u8BF7\u5148\u5728 Notion \u91CC\u79FB\u8D70\u5B50\u9875\u9762\u3002`,
+        {
+          id,
+          children: children.map((child) => child.id),
+          child_pages: children,
+          recursive_required: true
+        }
+      );
+    }
   }
   const result = await runner({ args: ["pages", "trash", id, "--yes"] });
   if (!result.ok) throw ntnFailure("ntn pages trash", result);
@@ -1938,6 +2140,10 @@ var PAGE_PARAMETERS = {
     yes: {
       type: "boolean",
       description: "trash: must be true, otherwise the tool refuses without calling ntn. attach (row\u2192row): consent to replacing an existing Parent-item link that points at a different parent."
+    },
+    recursive: {
+      type: "boolean",
+      description: "trash only: consent to delete a page together with its child pages (Notion archives the whole subtree). Without it a page that has child pages is refused with the child ids."
     }
   },
   required: ["action"],
@@ -1980,16 +2186,16 @@ function createNotionPageTool(deps = {}) {
     },
     async execute(args, exec) {
       const raw = args;
-      const action = raw.action;
-      if (typeof action !== "string" || !Object.prototype.hasOwnProperty.call(ALLOWED_PARAMS, action)) {
-        throw new InputError(
-          `\u672A\u77E5 action ${describeValue(action)}\uFF1A\u53EA\u652F\u6301 create / edit / attach / trash\uFF08\u79FB\u52A8/\u6302\u8F7D\u7528 attach\uFF0C\u6CA1\u6709 move\uFF09\u3002`
-        );
-      }
+      const action = readEnum(raw.action, "action", [
+        { value: "create", aliases: ["new", "add", "make", "insert"] },
+        { value: "edit", aliases: ["update", "modify", "change", "set", "patch"] },
+        { value: "attach", aliases: ["move", "reparent", "re-parent", "link"] },
+        { value: "trash", aliases: ["delete", "remove", "archive", "destroy", "trash"] }
+      ]);
       if (exec.signal?.aborted) throw abortError();
       const typedAction = action;
       rejectUnexpectedParams(raw, typedAction);
-      const typed = args;
+      const typed = normalizePageArgs(raw, typedAction);
       const run = bindSignal(runner, exec.signal);
       if (typedAction === "create") return await createPage(typed, run);
       if (typedAction === "edit") return await editPage(typed, run);
@@ -2018,23 +2224,26 @@ function summarizeFailure(result, action) {
   const code = result.code === null ? "" : ` (exit ${result.code})`;
   return `${action} failed${code}: ${detail || "no output from ntn"}`;
 }
-function normalizeLimit(limit) {
-  const value = limit ?? DEFAULT_QUERY_LIMIT;
-  if (!Number.isInteger(value)) {
-    throw new Error(`limit must be an integer, got ${String(limit)}.`);
-  }
-  if (value <= 0) {
-    throw new Error(`limit must be greater than 0, got ${value}.`);
-  }
-  return Math.min(value, MAX_QUERY_LIMIT);
+function readQueryLimit(raw) {
+  if (raw === void 0 || raw === null) return DEFAULT_QUERY_LIMIT;
+  const value = readInteger(raw, "limit", 1, MAX_QUERY_LIMIT);
+  return value;
 }
 function normalizeSort(sort) {
   if (sort === void 0) return [];
   const raw = Array.isArray(sort) ? sort : [sort];
   const specs = [];
   for (const item of raw) {
+    if (typeof item !== "string") {
+      throw inputError(
+        `sort entries must be "Property asc|desc" strings, got ${describe(item)}.`,
+        { sort: item }
+      );
+    }
     const spec = item.trim();
-    if (!spec) throw new Error("sort entries must be non-empty 'Property asc|desc' strings.");
+    if (!spec) {
+      throw inputError('sort entries must be non-empty "Property asc|desc" strings.');
+    }
     specs.push(spec);
   }
   return specs;
@@ -2161,7 +2370,7 @@ async function filterUnder(params, target, runner) {
     const hints = [...schema.properties.values()].filter((entry) => isWritablePropertyType(entry.type)).map((entry) => ({ name: entry.name, type: entry.type }));
     const relations = [...schema.properties.values()].filter((entry) => entry.type === "relation").map((entry) => entry.name);
     throw new QueryInputError(
-      `data source ${schema.dataSourceId} \u6CA1\u6709\u53EF\u7528\u7684 Parent-item / \u81EA\u5173\u8054 relation \u5217\uFF0C\u65E0\u6CD5\u7528 under \u7B5B\u5B50\u884C\uFF08${relations.length ? `\u73B0\u6709 relation \u5217\uFF1A${relations.join(", ")}` : "\u8BE5 data source \u6CA1\u6709\u4EFB\u4F55 relation \u5217"}\uFF09\u3002\u8BF7\u6539\u7528 filter \u663E\u5F0F\u8FC7\u6EE4\uFF0C\u6216\u5148\u4E3A\u8BE5\u5E93\u52A0\u4E00\u4E2A\u6307\u5411\u81EA\u8EAB\u7684 relation \u5C5E\u6027\u3002`,
+      `data source ${schema.dataSourceId} \u6CA1\u6709\u53EF\u7528\u7684 Parent-item / \u81EA\u5173\u8054 relation \u5217\uFF0C\u65E0\u6CD5\u7528 under \u7B5B\u5B50\u884C\uFF08${relations.length ? `\u73B0\u6709 relation \u5217\uFF1A${relations.join(", ")}` : "\u8BE5 data source \u6CA1\u6709\u4EFB\u4F55 relation \u5217"}\uFF09\u3002\u8BF7\u6539\u7528 filter \u663E\u5F0F\u8FC7\u6EE4\uFF0C\u6216\u5148\u4E3A\u8BE5\u5E93\u52A0\u4E00\u4E2A\u6307\u5411\u81EA\u8EAB\u7684 relation \u5C5E\u6027\u3002\u53EF\u5199\u5C5E\u6027\uFF1A${hints.length ? hints.map((h) => `${h.name} (${h.type})`).join(", ") : "(none)"}\u3002`,
       {
         target,
         dataSourceId: schema.dataSourceId,
@@ -2201,15 +2410,17 @@ async function attachMarkdown(rows, runner) {
   }
 }
 async function queryDataSource(params, runner = runNtn) {
-  const target = params.database_or_data_source?.trim();
+  const rawTarget = params.database_or_data_source;
+  const target = rawTarget === void 0 || rawTarget === null || rawTarget === "" ? "" : readString(rawTarget, "database_or_data_source");
   if (!target) {
     throw new QueryInputError(
       "database_or_data_source \u5FC5\u987B\u662F data source / database \u7684 id \u6216 URL\uFF08\u975E\u7A7A\uFF09\uFF0C\u4E0D\u77E5\u9053 id \u65F6\u5148\u7528 notion_search \u6309\u6807\u9898\u627E\u5230\u5B83\u3002"
     );
   }
-  const limit = normalizeLimit(params.limit);
+  const rawCursor = params.start_cursor;
+  const limit = readQueryLimit(params.limit);
   const sorts = normalizeSort(params.sort);
-  const startCursor = params.start_cursor?.trim() || void 0;
+  const startCursor = rawCursor === void 0 || rawCursor === null || typeof rawCursor === "string" && rawCursor.trim() === "" ? void 0 : readString(rawCursor, "start_cursor");
   const callerFilter = params.filter;
   if (callerFilter !== void 0 && !isRecord3(callerFilter)) {
     throw new QueryInputError("filter must be a Notion filter JSON object.");
@@ -2256,8 +2467,10 @@ var QUERY_PARAMETERS = {
   type: "object",
   properties: {
     database_or_data_source: {
+      // No `minLength`: DSH's enforced schema subset rejects it, and the PTC SDK
+      // then degrades this whole tool's argument type to `unknown`. The empty case
+      // is guarded at execution instead.
       type: "string",
-      minLength: 1,
       description: "Notion data source id, database id, or Notion URL. If the database has multiple data sources, pass one data source id explicitly."
     },
     limit: {
@@ -2363,7 +2576,7 @@ function normalizeQuery(query) {
   }
   return value;
 }
-function normalizeLimit2(limit) {
+function normalizeLimit(limit) {
   if (limit === void 0) return DEFAULT_LIMIT;
   if (typeof limit !== "number" || !Number.isFinite(limit)) {
     throw inputError(
@@ -2483,7 +2696,7 @@ function describeFailure(result) {
 }
 async function searchNotion(params, runner = defaultDeps.run) {
   const query = normalizeQuery(params.query);
-  const limit = normalizeLimit2(params.limit);
+  const limit = normalizeLimit(params.limit);
   const body = buildSearchBody({ query, limit, filter_object: params.filter_object });
   const result = await runner({ args: buildSearchArgs(body) });
   if (!result.ok) throw new Error(describeFailure(result));
@@ -2506,7 +2719,7 @@ function createNotionSearchTool(deps = {}) {
   const runner = deps.run ?? defaultDeps.run;
   return defineNotionTool({
     name: "notion_search",
-    description: "Search the Notion workspace by title and return every hit's id, title, URL and object type (page|database). Titles only: page body text is never searched, so pass a short keyword rather than a sentence, and use filter_object to cut noise. Read a hit with notion_get; a returned database's id is a data source id for notion_query. Refine the query instead of raising limit, which is capped at 25.",
+    description: "Search the Notion workspace by title and return every hit's id, title, URL and object type (page|database). The match is FUZZY, not exact: Notion matches words inside the title (case-insensitive), a hit can be loosely related, and an empty result does NOT prove the object is missing \u2014 try a shorter or different keyword first. Titles only: page body text is never searched. Use filter_object to cut noise. Any hit's id can be passed straight to notion_get or notion_query (both accept page, data source and database ids). Refine the query instead of raising limit, which is capped at 25.",
     timeoutMs: TOOL_TIMEOUTS.search,
     // Read-only and independent of every other call: safe to run alongside siblings.
     isConcurrencySafe: () => true,
@@ -2515,7 +2728,7 @@ function createNotionSearchTool(deps = {}) {
       properties: {
         query: {
           type: "string",
-          description: "Title keyword to match, searched verbatim (not full-text page search)."
+          description: "Keyword to match against object titles. This is a FUZZY match: Notion matches words inside the title, case-insensitively, and returns related hits \u2014 so a miss does NOT prove the page is absent, and a hit may be only loosely related. It never searches page body text."
         },
         limit: {
           type: "integer",
@@ -2561,7 +2774,7 @@ function createNotionSearchTool(deps = {}) {
       const params = args;
       try {
         const query = normalizeQuery(params.query);
-        const limit = normalizeLimit2(params.limit);
+        const limit = normalizeLimit(params.limit);
         if (exec.signal?.aborted) throw abortError();
         return await searchNotion(
           { query, limit, filter_object: params.filter_object },

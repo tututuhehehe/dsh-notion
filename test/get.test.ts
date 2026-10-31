@@ -298,7 +298,7 @@ describe("notion_get: pages", () => {
     const { run, calls } = mockNtn(() => ok(PAGE_MD));
     await assert.rejects(
       () => executeNotionGet({ id_or_url: PAGE_ID, format: "html" as "md" }, run),
-      /Unsupported format/
+      /not recognized|Unsupported format/
     );
     assert.deepEqual(calls, []);
   });
@@ -544,14 +544,16 @@ describe("notion_get: databases", () => {
       () => executeNotionGet({ id_or_url: PAGE_ID }, run),
       (error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
-        assert.match(message, /as a Notion page or database/);
-        assert.match(message, /- page: .*404/);
-        assert.match(message, /- database: .*404/);
+        // Three levels are reported now: page, database, and the data source probe.
+        assert.match(message, /as a page, database or data source/);
+        assert.match(message, /- ntn pages get: .*404/);
+        assert.match(message, /- ntn datasources resolve: .*404/);
         assert.match(message, /shared with the Notion integration/);
         return true;
       }
     );
-    assert.equal(calls.length, 2);
+    // pages get + datasources resolve + the v1/data_sources probe.
+    assert.equal(calls.length, 3);
   });
 
   it("throws on malformed datasources resolve JSON instead of guessing", async () => {

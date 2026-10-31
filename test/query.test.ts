@@ -130,17 +130,17 @@ describe("notion_query parameters", () => {
       const { run } = fakeRunner([]);
       await assert.rejects(
         () => queryDataSource({ database_or_data_source: "ds-1", limit }, run),
-        /greater than 0/
+        /limit must be >= 1/
       );
     }
   });
 
-  it("rejects a non-integer limit", async () => {
-    const { run } = fakeRunner([]);
-    await assert.rejects(
-      () => queryDataSource({ database_or_data_source: "ds-1", limit: 2.5 }, run),
-      /integer/
-    );
+  it("truncates a fractional limit instead of rejecting it", async () => {
+    // A caller asking for 2.5 rows means 2; rejecting the phrasing would only make
+    // it retry. `<= 0` stays an error because no page size produces it.
+    const { run, calls } = fakeRunner([ok(listResponse([]))]);
+    await queryDataSource({ database_or_data_source: "ds-1", limit: 2.5 }, run);
+    assert.equal(argValue(calls[0].args, "--limit"), "2");
   });
 
   it("omits start_cursor when absent, empty, or null", async () => {

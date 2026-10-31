@@ -16,7 +16,20 @@
  * filter; a caller filter that already targets the same relation column is refused rather than
  * silently rewritten.
  */
-import { abortError, bindSignal, codedError, defineNotionTool, NOTION_ERROR_CODES, NotionToolError, textBlocks, TOOL_TIMEOUTS } from "../dsh/tool.ts";
+import {
+  abortError,
+  bindSignal,
+  codedError,
+  defineNotionTool,
+  inputError,
+  NOTION_ERROR_CODES,
+  NotionToolError,
+  readInteger,
+  readString,
+  describe,
+  textBlocks,
+  TOOL_TIMEOUTS,
+} from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
 import { parseResolveDataSources } from "../lib/datasources.ts";
 import type { ResolvedDataSource } from "../lib/datasources.ts";
@@ -112,14 +125,36 @@ export function normalizeLimit(limit?: number): number {
   return Math.min(value, MAX_QUERY_LIMIT);
 }
 
+/**
+ * The tool's own limit reading: tolerant where {@link normalizeLimit} is strict.
+ * A fractional or numeric-string count is a harmless phrasing difference, so it
+ * is truncated rather than rejected; `<= 0` stays an error because no intended
+ * page size produces it.
+ */
+function readQueryLimit(raw: unknown): number {
+  if (raw === undefined || raw === null) return DEFAULT_QUERY_LIMIT;
+  const value = readInteger(raw, "limit", 1, MAX_QUERY_LIMIT);
+  return value;
+}
+
 /** `sort` accepts one "Prop asc|desc" spec or an ordered list of specs; order matters to Notion. */
 export function normalizeSort(sort?: string | string[]): string[] {
   if (sort === undefined) return [];
   const raw = Array.isArray(sort) ? sort : [sort];
   const specs: string[] = [];
   for (const item of raw) {
+    // Guard the element type: a non-string entry would surface as
+    // "item.trim is not a function", which says nothing the caller can act on.
+    if (typeof item !== "string") {
+      throw inputError(
+        `sort entries must be "Property asc|desc" strings, got ${describe(item)}.`,
+        { sort: item }
+      );
+    }
     const spec = item.trim();
-    if (!spec) throw new Error("sort entries must be non-empty 'Property asc|desc' strings.");
+    if (!spec) {
+      throw inputError('sort entries must be non-empty "Property asc|desc" strings.');
+    }
     specs.push(spec);
   }
   return specs;
@@ -313,7 +348,9 @@ async function filterUnder(
     throw new QueryInputError(
       `data source ${schema.dataSourceId} 没有可用的 Parent-item / 自关联 relation 列，无法用 under 筛子行` +
         `（${relations.length ? `现有 relation 列：${relations.join(", ")}` : "该 data source 没有任何 relation 列"}）。` +
-        "请改用 filter 显式过滤，或先为该库加一个指向自身的 relation 属性。",
+        "请改用 filter 显式过滤，或先为该库加一个指向自身的 relation 属性。" +
+        // DSH keeps only the message, so the writable columns must be listed here.
+        `可写属性：${hints.length ? hints.map((h) => `${h.name} (${h.type})`).join(", ") : "(none)"}。`,
       {
         target,
         dataSourceId: schema.dataSourceId,
@@ -368,7 +405,14 @@ export async function queryDataSource(
   params: NotionQueryParams,
   runner: RunNtnFn = runNtn
 ): Promise<QueryResult> {
-  const target = params.database_or_data_source?.trim();
+  // Guard the raw values before touching them: the schema does not enforce types
+  // (the DSH registry never validates arguments), so `params.x.trim()` on a
+  // number would surface as "trim is not a function" instead of a fixable error.
+  const rawTarget = (params as { database_or_data_source?: unknown }).database_or_data_source;
+  const target =
+    rawTarget === undefined || rawTarget === null || rawTarget === ""
+      ? ""
+      : readString(rawTarget, "database_or_data_source");
   if (!target) {
     throw new QueryInputError(
       "database_or_data_source 必须是 data source / database 的 id 或 URL（非空），" +
@@ -376,9 +420,15 @@ export async function queryDataSource(
     );
   }
 
-  const limit = normalizeLimit(params.limit);
-  const sorts = normalizeSort(params.sort);
-  const startCursor = params.start_cursor?.trim() || undefined;
+  const rawCursor = (params as { start_cursor?: unknown }).start_cursor;
+  const limit = readQueryLimit((params as { limit?: unknown }).limit);
+  const sorts = normalizeSort((params as { sort?: unknown }).sort as string | string[] | undefined);
+  const startCursor =
+    rawCursor === undefined ||
+    rawCursor === null ||
+    (typeof rawCursor === "string" && rawCursor.trim() === "")
+      ? undefined
+      : readString(rawCursor, "start_cursor");
   const callerFilter = params.filter;
   if (callerFilter !== undefined && !isRecord(callerFilter)) {
     throw new QueryInputError("filter must be a Notion filter JSON object.");
@@ -438,8 +488,10 @@ const QUERY_PARAMETERS = {
   type: "object",
   properties: {
     database_or_data_source: {
+      // No `minLength`: DSH's enforced schema subset rejects it, and the PTC SDK
+      // then degrades this whole tool's argument type to `unknown`. The empty case
+      // is guarded at execution instead.
       type: "string",
-      minLength: 1,
       description:
         "Notion data source id, database id, or Notion URL. If the database has multiple data sources, pass one data source id explicitly.",
     },
