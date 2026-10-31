@@ -16,7 +16,7 @@
  * filter; a caller filter that already targets the same relation column is refused rather than
  * silently rewritten.
  */
-import { abortError, bindSignal, defineNotionTool, NOTION_ERROR_CODES, NotionToolError, textBlocks, TOOL_TIMEOUTS } from "../dsh/tool.ts";
+import { abortError, bindSignal, codedError, defineNotionTool, NOTION_ERROR_CODES, NotionToolError, textBlocks, TOOL_TIMEOUTS } from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
 import { parseResolveDataSources } from "../lib/datasources.ts";
 import type { ResolvedDataSource } from "../lib/datasources.ts";
@@ -370,7 +370,10 @@ export async function queryDataSource(
 ): Promise<QueryResult> {
   const target = params.database_or_data_source?.trim();
   if (!target) {
-    throw new Error("database_or_data_source must be a non-empty data source/database id or URL.");
+    throw new QueryInputError(
+      "database_or_data_source 必须是 data source / database 的 id 或 URL（非空），" +
+        "不知道 id 时先用 notion_search 按标题找到它。"
+    );
   }
 
   const limit = normalizeLimit(params.limit);
@@ -540,9 +543,14 @@ export function createNotionQueryTool(deps: NotionQueryDeps = {}): NotionTool<Qu
         );
       } catch (error) {
         if (error instanceof QueryInputError) {
-          throw new NotionToolError(error.message, { code: NOTION_ERROR_CODES.invalidInput, details: error.details });
+          throw new NotionToolError(error.message, {
+            code: NOTION_ERROR_CODES.invalidInput,
+            details: error.details,
+          });
         }
-        throw error;
+        // Everything else (a failed `ntn datasources query`, an unparseable response)
+        // must still reach the model with a code; without this it arrives bare.
+        throw codedError(error);
       }
     },
   });

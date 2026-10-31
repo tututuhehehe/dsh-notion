@@ -20,10 +20,16 @@ function bindSignal(run, signal) {
 function abortError() {
   return new NotionToolError("tool call aborted", { code: NOTION_ERROR_CODES.aborted });
 }
-function codedError(error, code = NOTION_ERROR_CODES.ntnFailed) {
+function codedError(error) {
   if (error instanceof NotionToolError) return error;
   const message = error instanceof Error ? error.message : String(error);
-  return new NotionToolError(message, { code });
+  return new NotionToolError(message, { code: NOTION_ERROR_CODES.ntnFailed });
+}
+function inputError(message, details) {
+  return new NotionToolError(message, {
+    code: NOTION_ERROR_CODES.invalidInput,
+    ...details ? { details } : {}
+  });
 }
 function textBlocks(text2) {
   return [{ type: "text", text: text2 }];
@@ -2197,7 +2203,9 @@ async function attachMarkdown(rows, runner) {
 async function queryDataSource(params, runner = runNtn) {
   const target = params.database_or_data_source?.trim();
   if (!target) {
-    throw new Error("database_or_data_source must be a non-empty data source/database id or URL.");
+    throw new QueryInputError(
+      "database_or_data_source \u5FC5\u987B\u662F data source / database \u7684 id \u6216 URL\uFF08\u975E\u7A7A\uFF09\uFF0C\u4E0D\u77E5\u9053 id \u65F6\u5148\u7528 notion_search \u6309\u6807\u9898\u627E\u5230\u5B83\u3002"
+    );
   }
   const limit = normalizeLimit(params.limit);
   const sorts = normalizeSort(params.sort);
@@ -2330,9 +2338,12 @@ function createNotionQueryTool(deps = {}) {
         );
       } catch (error) {
         if (error instanceof QueryInputError) {
-          throw new NotionToolError(error.message, { code: NOTION_ERROR_CODES.invalidInput, details: error.details });
+          throw new NotionToolError(error.message, {
+            code: NOTION_ERROR_CODES.invalidInput,
+            details: error.details
+          });
         }
-        throw error;
+        throw codedError(error);
       }
     }
   });
@@ -2346,7 +2357,7 @@ var defaultDeps = { run: runNtn };
 function normalizeQuery(query) {
   const value = typeof query === "string" ? query.trim() : "";
   if (!value) {
-    throw new Error(
+    throw inputError(
       "notion_search requires a non-empty query: pass a keyword. Notion search matches titles (page/database names), not page body text."
     );
   }
@@ -2355,13 +2366,13 @@ function normalizeQuery(query) {
 function normalizeLimit2(limit) {
   if (limit === void 0) return DEFAULT_LIMIT;
   if (typeof limit !== "number" || !Number.isFinite(limit)) {
-    throw new Error(
+    throw inputError(
       `notion_search limit must be a positive integer (got ${String(limit)}). Default ${DEFAULT_LIMIT}, max ${MAX_LIMIT}.`
     );
   }
   const value = Math.trunc(limit);
   if (value <= 0) {
-    throw new Error(
+    throw inputError(
       `notion_search limit must be >= 1 (got ${limit}). Default ${DEFAULT_LIMIT}, max ${MAX_LIMIT}.`
     );
   }

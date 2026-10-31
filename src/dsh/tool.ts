@@ -107,16 +107,29 @@ export function abortError(): NotionToolError {
 /**
  * Ensure a thrown value reaches the model with a `[CODE]` prefix.
  *
- * The tool bodies predate error codes and throw plain `Error`s for `ntn`
- * failures and unparseable output. DSH forwards only `message`, so wrapping
- * here is what keeps a bare `Error` from arriving as an unexplained sentence.
- * An already-coded error (and a cancellation) passes through untouched.
+ * The tool bodies predate error codes and throw plain `Error`s both for bad
+ * arguments and for failed `ntn` calls. DSH forwards only `message`, so this
+ * wrapper is what keeps a bare `Error` from arriving as an unexplained
+ * sentence. An already-coded error passes through untouched.
+ *
+ * Argument validation throws {@link NotionToolError} with `INVALID_INPUT` at
+ * the point of validation, so anything still uncoded by the time it reaches
+ * here is an `ntn` failure or an unparseable response.
  */
-export function codedError(error: unknown, code: NotionErrorCode = NOTION_ERROR_CODES.ntnFailed): Error {
+export function codedError(error: unknown): Error {
   if (error instanceof NotionToolError) return error;
   const message = error instanceof Error ? error.message : String(error);
-  return new NotionToolError(message, { code });
+  return new NotionToolError(message, { code: NOTION_ERROR_CODES.ntnFailed });
 }
+
+/** An argument the caller can fix: `[INVALID_INPUT]` with optional structured details. */
+export function inputError(message: string, details?: JsonObject): NotionToolError {
+  return new NotionToolError(message, {
+    code: NOTION_ERROR_CODES.invalidInput,
+    ...(details ? { details } : {}),
+  });
+}
+
 
 /** Single-text-block renderer for the common "one human-readable summary" output. */
 export function textBlocks(text: string): TextBlock[] {

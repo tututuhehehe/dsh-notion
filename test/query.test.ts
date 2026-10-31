@@ -155,8 +155,18 @@ describe("notion_query parameters", () => {
     const { run } = fakeRunner([]);
     await assert.rejects(
       () => queryDataSource({ database_or_data_source: "   " }, run),
-      /non-empty/
+      /非空|non-empty/
     );
+  });
+
+  it("codes a failed data source query as NTN_FAILED instead of leaving it bare", async () => {
+    const tool = createNotionQueryTool({
+      runNtn: async () => ({ ok: false, stdout: "", stderr: "boom", code: 1 }),
+    });
+    const mounted = mount(tool);
+    const result = await mounted.execute("call-q-code", { database_or_data_source: "abc", limit: 5 });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error: \[NTN_FAILED\] /);
   });
 
   it("rejects a non-object filter", async () => {

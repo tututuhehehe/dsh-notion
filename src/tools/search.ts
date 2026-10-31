@@ -11,7 +11,7 @@
  *   data_source，所以只在**发请求时**翻译（`value: "data_source"`），返回里再翻回 `database`。
  * - 依赖注入 runner：单测拿假 runner 顶替 runNtn，不需要 PATH 上的 ntn、不需要真 Notion 账号。
  */
-import { abortError, bindSignal, codedError, defineNotionTool, textBlocks, TOOL_TIMEOUTS } from "../dsh/tool.ts";
+import { abortError, bindSignal, codedError, defineNotionTool, inputError, textBlocks, TOOL_TIMEOUTS } from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
 import { parseJsonStdout, runNtn } from "../lib/runNtn.ts";
 import type { RunNtnOptions, RunNtnResult } from "../lib/runNtn.ts";
@@ -76,7 +76,7 @@ const defaultDeps: SearchDeps = { run: runNtn };
 export function normalizeQuery(query: unknown): string {
   const value = typeof query === "string" ? query.trim() : "";
   if (!value) {
-    throw new Error(
+    throw inputError(
       "notion_search requires a non-empty query: pass a keyword. Notion search matches titles " +
         "(page/database names), not page body text."
     );
@@ -88,13 +88,13 @@ export function normalizeQuery(query: unknown): string {
 export function normalizeLimit(limit: number | undefined): number {
   if (limit === undefined) return DEFAULT_LIMIT;
   if (typeof limit !== "number" || !Number.isFinite(limit)) {
-    throw new Error(
+    throw inputError(
       `notion_search limit must be a positive integer (got ${String(limit)}). Default ${DEFAULT_LIMIT}, max ${MAX_LIMIT}.`
     );
   }
   const value = Math.trunc(limit);
   if (value <= 0) {
-    throw new Error(
+    throw inputError(
       `notion_search limit must be >= 1 (got ${limit}). Default ${DEFAULT_LIMIT}, max ${MAX_LIMIT}.`
     );
   }
