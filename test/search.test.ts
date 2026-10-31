@@ -1,6 +1,7 @@
 /**
  * notion_search 单测：不碰 PATH 上的 ntn、不联网。
- * runNtn 通过 registerNotionSearch(pi, { run }) 注入假实现顶替（就是 mock runNtn）。
+ * runNtn 通过 createNotionSearchTool({ run }) 注入假实现顶替（就是 mock runNtn），
+ * 再用 test/fixtures/dsh.ts 按 DSH registry 的方式把 tool 定义挂出来。
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -10,54 +11,26 @@ import {
   MAX_LIMIT,
   buildSearchArgs,
   buildSearchBody,
+  createNotionSearchTool,
   extractTitle,
   formatOutcome,
   normalizeHit,
   normalizeLimit,
   normalizeQuery,
   parseSearchResponse,
-  registerNotionSearch,
   searchNotion,
+  type SearchOutcome,
 } from "../src/tools/search.ts";
 import type { SearchRunner } from "../src/tools/search.ts";
 import type { RunNtnOptions } from "../src/lib/runNtn.ts";
+import { mount, text } from "./fixtures/dsh.ts";
+import type { MountedTool } from "./fixtures/dsh.ts";
 
-type RegisteredTool = {
-  name: string;
-  label: string;
-  description: string;
-  parameters: { required?: string[]; properties: Record<string, unknown> };
-  execute: (
-    toolCallId: string,
-    params: Record<string, unknown>,
-    signal?: AbortSignal,
-    onUpdate?: (update: {
-      content: Array<{ type: string; text: string }>;
-      details: Record<string, unknown>;
-    }) => void
-  ) => Promise<{
-    content: Array<{ type: string; text: string }>;
-    details: Record<string, unknown>;
-    structuredContent?: unknown;
-  }>;
-};
-
-/** 假 pi：只实现 registerTool（扩展只用到这一个 API） */
-function fakePi(): { pi: Parameters<typeof registerNotionSearch>[0]; tools: RegisteredTool[] } {
-  const tools: RegisteredTool[] = [];
-  const pi = {
-    registerTool: (tool: RegisteredTool) => {
-      tools.push(tool);
-    },
-  } as unknown as Parameters<typeof registerNotionSearch>[0];
-  return { pi, tools };
-}
-
-function registerWith(runner: SearchRunner): RegisteredTool {
-  const { pi, tools } = fakePi();
-  registerNotionSearch(pi, { run: runner });
-  assert.equal(tools.length, 1);
-  return tools[0];
+/** Mount the real tool definition the way DSH does, with an injected fake runner. */
+function mountWith(runner: SearchRunner): MountedTool<SearchOutcome> {
+  const tool = mount(createNotionSearchTool({ run: runner }));
+  assert.equal(tool.name, "notion_search");
+  return tool;
 }
 
 /** 记录 argv，并返回固定 stdout */
@@ -84,7 +57,7 @@ const PAGE_AND_DB = {
         Name: {
           id: "title",
           type: "title",
-          title: [{ type: "text", plain_text: "Pi 设计", text: { content: "Pi 设计" } }],
+          title: [{ type: "text", plain_text: "设计评审", text: { content: "设计评审" } }],
         },
         Status: { id: "st", type: "status", status: { name: "Done" } },
       },
@@ -103,7 +76,7 @@ const PAGE_AND_DB = {
 
 describe("normalizeQuery", () => {
   it("trims a real query", () => {
-    assert.equal(normalizeQuery("  pi-notion "), "pi-notion");
+    assert.equal(normalizeQuery("  notion-tools "), "notion-tools");
   });
   it("rejects missing / blank query with a clear message", () => {
     assert.throws(() => normalizeQuery(""), /non-empty query/);
@@ -133,23 +106,23 @@ describe("normalizeLimit", () => {
 
 describe("buildSearchBody / buildSearchArgs", () => {
   it("sends query + page_size only when no filter is asked", () => {
-    const body = buildSearchBody({ query: "pi", limit: 5 });
-    assert.deepEqual(body, { query: "pi", page_size: 5 });
-    assert.deepEqual(buildSearchArgs(body), ["api", "v1/search", "--data", '{"query":"pi","page_size":5}']);
+    const body = buildSearchBody({ query: "notion", limit: 5 });
+    assert.deepEqual(body, { query: "notion", page_size: 5 });
+    assert.deepEqual(buildSearchArgs(body), ["api", "v1/search", "--data", '{"query":"notion","page_size":5}']);
   });
   it("translates database -> data_source for the API", () => {
-    const body = buildSearchBody({ query: "pi", limit: 5, filter_object: "database" });
+    const body = buildSearchBody({ query: "notion", limit: 5, filter_object: "database" });
     assert.deepEqual(body.filter, { property: "object", value: "data_source" });
   });
   it("passes page through as page", () => {
-    const body = buildSearchBody({ query: "pi", limit: 5, filter_object: "page" });
+    const body = buildSearchBody({ query: "notion", limit: 5, filter_object: "page" });
     assert.deepEqual(body.filter, { property: "object", value: "page" });
   });
 });
 
 describe("extractTitle / normalizeHit", () => {
   it("reads the title property of a page in a data source", () => {
-    assert.equal(extractTitle(PAGE_AND_DB.results[0]), "Pi 设计");
+    assert.equal(extractTitle(PAGE_AND_DB.results[0]), "设计评审");
   });
   it("reads the top-level title of a database (data source)", () => {
     assert.equal(extractTitle(PAGE_AND_DB.results[1]), "测试库");
@@ -200,21 +173,21 @@ describe("parseSearchResponse", () => {
 describe("searchNotion", () => {
   it("calls ntn api v1/search with the JSON body and returns hits", async () => {
     const calls: RunNtnOptions[] = [];
-    const outcome = await searchNotion({ query: " pi ", limit: 5, filter_object: "page" }, runnerReturning(JSON.stringify(PAGE_AND_DB), calls));
+    const outcome = await searchNotion({ query: " notion ", limit: 5, filter_object: "page" }, runnerReturning(JSON.stringify(PAGE_AND_DB), calls));
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0].args, [
       "api",
       "v1/search",
       "--data",
-      '{"query":"pi","page_size":5,"filter":{"property":"object","value":"page"}}',
+      '{"query":"notion","page_size":5,"filter":{"property":"object","value":"page"}}',
     ]);
-    assert.equal(outcome.query, "pi");
+    assert.equal(outcome.query, "notion");
     assert.equal(outcome.limit, 5);
     assert.deepEqual(outcome.results.map((hit) => hit.object), ["page", "database"]);
   });
 
   it("slices overshooting upstream results down to limit", async () => {
-    const outcome = await searchNotion({ query: "pi", limit: 1 }, runnerReturning(JSON.stringify(PAGE_AND_DB)));
+    const outcome = await searchNotion({ query: "notion", limit: 1 }, runnerReturning(JSON.stringify(PAGE_AND_DB)));
     assert.equal(outcome.results.length, 1);
   });
 
@@ -226,7 +199,7 @@ describe("searchNotion", () => {
       stderr: "error: Public API request failed: API token is invalid.",
     });
     await assert.rejects(
-      () => searchNotion({ query: "pi" }, runner),
+      () => searchNotion({ query: "notion" }, runner),
       /the token was rejected — set a valid NOTION_API_TOKEN/
     );
   });
@@ -237,12 +210,12 @@ describe("searchNotion", () => {
       code: 4,
       stderr: "error: No workspace selected.",
     });
-    await assert.rejects(() => searchNotion({ query: "pi" }, runner), /authenticate first/);
+    await assert.rejects(() => searchNotion({ query: "notion" }, runner), /authenticate first/);
   });
 
   it("surfaces an install hint when ntn is not on PATH", async () => {
     const runner = runnerReturning("", [], { ok: false, code: null, stderr: "spawn ntn ENOENT" });
-    await assert.rejects(() => searchNotion({ query: "pi" }, runner), /install the Notion CLI/);
+    await assert.rejects(() => searchNotion({ query: "notion" }, runner), /install the Notion CLI/);
   });
 
   it("fails before spawning ntn when query is blank", async () => {
@@ -263,7 +236,7 @@ describe("searchNotion", () => {
     const runner = runnerReturning("", [], { ok: false, code: 500, stderr: `boom ${"x".repeat(5000)}` });
     await assert.rejects(async () => {
       try {
-        await searchNotion({ query: "pi" }, runner);
+        await searchNotion({ query: "notion" }, runner);
       } catch (error) {
         const message = (error as Error).message;
         assert.ok(message.length < 400, `message too long: ${message.length}`);
@@ -277,13 +250,13 @@ describe("searchNotion", () => {
 describe("formatOutcome", () => {
   it("lists hits with object, title, id and url", () => {
     const text = formatOutcome({
-      query: "pi",
+      query: "notion",
       limit: 5,
       hasMore: false,
-      results: [{ id: "abc", title: "Pi 设计", url: "https://app.notion.com/p/x", object: "page" }],
+      results: [{ id: "abc", title: "设计评审", url: "https://app.notion.com/p/x", object: "page" }],
     });
     assert.match(text, /1 result\(s\)/);
-    assert.match(text, /1\. page · Pi 设计/);
+    assert.match(text, /1\. page · 设计评审/);
     assert.match(text, /id: abc/);
     assert.match(text, /https:\/\/app\.notion\.com\/p\/x/);
   });
@@ -296,10 +269,10 @@ describe("formatOutcome", () => {
 
   it("tells the model when upstream has more", () => {
     const text = formatOutcome({
-      query: "pi",
+      query: "notion",
       limit: 1,
       hasMore: true,
-      results: [{ id: "abc", title: "Pi 设计", url: "https://app.notion.com/p/x", object: "page" }],
+      results: [{ id: "abc", title: "设计评审", url: "https://app.notion.com/p/x", object: "page" }],
     });
     assert.match(text, /1 result\(s\)/);
     assert.match(text, /More results exist upstream/);
@@ -312,34 +285,34 @@ describe("formatOutcome", () => {
   });
 });
 
-describe("registerNotionSearch", () => {
-  it("registers notion_search with the documented schema", () => {
-    const tool = registerWith(runnerReturning("{}"));
+describe("createNotionSearchTool", () => {
+  it("defines notion_search with the documented schema", () => {
+    const tool = mountWith(runnerReturning("{}"));
     assert.equal(tool.name, "notion_search");
-    assert.equal(tool.label, "Notion Search");
     assert.deepEqual(tool.parameters.required, ["query"]);
     assert.deepEqual(Object.keys(tool.parameters.properties).sort(), ["filter_object", "limit", "query"]);
+    assert.equal(tool.parameters.additionalProperties, false);
   });
 
-  it("executes end-to-end with an injected runner and returns structuredContent", async () => {
+  // DSH tool definitions have no per-call preview channel: there is no `onUpdate`, so there is
+  // nothing to assert about a "pending" streaming update. The canonical value below is the
+  // contract instead (it used to live in `structuredContent`).
+  it("executes end-to-end with an injected runner and returns the canonical SearchOutcome", async () => {
     const calls: RunNtnOptions[] = [];
-    const tool = registerWith(runnerReturning(JSON.stringify(PAGE_AND_DB), calls));
+    const tool = mountWith(runnerReturning(JSON.stringify(PAGE_AND_DB), calls));
 
-    const updates: Array<{ text: string; details: Record<string, unknown> }> = [];
-    const result = await tool.execute("call-1", { query: "pi", limit: 10 }, undefined, (update) => {
-      updates.push({ text: update.content[0].text, details: update.details });
-    });
+    const result = await tool.execute("call-1", { query: "notion", limit: 10 });
 
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0].args.slice(0, 3), ["api", "v1/search", "--data"]);
-    assert.match(updates[0].text, /Searching Notion: pi/);
-    assert.equal(updates[0].details.pending, true);
-    assert.equal(updates[0].details.count, 0);
-    assert.deepEqual(result.structuredContent, {
+    const expected: SearchOutcome = {
+      query: "notion",
+      limit: 10,
+      hasMore: false,
       results: [
         {
           id: "4077266d-1cb4-8153-8f4e-d5d1a1ba6ec1",
-          title: "Pi 设计",
+          title: "设计评审",
           url: "https://app.notion.com/p/4077266d1cb481538f4ed5d1a1ba6ec1",
           object: "page",
         },
@@ -350,22 +323,28 @@ describe("registerNotionSearch", () => {
           object: "database",
         },
       ],
-    });
-    assert.equal(result.details.count, 2);
-    assert.match(result.content[0].text, /2 result\(s\)/);
+    };
+    assert.equal(result.isError, false);
+    assert.deepEqual(result.value, expected);
+    assert.deepEqual(result.details, expected);
+    assert.match(text(result), /2 result\(s\)/);
   });
 
-  it("throws a clear error (and does not run ntn) when query is missing", async () => {
+  it("returns an error result (and does not run ntn) when query is missing", async () => {
     const calls: RunNtnOptions[] = [];
-    const tool = registerWith(runnerReturning("{}", calls));
-    await assert.rejects(() => tool.execute("call-2", {}), /non-empty query/);
+    const tool = mountWith(runnerReturning("{}", calls));
+    const result = await tool.execute("call-2", {});
+    assert.equal(result.isError, true);
+    assert.match(text(result), /non-empty query/);
     assert.equal(calls.length, 0);
   });
 
   it("rejects limit 0 at the tool boundary", async () => {
     const calls: RunNtnOptions[] = [];
-    const tool = registerWith(runnerReturning("{}", calls));
-    await assert.rejects(() => tool.execute("call-3", { query: "pi", limit: 0 }), /limit must be >= 1/);
+    const tool = mountWith(runnerReturning("{}", calls));
+    const result = await tool.execute("call-3", { query: "notion", limit: 0 });
+    assert.equal(result.isError, true);
+    assert.match(text(result), /limit must be >= 1/);
     assert.equal(calls.length, 0);
   });
 });

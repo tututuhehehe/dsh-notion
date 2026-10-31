@@ -119,6 +119,16 @@ export const BODY_COLUMN_SCHEMA = {
   },
 } as const;
 
+/** Acceptance schema with a real column literally named icon (reserved-key conflict). */
+export const ICON_COLUMN_SCHEMA = {
+  object: "data_source",
+  id: ACCEPTANCE.dataSourceId,
+  properties: {
+    ...DATA_SOURCE_SCHEMA.properties,
+    icon: { id: "icon", name: "icon", type: "rich_text", rich_text: {} },
+  },
+} as const;
+
 export function resolveResponse(...ids: string[]): unknown {
   return {
     database_id: ACCEPTANCE_DATABASE_ID,

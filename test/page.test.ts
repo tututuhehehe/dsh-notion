@@ -1,71 +1,37 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-
-import { registerNotionPage } from "../src/tools/page.ts";
-import type { NtnRunner } from "../src/tools/page.ts";
+import { createNotionPageTool } from "../src/tools/page.ts";
+import type { NtnRunner, PageToolValue } from "../src/tools/page.ts";
 import type { RunNtnResult } from "../src/lib/runNtn.ts";
+import { mount, text } from "./fixtures/dsh.ts";
+import type { MountedTool } from "./fixtures/dsh.ts";
 import {
   ACCEPTANCE,
   ACCEPTANCE_DATABASE_ID,
   BODY_COLUMN_SCHEMA,
   DATA_SOURCE_SCHEMA,
   DUAL_RELATION_SCHEMA,
+  ICON_COLUMN_SCHEMA,
   SELF_RELATION_SCHEMA,
   ntnFail,
   ntnOk,
   resolveResponse,
 } from "./fixtures/notion.ts";
 
-type ToolResult = {
-  content: { type: string; text: string }[];
-  details: Record<string, unknown> & {
-    hint_properties?: { name: string; type: string }[];
-    properties?: string[];
-    id?: string;
-    title?: string;
-    parent?: string;
-    parent_item_property?: string;
-    data_source_ids?: string[];
-  };
-  isError?: boolean;
-};
-
-type Tool = {
-  name: string;
-  description?: string;
-  parameters?: { properties?: Record<string, unknown> };
-  execute: (
-    toolCallId: string,
-    params: Record<string, unknown>,
-    signal?: AbortSignal,
-    onUpdate?: unknown,
-    ctx?: unknown
-  ) => Promise<ToolResult>;
-};
-
-/** Register the real tool against a fake pi + a scripted `ntn` runner. */
+/** Mount the real tool definition the way DSH does, with a scripted `ntn` runner. */
 function harness(handler: (args: string[]) => RunNtnResult = () => ntnOk("{}")): {
-  tool: Tool;
+  tool: MountedTool<PageToolValue>;
   calls: string[][];
 } {
   const calls: string[][] = [];
-  const runner: NtnRunner = async (args) => {
-    calls.push(args);
-    return handler(args);
+  const runner: NtnRunner = async (options) => {
+    calls.push(options.args);
+    return handler(options.args);
   };
-  const tools: Tool[] = [];
-  const pi = {
-    registerTool(tool: Tool) {
-      tools.push(tool);
-    },
-  } as unknown as ExtensionAPI;
-
-  registerNotionPage(pi, { runNtn: runner });
-  assert.equal(tools.length, 1);
-  assert.equal(tools[0].name, "notion_page");
-  return { tool: tools[0], calls };
+  const tool = mount(createNotionPageTool({ runNtn: runner }));
+  assert.equal(tool.name, "notion_page");
+  return { tool, calls };
 }
 
 function pageCreateResponse(pageId: string): RunNtnResult {
@@ -92,12 +58,17 @@ const PARENT_ROW_ID = "33333333-3333-4333-8333-333333333333";
 const OTHER_ROW_ID = "44444444-4444-4444-8444-444444444444";
 
 describe("notion_page registration", () => {
-  it("exposes create/edit/attach/trash and no top-level content parameter", () => {
+  it("exposes create/edit/attach/trash, no top-level content and no top-level icon", () => {
     const { tool } = harness();
     const properties = tool.parameters?.properties ?? {};
     assert.deepEqual(Object.keys(properties).sort(), ["action", "id", "parent", "props", "title", "yes"]);
     assert.equal("content" in properties, false);
+    // icon is a reserved key inside props, never a top-level parameter.
+    assert.equal("icon" in properties, false);
+    assert.equal(tool.parameters?.additionalProperties, false);
+    assert.deepEqual(tool.parameters?.required, ["action"]);
     assert.match(tool.description ?? "", /props\.body_content/);
+    assert.match(tool.description ?? "", /props\.icon/);
   });
 });
 
@@ -166,7 +137,7 @@ describe("notion_page create", () => {
       props: { body_content: "# Hello\n\nbody" },
     });
 
-    assert.equal(result.isError, undefined);
+    assert.equal(result.isError, false);
     assert.equal(calls.length, 1);
 
     const args = calls[0];
@@ -196,8 +167,12 @@ describe("notion_page create", () => {
         yes: true,
       });
       assert.equal(result.isError, true);
-      assert.match(result.content[0].text, /已移除顶层 content/);
-      assert.match(result.content[0].text, /props\.body_content/);
+      // DSH's schema has additionalProperties:false; the body still fails loudly instead of
+      // silently dropping the argument, and says where the Markdown really goes.
+      assert.match(text(result), /多余的参数：.*content/);
+      if (action === "create" || action === "edit") {
+        assert.match(text(result), /props\.body_content/);
+      }
     }
     assert.equal(calls.length, 0);
   });
@@ -231,7 +206,7 @@ describe("notion_page create", () => {
       props: { Name: "新行", Status: "待办" },
     });
 
-    assert.equal(result.isError, undefined);
+    assert.equal(result.isError, false);
     assert.deepEqual(calls[0], ["datasources", "resolve", ACCEPTANCE_DATABASE_ID, "--json"]);
     assert.deepEqual(calls[1], ["api", `v1/data_sources/${ACCEPTANCE.dataSourceId}`]);
     assert.deepEqual(calls[2].slice(0, 3), ["pages", "create", "--json"]);
@@ -298,7 +273,7 @@ describe("notion_page create", () => {
     const hints = result.details.hint_properties;
     assert.ok(Array.isArray(hints));
     assert.deepEqual(
-      hints.map((hint) => hint.name),
+      hints.map((hint: { name: string }) => hint.name),
       ["Name", "Status", "标签", "截止日期", "Done"]
     );
     assert.ok(result.content[0].text.includes("Name (title)"));
@@ -327,7 +302,7 @@ describe("notion_page create", () => {
       props: { body_content: "- one\n- two" },
     });
 
-    assert.equal(result.isError, undefined);
+    assert.equal(result.isError, false);
     assert.equal(calls.length, 1);
     assert.ok(calls[0].includes("--content=- one\n- two"));
   });
@@ -349,7 +324,7 @@ describe("notion_page create", () => {
       props: { Name: "B", body_content: "body" },
     });
 
-    assert.equal(result.isError, undefined);
+    assert.equal(result.isError, false);
     assert.match(calls[1].find((arg) => arg.startsWith("--content=")) ?? "", /title: "A"/);
     assert.deepEqual(JSON.parse(calls[2][5]), {
       properties: { Name: { title: [{ type: "text", text: { content: "A" } }] } },
@@ -396,7 +371,7 @@ describe("notion_page create", () => {
       props: { Name: "子任务", Status: "待办" },
     });
 
-    assert.equal(result.isError, undefined);
+    assert.equal(result.isError, false);
     const createArgs = calls.find((args) => args[0] === "pages") ?? [];
     assert.equal(
       createArgs[createArgs.indexOf("--parent") + 1],
@@ -436,7 +411,11 @@ describe("notion_page create", () => {
     assert.equal(calls.some((args) => args[0] === "pages"), false);
     assert.match(result.content[0].text, /Parent-item/);
     assert.match(result.content[0].text, /没有任何 relation 列/);
-    assert.ok((result.details.hint_properties ?? []).some((hint) => hint.name === "Name"));
+    assert.ok(
+      (result.details.hint_properties ?? []).some(
+        (hint: { name: string }) => hint.name === "Name"
+      )
+    );
   });
 
   it("rejects a bare id that is not a readable page with prefix guidance", async () => {
@@ -452,6 +431,210 @@ describe("notion_page create", () => {
   });
 });
 
+describe("notion_page error codes", () => {
+  // DSH forwards only `message` to the model, so every code must be visible in it.
+  it("prefixes a rejected argument with [INVALID_INPUT]", async () => {
+    const { tool, calls } = harness();
+    const result = await tool.execute("call-code-1", { action: "create" });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+    assert.equal(calls.length, 0);
+  });
+
+  it("prefixes a failed ntn call with [NTN_FAILED]", async () => {
+    const { tool } = harness(() => ntnFail("boom: not logged in"));
+    const result = await tool.execute("call-code-2", {
+      action: "trash",
+      id: EDIT_PAGE_ID,
+      yes: true,
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error: \[NTN_FAILED\] /);
+    assert.match(result.content[0].text, /boom: not logged in/);
+  });
+
+  it("reports a cleanup that left a page behind as [PARTIAL_WRITE]", async () => {
+    const { tool } = harness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${PARENT_ROW_ID}`) return pageWithParent(DS_PARENT);
+      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
+        return ntnOk(SELF_RELATION_SCHEMA);
+      }
+      if (args[0] === "pages" && args[1] === "create") return pageCreateResponse(NEW_PAGE_ID);
+      if (args[0] === "api" && args[2] === "-X") return ntnFail("relation write rejected");
+      if (args[0] === "pages" && args[1] === "trash") return ntnFail("trash rejected");
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    });
+    const result = await tool.execute("call-code-3", {
+      action: "create",
+      parent: PARENT_ROW_ID,
+      props: { body_content: "# Child" },
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error: \[PARTIAL_WRITE\] /);
+    assert.match(result.content[0].text, /partial: true/);
+    assert.match(result.content[0].text, /回滚失败/);
+    assert.equal(result.details.partial, true);
+  });
+
+  it("reports a successful rollback under the original code, not PARTIAL_WRITE", async () => {
+    const { tool } = harness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${PARENT_ROW_ID}`) return pageWithParent(DS_PARENT);
+      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
+        return ntnOk(SELF_RELATION_SCHEMA);
+      }
+      if (args[0] === "pages" && args[1] === "create") return pageCreateResponse(NEW_PAGE_ID);
+      if (args[0] === "api" && args[2] === "-X") return ntnFail("relation write rejected");
+      if (args[0] === "pages" && args[1] === "trash") return ntnOk("trashed");
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    });
+    const result = await tool.execute("call-code-4", {
+      action: "create",
+      parent: PARENT_ROW_ID,
+      props: { body_content: "# Child" },
+    });
+    assert.equal(result.isError, true);
+    // The page was trashed, so this is an ordinary ntn failure, not a partial write.
+    assert.match(result.content[0].text, /^Error: \[NTN_FAILED\] /);
+    assert.match(result.content[0].text, /partial: false/);
+    assert.doesNotMatch(result.content[0].text, /PARTIAL_WRITE/);
+    assert.equal(result.details.partial, false);
+  });
+});
+
+describe("notion_page icon", () => {
+  function createScript(): (args: string[]) => RunNtnResult {
+    return (args) => {
+      if (args[0] === "pages") return pageCreateResponse(NEW_PAGE_ID);
+      if (args[0] === "api" && args[2] === "-X") return ntnOk({ object: "page", id: NEW_PAGE_ID });
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    };
+  }
+
+  function patchBody(calls: string[][]): Record<string, unknown> {
+    const patch = calls.find((args) => args[2] === "-X");
+    if (!patch) throw new Error("expected a PATCH call");
+    return JSON.parse(patch[5]) as Record<string, unknown>;
+  }
+
+  it("writes props.icon as an emoji in the follow-up PATCH, with no properties key", async () => {
+    const { tool, calls } = harness(createScript());
+
+    const result = await tool.execute("icon-create-emoji", {
+      action: "create",
+      parent: `page:${ACCEPTANCE.parentPageId}`,
+      title: "Icon page",
+      props: { icon: "🎯" },
+    });
+
+    assert.equal(result.isError, false, text(result));
+    const create = calls.find((args) => args[0] === "pages") ?? [];
+    assert.equal(create[1], "create");
+    assert.deepEqual(patchBody(calls), { icon: { type: "emoji", emoji: "🎯" } });
+    assert.equal("properties" in patchBody(calls), false);
+    assert.deepEqual(result.details.properties, []);
+    assert.equal(result.details.icon, "🎯");
+    assert.deepEqual(result.details.changed, ["icon"]);
+  });
+
+  it("writes an http(s) props.icon as a Notion external file icon", async () => {
+    const url = "https://x.test/a.png";
+    const { tool, calls } = harness(createScript());
+
+    const result = await tool.execute("icon-create-url", {
+      action: "create",
+      parent: `page:${ACCEPTANCE.parentPageId}`,
+      title: "Icon page",
+      props: { icon: url },
+    });
+
+    assert.equal(result.isError, false, text(result));
+    assert.deepEqual(patchBody(calls), { icon: { type: "external", external: { url } } });
+    assert.equal("properties" in patchBody(calls), false);
+    assert.equal(result.details.icon, url);
+  });
+
+  it("sends icon: null to clear the icon, still without a properties key", async () => {
+    const { tool, calls } = harness(createScript());
+
+    const result = await tool.execute("icon-create-clear", {
+      action: "create",
+      parent: `page:${ACCEPTANCE.parentPageId}`,
+      title: "Icon page",
+      props: { icon: null },
+    });
+
+    assert.equal(result.isError, false, text(result));
+    assert.deepEqual(patchBody(calls), { icon: null });
+    assert.equal("properties" in patchBody(calls), false);
+    assert.equal(result.details.icon, null);
+  });
+
+  it("edits an icon-only page with exactly one PATCH and no property map", async () => {
+    const { tool, calls } = harness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
+        return pageWithParent({ type: "page_id", page_id: ACCEPTANCE.parentPageId });
+      }
+      if (args[0] === "api" && args[2] === "-X") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    });
+
+    const result = await tool.execute("icon-edit-only", {
+      action: "edit",
+      id: EDIT_PAGE_ID,
+      props: { icon: "🎯" },
+    });
+
+    assert.equal(result.isError, false, text(result));
+    const patches = calls.filter((args) => args[2] === "-X");
+    assert.equal(patches.length, 1, "an icon-only edit is exactly one PATCH");
+    assert.equal("properties" in patchBody(calls), false);
+    assert.deepEqual(patchBody(calls), { icon: { type: "emoji", emoji: "🎯" } });
+    assert.deepEqual(result.details.changed, ["icon"]);
+    assert.deepEqual(result.details.properties, []);
+  });
+
+  it("refuses props.icon when the data source has a real column named icon", async () => {
+    const { tool, calls } = harness((args) => {
+      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
+        return ntnOk(ICON_COLUMN_SCHEMA);
+      }
+      return pageCreateResponse(NEW_PAGE_ID);
+    });
+
+    const result = await tool.execute("icon-conflict", {
+      action: "create",
+      parent: `data-source:${ACCEPTANCE.dataSourceId}`,
+      title: "冲突",
+      props: { icon: "🎯" },
+    });
+
+    assert.equal(result.isError, true);
+    assert.match(text(result), /保留键/);
+    assert.match(text(result), /icon/);
+    assert.deepEqual(result.details.reserved_keys, ["icon"]);
+    assert.equal(result.details.conflict, true);
+    // Only the schema read ran: the reserved-key conflict must never create a page.
+    assert.equal(calls.length, 1);
+    assert.equal(calls.some((args) => args[0] === "pages"), false);
+  });
+
+  it("rejects an over-long non-URL icon string as invalid input, before any ntn call", async () => {
+    const { tool, calls } = harness(createScript());
+
+    const result = await tool.execute("icon-invalid", {
+      action: "create",
+      parent: `page:${ACCEPTANCE.parentPageId}`,
+      title: "Icon page",
+      props: { icon: "this is definitely not an emoji" },
+    });
+
+    assert.equal(result.isError, true);
+    assert.match(text(result), /既不是 emoji 也不是图片 URL/);
+    assert.equal(result.details.property, "icon");
+    assert.equal(calls.length, 0);
+  });
+});
+
 describe("notion_page edit", () => {
   it("refuses edit with neither props nor title, without calling ntn", async () => {
     const { tool, calls } = harness();
@@ -460,7 +643,7 @@ describe("notion_page edit", () => {
 
     assert.equal(result.isError, true);
     assert.equal(calls.length, 0);
-    assert.match(result.content[0].text, /props.*或 title/);
+    assert.match(result.content[0].text, /edit 需要 props.*至少一项/);
   });
 
   it("edits the body via props.body_content using pages edit", async () => {
@@ -478,7 +661,7 @@ describe("notion_page edit", () => {
       props: { body_content: "# New body" },
     });
 
-    assert.equal(result.isError, undefined);
+    assert.equal(result.isError, false);
     assert.equal(calls.length, 2);
     assert.deepEqual(calls[1].slice(0, 3), ["pages", "edit", EDIT_PAGE_ID]);
     assert.equal(calls[1][3], "--content=# New body");
@@ -507,7 +690,7 @@ describe("notion_page edit", () => {
       },
     });
 
-    assert.equal(result.isError, undefined);
+    assert.equal(result.isError, false);
     assert.equal(calls.length, 3);
     const patch = calls[2];
     assert.deepEqual(patch.slice(0, 5), ["api", `v1/pages/${EDIT_PAGE_ID}`, "-X", "PATCH", "--data"]);
@@ -540,7 +723,7 @@ describe("notion_page edit", () => {
       props: { body_content: "更新后的正文", Done: true },
     });
 
-    assert.equal(result.isError, undefined);
+    assert.equal(result.isError, false);
     assert.equal(calls.length, 4);
     assert.equal(calls[2][0], "pages");
     assert.equal(calls[2][1], "edit");
@@ -566,7 +749,11 @@ describe("notion_page edit", () => {
     assert.equal(result.isError, true);
     assert.equal(calls.length, 2, "no PATCH may run for an unknown property");
     assert.match(result.content[0].text, /未知属性/);
-    assert.ok((result.details.hint_properties ?? []).some((hint) => hint.name === "Name"));
+    assert.ok(
+      (result.details.hint_properties ?? []).some(
+        (hint: { name: string }) => hint.name === "Name"
+      )
+    );
   });
 
   it("updates the title property when only title is given", async () => {
@@ -584,7 +771,7 @@ describe("notion_page edit", () => {
       title: "改名",
     });
 
-    assert.equal(result.isError, undefined);
+    assert.equal(result.isError, false);
     assert.equal(calls.length, 3);
     assert.deepEqual(JSON.parse(calls[2][5]), {
       properties: {
@@ -633,7 +820,7 @@ describe("notion_page edit", () => {
       props: { Done: true },
     });
 
-    assert.equal(result.isError, undefined, result.content[0].text);
+    assert.equal(result.isError, false, result.content[0].text);
     assert.deepEqual(calls[1], ["datasources", "resolve", ACCEPTANCE_DATABASE_ID, "--json"]);
     assert.equal(
       calls.some((args) => args[1]?.startsWith("v1/databases/")),
@@ -651,7 +838,7 @@ describe("notion_page edit", () => {
     });
     assert.equal(result.isError, true);
     assert.equal(calls.length, 0);
-    assert.match(result.content[0].text, /props.*或 title/);
+    assert.match(result.content[0].text, /edit 需要 props.*至少一项/);
   });
 });
 
@@ -679,7 +866,7 @@ describe("notion_page attach", () => {
       parent: `page:${NEW_PAGE_ID}`,
     });
 
-    assert.equal(result.isError, undefined, result.content[0].text);
+    assert.equal(result.isError, false, result.content[0].text);
     assert.deepEqual(calls, [
       ["api", `v1/pages/${EDIT_PAGE_ID}`],
       ["api", `v1/pages/${NEW_PAGE_ID}`],
@@ -714,7 +901,7 @@ describe("notion_page attach", () => {
       parent: NEW_PAGE_ID,
     });
 
-    assert.equal(result.isError, undefined, result.content[0].text);
+    assert.equal(result.isError, false, result.content[0].text);
     assert.equal(result.details.parent, `page:${NEW_PAGE_ID}`);
     // classify the bare id once, read the child once, walk the page ancestors, then move.
     assert.equal(calls.length, 4);
@@ -765,7 +952,7 @@ describe("notion_page attach", () => {
       parent: PARENT_ROW_ID,
     });
 
-    assert.equal(result.isError, undefined);
+    assert.equal(result.isError, false);
     const patch = calls.find((args) => args[2] === "-X") ?? [];
     assert.deepEqual(JSON.parse(patch[5]), {
       properties: { "Parent-item": { relation: [{ id: PARENT_ROW_ID }] } },
@@ -1114,7 +1301,7 @@ describe("notion_page attach guards", () => {
       yes: true,
     });
 
-    assert.equal(result.isError, undefined, result.content[0].text);
+    assert.equal(result.isError, false, result.content[0].text);
     const patch = calls.find((args) => args[2] === "-X") ?? [];
     assert.deepEqual(JSON.parse(patch[5]), {
       properties: { "Parent-item": { relation: [{ id: PARENT_ROW_ID }] } },
@@ -1134,7 +1321,7 @@ describe("notion_page attach guards", () => {
       parent: PARENT_ROW_ID,
     });
 
-    assert.equal(result.isError, undefined, result.content[0].text);
+    assert.equal(result.isError, false, result.content[0].text);
     assert.equal(result.details.already_linked, true);
     assert.deepEqual(result.details.changed, []);
     assert.equal(calls.some((args) => args[2] === "-X"), false);
@@ -1161,7 +1348,7 @@ describe("notion_page attach guards", () => {
       parent: PARENT_ROW_ID,
       yes: true,
     });
-    assert.equal(replaced.isError, undefined, replaced.content[0].text);
+    assert.equal(replaced.isError, false, replaced.content[0].text);
     const patch = calls.find((args) => args[2] === "-X") ?? [];
     assert.deepEqual(JSON.parse(patch[5]), {
       properties: { "Parent-item": { relation: [{ id: PARENT_ROW_ID }] } },
@@ -1186,7 +1373,7 @@ describe("notion_page attach guards", () => {
       id: OTHER_ROW_ID,
       parent: PARENT_ROW_ID,
     });
-    assert.equal(attach.isError, undefined, attach.content[0].text);
+    assert.equal(attach.isError, false, attach.content[0].text);
     assert.equal(attach.details.parent_item_property, ACCEPTANCE.parentItemColumn);
     const patch = calls.find((args) => args[2] === "-X") ?? [];
     const body = JSON.parse(patch[5]).properties;
@@ -1198,7 +1385,7 @@ describe("notion_page attach guards", () => {
       parent: PARENT_ROW_ID,
       props: { body_content: "# Child" },
     });
-    assert.equal(created.isError, undefined, created.content[0].text);
+    assert.equal(created.isError, false, created.content[0].text);
     const createPatch = calls.filter((args) => args[2] === "-X").at(-1) ?? [];
     const createdBody = JSON.parse(createPatch[5]).properties;
     assert.deepEqual(createdBody[ACCEPTANCE.parentItemColumn], {
@@ -1273,7 +1460,7 @@ describe("notion_page trash", () => {
       yes: true,
     });
 
-    assert.equal(result.isError, undefined);
+    assert.equal(result.isError, false);
     assert.deepEqual(calls, [["pages", "trash", EDIT_PAGE_ID, "--yes"]]);
     assert.deepEqual(result.details.changed, ["trashed"]);
   });

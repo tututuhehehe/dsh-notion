@@ -1,5 +1,5 @@
 /**
- * Live end-to-end check for pi-notion 1.1 (NOT part of `npm test`).
+ * Live end-to-end check for dsh-notion 1.1 (NOT part of `npm test`).
  *
  * Covers the v1.1 behaviors that cannot be proven with mocks:
  *   - child row create under a parent row (bare parent row id → Parent-item relation)
@@ -14,39 +14,32 @@
  * Uses the acceptance database from AGENTS.md. Temps are named `e2e <stamp> …` so a
  * leftover is easy to spot if the process is killed mid-run.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-
 import { sameNotionId } from "../src/lib/properties.ts";
-import { registerNotionGet } from "../src/tools/get.ts";
-import { registerNotionPage } from "../src/tools/page.ts";
-import { registerNotionQuery } from "../src/tools/query.ts";
+import type { NotionTool } from "../src/dsh/tool.ts";
+import { createNotionGetTool } from "../src/tools/get.ts";
+import { createNotionPageTool } from "../src/tools/page.ts";
+import { createNotionQueryTool } from "../src/tools/query.ts";
+import { mount, text } from "./fixtures/dsh.ts";
+import type { MountedResult, MountedTool } from "./fixtures/dsh.ts";
 import { ACCEPTANCE } from "./fixtures/notion.ts";
 
-type ToolResult = {
-  content: { type: string; text: string }[];
-  details?: Record<string, unknown>;
-  isError?: boolean;
-};
+type ToolResult = MountedResult<any>;
 
-type Tool = {
-  name: string;
-  execute: (toolCallId: string, params: Record<string, unknown>) => Promise<ToolResult>;
-};
+const tools = new Map<string, MountedTool<any>>();
 
-const tools = new Map<string, Tool>();
-const pi = {
-  registerTool(config: Tool) {
-    tools.set(config.name, config);
-  },
-} as unknown as ExtensionAPI;
+/** Mount a factory-built DSH tool definition the way the registry does. */
+function register<Value>(tool: NotionTool<Value>): void {
+  const mounted = mount(tool);
+  tools.set(mounted.name, mounted as MountedTool<any>);
+}
 
-registerNotionGet(pi);
-registerNotionPage(pi);
-registerNotionQuery(pi);
+register(createNotionGetTool());
+register(createNotionPageTool());
+register(createNotionQueryTool());
 
-function tool(name: string): Tool {
+function tool(name: string): MountedTool<any> {
   const registered = tools.get(name);
-  if (!registered) throw new Error(`tool ${name} was not registered`);
+  if (!registered) throw new Error(`tool ${name} was not mounted`);
   return registered;
 }
 
@@ -71,10 +64,6 @@ function check(name: string, condition: boolean, detail = ""): void {
   }
 }
 
-function text(result: ToolResult): string {
-  return result.content.map((part) => part.text).join("\n");
-}
-
 function detailId(result: ToolResult): string | undefined {
   const id = result.details?.id;
   return typeof id === "string" ? id : undefined;
@@ -88,7 +77,7 @@ async function createRow(
   const result = await call("notion_page", {
     action: "create",
     parent: parent ?? `data-source:${ACCEPTANCE.dataSourceId}`,
-    props: { body_content: `# ${title}\n\npi-notion 1.1 live e2e temp row.` },
+    props: { body_content: `# ${title}\n\ndsh-notion 1.1 live e2e temp row.` },
   });
   if (result.isError) {
     throw new Error(`create ${label} failed: ${text(result)}`);

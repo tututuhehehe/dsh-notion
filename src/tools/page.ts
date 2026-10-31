@@ -1,21 +1,25 @@
 /**
- * notion_page — create / edit / attach / trash Notion pages through the official `ntn` CLI.
+ * notion_page — create / edit / attach / trash one Notion page through the official `ntn` CLI.
  *
- * All `ntn` invocations go through {@link NtnRunner} (default: `src/lib/runNtn.ts`).
+ * Every `ntn` invocation goes through {@link NtnRunner} (default: `src/lib/runNtn.ts`).
  * The model never gets a free-form `ntn api` call: the only API paths used here are
  *   GET   v1/pages/{id}                (classify a bare parent id; read a page's parent)
  *   GET   v1/data_sources/{id}         (property schema; a database has no schema in 2025-09+)
- *   PATCH v1/pages/{id}                (property whitelist; see below)
+ *   PATCH v1/pages/{id}                (property whitelist + icon; see below)
  *   POST  v1/pages/{id}/move           (attach a page under a page)
  *   `ntn datasources resolve <db-id>`  (database id → its unique data source)
  * and each is built from a validated id, never from raw model text.
  *
- * Property write rules (also documented in README):
+ * Reserved `props` keys (never columns):
+ *   - `props.body_content` : the page Markdown body.
+ *   - `props.icon`         : the page icon. An emoji (`"🎯"`), an http(s) image URL, an
+ *                            already-typed Notion icon object, or `null` to clear it.
+ *   A data source that really has a column with either name makes any write carrying that
+ *   reserved key fail instead of silently writing the column.
+ *
+ * Property write rules:
  *   - `props` is an OBJECT map of property NAME → simplified value. Multiple keys
  *     mean multiple properties; `{}` is treated as "omit" (no PATCH).
- *   - `props.body_content` is RESERVED: it is the page Markdown body, stripped from
- *     the map before the property PATCH. A real column named `body_content` makes
- *     any write that carries a body fail instead of silently writing the column.
  *   - The value is converted according to the property TYPE from the parent
  *     database/data-source schema:
  *       title / rich_text : string                    → { title | rich_text: [{type:"text",text:{content}}] }
@@ -43,11 +47,11 @@
  *   database:<id>      resolved through `ntn datasources resolve` to its unique data
  *                      source (several → error listing the ids, never a guess)
  *
- * `attach` (NOT a file upload, NOT a rename of `move`): re-parents an existing page.
+ * `attach` (NOT a file upload, and not a rename of `move`): re-parents an existing page.
  *   page → page : POST v1/pages/{id}/move
  *   row  → row  : PATCH the Parent-item / self-relation column of the moved row
  *
- * Attach guards (1.1):
+ * Attach guards:
  *   - row→row refuses cycles: walk the Parent-item chain up from the prospective parent
  *     inside the same data source; an unreadable ancestor refuses instead of guessing.
  *   - row→row refuses to replace a different existing parent unless `yes: true`; the
@@ -55,14 +59,13 @@
  *   - page→page refuses self and already-child; deeper page cycles use a best-effort
  *     `parent.page_id` walk (GET per ancestor) and report `cycle_check`.
  *
- * Create is two writes (pages create + one property/Parent-item PATCH). If the PATCH
+ * Create is two writes (pages create + one property/Parent-item/icon PATCH). If the PATCH
  * fails the new page is trashed immediately; the error carries `partial` (false when
  * the workspace is clean again), `created_id`, and `rollback` ("trashed" | "trash_failed"
  * | "unknown_id"). Only a structured JSON page id is ever used as a trash target.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
-
+import { abortError, bindSignal, defineNotionTool, NOTION_ERROR_CODES, NotionToolError, textBlocks, TOOL_TIMEOUTS } from "../dsh/tool.ts";
+import type { NotionTool } from "../dsh/tool.ts";
 import { parseResolveDataSources } from "../lib/datasources.ts";
 import {
   canonicalNotionId,
@@ -72,14 +75,14 @@ import {
   READ_ONLY_PROPERTY_TYPES,
 } from "../lib/properties.ts";
 import { parseJsonStdout, runNtn } from "../lib/runNtn.ts";
-import type { RunNtnResult } from "../lib/runNtn.ts";
+import type { RunNtnOptions, RunNtnResult } from "../lib/runNtn.ts";
 import {
   extractSchemaProperties,
   reportedDataSourceId,
   type SchemaProperty,
 } from "../lib/schema.ts";
 
-export type NtnRunner = (args: string[]) => Promise<RunNtnResult>;
+export type NtnRunner = (options: RunNtnOptions) => Promise<RunNtnResult>;
 export type NotionPageDeps = {
   /** Injected for tests; production always spawns the real `ntn`. */
   runNtn?: NtnRunner;
@@ -90,6 +93,8 @@ type ParentKind = "page" | "database" | "data_source";
 
 /** Reserved props key: the Markdown body, never a column write. */
 const BODY_CONTENT_KEY = "body_content";
+/** Reserved props key: the page icon (emoji / external URL / null to clear), never a column. */
+const ICON_KEY = "icon";
 
 export interface NotionPageParams {
   action: "create" | "edit" | "attach" | "trash";
@@ -159,14 +164,11 @@ function isNotionId(value: string): boolean {
   return UUID_RE.test(value) || HEX32_RE.test(value);
 }
 
-/** Validation failure that should be reported to the model without a stack trace. */
-class InputError extends Error {
-  readonly details: JsonObject;
-
+/** Validation failure the model can correct: reported as the call's error, without a stack. */
+class InputError extends NotionToolError {
   constructor(message: string, details: JsonObject = {}) {
-    super(message);
+    super(message, { code: NOTION_ERROR_CODES.invalidInput, details });
     this.name = "InputError";
-    this.details = details;
   }
 }
 
@@ -229,12 +231,98 @@ interface NormalizedProps {
   body?: string;
   /** True when the caller supplied `body_content` at all (even an empty string). */
   hasBody: boolean;
+  /** Notion `icon` payload from the reserved `icon` key. */
+  icon?: NormalizedIcon;
+}
+
+/**
+ * The page icon, already shaped the way `PATCH v1/pages/{id}` expects:
+ *   "🎯"                 → { type: "emoji", emoji: "🎯" }
+ *   "https://…/a.png"    → { type: "external", external: { url } }
+ *   null                 → null (clear the icon)
+ *   { type: "emoji", … } → passed through (escape hatch for custom_emoji / file icons)
+ */
+interface NormalizedIcon {
+  /** The value to send as `icon`; null clears. */
+  payload: JsonObject | null;
+  /** Short label for the model-facing result. */
+  display: string | null;
+}
+
+const HTTP_URL_RE = /^https?:\/\//i;
+/** Notion icons are one emoji; anything long is a caller mistake, not an emoji. */
+const MAX_EMOJI_LENGTH = 16;
+
+function normalizeIcon(raw: unknown): NormalizedIcon | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === null) return { payload: null, display: null };
+
+  if (typeof raw === "string") {
+    const value = raw.trim();
+    if (!value) {
+      throw new InputError(
+        `props.${ICON_KEY} 不能是空字符串：不设置 icon 就省略这个键，清除已有 icon 请传 null。`,
+        { property: ICON_KEY }
+      );
+    }
+    if (HTTP_URL_RE.test(value)) {
+      return { payload: { type: "external", external: { url: value } }, display: value };
+    }
+    if ([...value].length > MAX_EMOJI_LENGTH) {
+      throw new InputError(
+        `props.${ICON_KEY} 看起来既不是 emoji 也不是图片 URL（长度 ${[...value].length}）：` +
+          `${describeValue(value)}。请传单个 emoji（如 "🎯"）、http(s) 图片 URL，或 null 清除。`,
+        { property: ICON_KEY, value }
+      );
+    }
+    return { payload: { type: "emoji", emoji: value }, display: value };
+  }
+
+  if (isPlainObject(raw)) {
+    const type = raw.type;
+    if (type === "emoji") {
+      const emoji = typeof raw.emoji === "string" ? raw.emoji.trim() : "";
+      if (!emoji) {
+        throw new InputError(
+          `props.${ICON_KEY} 的 emoji 对象缺少 emoji 文本：需要 { "type": "emoji", "emoji": "🎯" }。`,
+          { property: ICON_KEY }
+        );
+      }
+      return { payload: { type: "emoji", emoji }, display: emoji };
+    }
+    if (type === "external") {
+      const url = isPlainObject(raw.external) ? raw.external.url : undefined;
+      if (typeof url !== "string" || !HTTP_URL_RE.test(url.trim())) {
+        throw new InputError(
+          `props.${ICON_KEY} 的 external 对象需要一个 http(s) url：` +
+            `{ "type": "external", "external": { "url": "https://…/a.png" } }。`,
+          { property: ICON_KEY }
+        );
+      }
+      return { payload: { type: "external", external: { url: url.trim() } }, display: url.trim() };
+    }
+    if (type === "custom_emoji" || type === "file") {
+      // Escape hatch: a caller that already knows the exact Notion payload wins.
+      return { payload: raw, display: `${String(type)} icon` };
+    }
+    throw new InputError(
+      `props.${ICON_KEY} 的对象形式必须带 type：接受 "emoji" / "external" / "custom_emoji" / "file"，` +
+        `或直接传 emoji 字符串、图片 URL、null。收到 ${describeValue(raw)}。`,
+      { property: ICON_KEY, value: raw }
+    );
+  }
+
+  throw new InputError(
+    `props.${ICON_KEY} 必须是 emoji 字符串、http(s) 图片 URL、已构好的 Notion icon 对象，或 null（清除）；` +
+      `收到 ${describeValue(raw)}。`,
+    { property: ICON_KEY, value: raw }
+  );
 }
 
 /**
  * `props` must be an object map. `{}`/absent means "no property write".
  * Arrays (the old/naive shape) are rejected explicitly, with the fix in the message.
- * `body_content` is split out: it is the page body, not a column.
+ * `body_content` and `icon` are split out: they are page-level fields, not columns.
  */
 function normalizeProps(raw: unknown): NormalizedProps {
   if (raw === undefined || raw === null) return { hasBody: false };
@@ -250,10 +338,11 @@ function normalizeProps(raw: unknown): NormalizedProps {
   const rest: Record<string, unknown> = {};
   let body: string | undefined;
   let hasBody = false;
+  let icon: NormalizedIcon | undefined;
   for (const [name, value] of Object.entries(raw)) {
-    if (value === undefined) continue;
     if (name === BODY_CONTENT_KEY) {
       hasBody = true;
+      if (value === undefined) continue;
       if (typeof value !== "string") {
         throw new InputError(
           `props.${BODY_CONTENT_KEY} 必须是 Markdown 字符串（页面正文），收到 ${describeValue(value)}。`,
@@ -263,6 +352,11 @@ function normalizeProps(raw: unknown): NormalizedProps {
       body = value;
       continue;
     }
+    if (name === ICON_KEY) {
+      icon = normalizeIcon(value);
+      continue;
+    }
+    if (value === undefined) continue;
     rest[name] = value;
   }
 
@@ -271,22 +365,35 @@ function normalizeProps(raw: unknown): NormalizedProps {
     ...(entries.length ? { props: Object.fromEntries(entries) } : {}),
     ...(body !== undefined ? { body } : {}),
     hasBody,
+    ...(icon ? { icon } : {}),
   };
 }
 
 /**
- * `body_content` is reserved. If the data source really has a column with that
- * name, refuse instead of guessing whether the caller meant the column or the body.
+ * Both reserved keys must not collide with a real column of the same name: guessing
+ * whether the caller meant the column or the reserved field would write the wrong thing.
  */
-function assertBodyContentAvailable(schema: PropertySchemaSet, hasBody: boolean): void {
-  if (!hasBody) return;
-  if (!schema.properties.has(BODY_CONTENT_KEY)) return;
+function assertReservedKeysAvailable(
+  schema: PropertySchemaSet,
+  hasBody: boolean,
+  icon: NormalizedIcon | undefined
+): void {
+  const conflicts = [
+    ...(hasBody && schema.properties.has(BODY_CONTENT_KEY) ? [BODY_CONTENT_KEY] : []),
+    ...(icon && schema.properties.has(ICON_KEY) ? [ICON_KEY] : []),
+  ];
+  if (conflicts.length === 0) return;
+  const described = conflicts
+    .map((name) =>
+      name === BODY_CONTENT_KEY ? `"${name}"（保留键：页面正文）` : `"${name}"（保留键：页面 icon）`
+    )
+    .join("、");
   throw new InputError(
-    `data source 里存在名为 "${BODY_CONTENT_KEY}" 的真实列，而 ${BODY_CONTENT_KEY} 是保留键（页面正文），` +
-      `不能同时作为列名写入。请先重命名该列，或不要把正文和该列混用；本次没有写入任何属性。`,
+    `data source 里存在名为 ${described} 的真实列，与保留键同名。` +
+      `不能同时当作列名写入，请先重命名该列，或不使用该保留键；本次没有写入任何内容。`,
     {
-      property: BODY_CONTENT_KEY,
       conflict: true,
+      reserved_keys: conflicts,
       ...(schema.dataSourceId ? { dataSourceId: schema.dataSourceId } : {}),
     }
   );
@@ -383,15 +490,18 @@ function parseJsonMaybe(stdout: string): unknown {
   }
 }
 
-function ntnFailure(label: string, result: RunNtnResult, note?: string): InputError {
+function ntnFailure(label: string, result: RunNtnResult, note?: string): NotionToolError {
   const detail = (result.stderr || result.stdout || "").trim();
   const exit = result.code === null ? "" : `（exit ${result.code}）`;
-  return new InputError(
+  return new NotionToolError(
     `${note ? `${note}；` : ""}${label} 失败${exit}${detail ? `：${truncate(detail)}` : ""}`,
     {
-      stderr: result.stderr.trim(),
-      stdout: truncate(result.stdout.trim()),
-      code: result.code,
+      code: NOTION_ERROR_CODES.ntnFailed,
+      details: {
+        stderr: result.stderr.trim(),
+        stdout: truncate(result.stdout.trim()),
+        code: result.code,
+      },
     }
   );
 }
@@ -401,7 +511,7 @@ async function fetchDataSourceSchema(
   dataSourceId: string
 ): Promise<PropertySchemaSet> {
   const path = `v1/data_sources/${dataSourceId}`;
-  const result = await runner(["api", path]);
+  const result = await runner({ args: ["api", path] });
   if (!result.ok) throw ntnFailure(`读取属性 schema (${path})`, result);
 
   const parsed = parseJsonMaybe(result.stdout);
@@ -421,7 +531,7 @@ async function fetchDataSourceSchema(
 
 /** Database id → unique data source id; several → error listing them, never a silent pick. */
 async function resolveDatabaseDataSource(runner: NtnRunner, databaseId: string): Promise<string> {
-  const result = await runner(["datasources", "resolve", databaseId, "--json"]);
+  const result = await runner({ args: ["datasources", "resolve", databaseId, "--json"] });
   if (!result.ok) {
     throw ntnFailure(`解析 database ${databaseId} 的 data source`, result);
   }
@@ -488,7 +598,7 @@ function pageObjectFrom(raw: unknown): PageObject {
 }
 
 async function fetchPageObject(runner: NtnRunner, pageId: string): Promise<PageObject> {
-  const result = await runner(["api", `v1/pages/${pageId}`]);
+  const result = await runner({ args: ["api", `v1/pages/${pageId}`] });
   if (!result.ok) throw ntnFailure(`读取页面 ${pageId}`, result);
   return pageObjectFrom(parseJsonMaybe(result.stdout));
 }
@@ -1071,31 +1181,128 @@ function pageUrlFromRaw(raw: unknown, pageId: string): string {
   return pageUrl(pageId);
 }
 
-function patchArgs(pageId: string, properties: JsonObject): string[] {
-  return ["api", `v1/pages/${pageId}`, "-X", "PATCH", "--data", JSON.stringify({ properties })];
+/**
+ * `PATCH v1/pages/{id}`: property writes and/or the icon, in one request.
+ * An empty property map is omitted so an icon-only write stays icon-only.
+ */
+function patchArgs(pageId: string, properties: JsonObject, icon?: NormalizedIcon): string[] {
+  const body: JsonObject = {};
+  if (Object.keys(properties).length > 0) body.properties = properties;
+  if (icon) body.icon = icon.payload;
+  return ["api", `v1/pages/${pageId}`, "-X", "PATCH", "--data", JSON.stringify(body)];
 }
 
 type Action = "create" | "edit" | "attach" | "trash";
 
-type ToolResult = {
-  content: { type: "text"; text: string }[];
-  details: JsonObject;
-  isError?: boolean;
+/**
+ * The canonical JSON value of a successful `notion_page` call. The model-facing text is
+ * derived from it by {@link describePageValue}, so the value stays a domain DTO rather
+ * than a copy of the rendered content.
+ */
+export type PageToolValue = {
+  ok: true;
+  action: Action;
+  id?: string;
+  url?: string;
+  title?: string;
+  parent?: string;
+  /** Names of the properties actually written (empty = none). */
+  properties: string[];
+  /** What changed: "body_content" | "properties" | "parent" | "parent_item_relation" | "trashed" */
+  changed: string[];
+  /** Icon as sent: an emoji, an image URL, a description, or null when cleared. */
+  icon?: string | null;
+  /** create when the parent was a database row. */
+  parent_item_row_id?: string;
+  parent_item_property?: string;
+  /** attach: the page/row is already under the requested parent; nothing was written. */
+  already_linked?: boolean;
+  /** attach row→row: the Parent-item values that were replaced. */
+  replaced_parent_ids?: string[];
+  /** attach: how far the cycle check got ("walked" | "partial" | "cycle"). */
+  cycle_check?: string;
 };
 
-function okResult(action: Action, text: string, details: JsonObject): ToolResult {
-  return {
-    content: [{ type: "text", text }],
-    details: { ok: true, action, ...details },
-  };
+/** Model-facing text for a canonical create/edit/attach/trash value. */
+export function describePageValue(value: PageToolValue): string {
+  const props = value.properties.join(", ");
+  if (value.action === "create") {
+    return [
+      `已创建页面${value.title ? ` "${value.title}"` : ""}${value.id ? `：${value.id}` : ""}`,
+      value.url ? `URL: ${value.url}` : "",
+      value.parent ? `parent: ${value.parent}` : "",
+      value.parent_item_row_id ? `Parent-item → ${value.parent_item_row_id}` : "",
+      value.properties.length ? `已写入属性：${props}` : "未写入属性（props 为空）",
+      value.icon !== undefined ? `icon: ${value.icon ?? "（已清除）"}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  if (value.action === "edit") {
+    const what = value.changed.includes("body_content") ? "内容" : "属性";
+    return [
+      `已更新页面 ${value.id} 的${what}`,
+      value.url ? `URL: ${value.url}` : "",
+      value.changed.includes("body_content") && value.changed.includes("properties")
+        ? `已写入属性：${props}`
+        : value.properties.length
+          ? `属性：${props}`
+          : "",
+      value.icon !== undefined ? `icon: ${value.icon ?? "（已清除）"}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  if (value.action === "attach") {
+    if (value.already_linked) {
+      return [
+        `行 ${value.id} 已经在父行 ${value.parent_item_row_id} 下（Parent-item 列：${value.parent_item_property}），无需改动`,
+        value.url ? `URL: ${value.url}` : "",
+        "changed: (none)",
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
+    if (value.parent_item_property) {
+      return [
+        `已把行 ${value.id} 挂到父行 ${value.parent_item_row_id} 下`,
+        `Parent-item 列：${value.parent_item_property}`,
+        value.replaced_parent_ids?.length
+          ? `替换了原来的父级：${value.replaced_parent_ids.join(", ")}`
+          : "",
+        value.url ? `URL: ${value.url}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
+    return [
+      `已把页面 ${value.id} 挂到 ${value.parent} 下`,
+      value.url ? `URL: ${value.url}` : "",
+      value.cycle_check === "partial"
+        ? "注意：页面祖先链未能完整读取，深层环检查为 best-effort（cycle_check: partial）"
+        : "",
+      "changed: parent",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  return [`已把页面 ${value.id} 移入回收站`, value.url ? `URL: ${value.url}` : ""]
+    .filter(Boolean)
+    .join("\n");
 }
 
-function inputErrorResult(error: InputError, action: unknown): ToolResult & { isError: true } {
-  return {
-    content: [{ type: "text", text: `notion_page: ${error.message}` }],
-    details: { ok: false, action, error: error.message, ...error.details },
-    isError: true,
-  };
+/** Build the canonical value of a successful action. */
+function pageValue(
+  action: Action,
+  fields: Omit<PageToolValue, "ok" | "action" | "properties" | "changed"> & {
+    properties?: string[];
+    changed: string[];
+  }
+): PageToolValue {
+  return { ok: true, action, properties: [], ...fields };
 }
 
 /* ------------------------------------------------------------------ *
@@ -1150,12 +1357,12 @@ function withRowParentRelation(
 async function rollbackCreatedPage(
   runner: NtnRunner,
   pageId: string,
-  cause: InputError
-): Promise<InputError> {
+  cause: NotionToolError
+): Promise<NotionToolError> {
   // Production runNtn never rejects, but an injected runner may; never lose the create failure.
   let trash: RunNtnResult;
   try {
-    trash = await runner(["pages", "trash", pageId, "--yes"]);
+    trash = await runner({ args: ["pages", "trash", pageId, "--yes"] });
   } catch (error) {
     trash = {
       ok: false,
@@ -1171,28 +1378,35 @@ async function rollbackCreatedPage(
       `该页面/行仍然存在（partial: true）。请手动清理：notion_page { action: "trash", id: "${pageId}", yes: true }。`
     : `\n已回滚：新页面 ${pageId} 已移入回收站（partial: false），没有留下半成品。`;
 
-  return new InputError(`${cause.message}${rollbackLine}`, {
+  // A failed cleanup leaves a page behind: the model must act on that differently from
+  // "the arguments were rejected", so it gets its own code. A clean rollback keeps the
+  // code that actually failed (NTN_FAILED / INVALID_INPUT), not PARTIAL_WRITE.
+  const details: JsonObject = {
     ...cause.details,
     partial,
     created_id: pageId,
     rollback: partial ? "trash_failed" : "trashed",
     rollback_code: trash.code,
     ...(detail ? { rollback_error: truncate(detail, 600) } : {}),
+  };
+  return new NotionToolError(`${cause.detail}${rollbackLine}`, {
+    code: partial ? NOTION_ERROR_CODES.partialWrite : cause.code,
+    details,
   });
 }
 
 async function createPage(
   params: NotionPageParams,
   runner: NtnRunner
-): Promise<ToolResult> {
-  const { props, body, hasBody } = normalizeProps(params.props);
+): Promise<PageToolValue> {
+  const { props, body, hasBody, icon } = normalizeProps(params.props);
   const explicitTitle = normalizeTitle(params.title);
 
   // Resolving the container also resolves the schema (C4: via data source, not database).
   // The reader memoizes GET v1/pages so a bare row parent is fetched once.
   const readPage = makePageReader(runner);
   const container = await resolveContainer(runner, params.parent, "create", readPage);
-  assertBodyContentAvailable(container.schema, hasBody);
+  assertReservedKeysAvailable(container.schema, hasBody, icon);
 
   const markdown = body ?? "";
 
@@ -1251,14 +1465,16 @@ async function createPage(
 
   // Use `--content=<markdown>` as one argv element: clap would otherwise treat a
   // value starting with `---` (our frontmatter) or `-` (bullet lists) as a flag.
-  const createResult = await runner([
-    "pages",
-    "create",
-    "--json",
-    "--parent",
-    formatParent(container.createParent),
-    `--content=${draft.body}`,
-  ]);
+  const createResult = await runner({
+    args: [
+      "pages",
+      "create",
+      "--json",
+      "--parent",
+      formatParent(container.createParent),
+      `--content=${draft.body}`,
+    ],
+  });
   if (!createResult.ok) throw ntnFailure("ntn pages create", createResult);
 
   const created = parseJsonMaybe(createResult.stdout);
@@ -1269,11 +1485,16 @@ async function createPage(
   const pageId = structuredId ?? textId;
   const url = pageId ? pageUrlFromRaw(created, pageId) : undefined;
 
-  if (propertyNames.length > 0) {
+  // The follow-up PATCH is one request that carries every property plus the icon, so a
+  // page created with only an icon still gets its icon (no properties were written).
+  const needsPatch = propertyNames.length > 0 || icon !== undefined;
+  if (needsPatch) {
     if (!structuredId) {
       throw new InputError(
-        `页面已创建（parent ${formatParent(container.createParent)}），但没有从 ntn 的结构化输出里取到页面 id，props 未写入。` +
-          `没有可信 id 就不自动 trash（避免误删），请用 notion_search/notion_get 找到该页面后，用 notion_page edit 写属性或 trash 删除（partial: true）。`,
+        `页面已创建（parent ${formatParent(container.createParent)}），但没有从 ntn 的结构化输出里取到页面 id，` +
+          `${propertyNames.length > 0 ? "props 和 icon 都" : "icon"}未写入。` +
+          `没有可信 id 就不自动 trash（避免误删），请用 notion_search/notion_get 找到该页面后，` +
+          `用 notion_page edit 写入，或 notion_page trash 删除（partial: true，rollback: unknown_id）。`,
         {
           parent: formatParent(container.createParent),
           partial: true,
@@ -1283,31 +1504,23 @@ async function createPage(
         }
       );
     }
-    const patchResult = await runner(patchArgs(structuredId, properties));
+    const patchResult = await runner({ args: patchArgs(structuredId, properties, icon) });
     if (!patchResult.ok) {
       throw await rollbackCreatedPage(
         runner,
         structuredId,
         ntnFailure(
-          "PATCH 页面属性",
+          "PATCH 页面属性/icon",
           patchResult,
           container.kind === "row"
-            ? `子行已创建（id ${structuredId}），但属性/Parent-item relation 未写入`
-            : `页面已创建（id ${structuredId}），但属性未写入`
+            ? `子行已创建（id ${structuredId}），但属性/Parent-item relation/icon 未写入`
+            : `页面已创建（id ${structuredId}），但属性/icon 未写入`
         )
       );
     }
   }
 
-  const lines = [
-    `已创建页面${title ? ` "${title}"` : ""}${pageId ? `：${pageId}` : ""}`,
-    url ? `URL: ${url}` : "",
-    `parent: ${formatParent(container.createParent)}`,
-    container.kind === "row" ? `Parent-item → ${container.rowParentId}` : "",
-    propertyNames.length ? `已写入属性：${propertyNames.join(", ")}` : "未写入属性（props 为空）",
-  ].filter(Boolean);
-
-  return okResult("create", lines.join("\n"), {
+  return pageValue("create", {
     ...(pageId ? { id: pageId } : {}),
     ...(url ? { url } : {}),
     parent: formatParent(container.createParent),
@@ -1318,30 +1531,35 @@ async function createPage(
           ...(rowRelationName ? { parent_item_property: rowRelationName } : {}),
         }
       : {}),
+    ...(icon ? { icon: icon.display } : {}),
     properties: propertyNames,
+    changed: [
+      ...(propertyNames.length > 0 || container.kind === "row" ? ["properties"] : []),
+      ...(icon ? ["icon"] : []),
+    ],
   });
 }
 
 async function editPage(
   params: NotionPageParams,
   runner: NtnRunner
-): Promise<ToolResult> {
+): Promise<PageToolValue> {
   const id = requireId(params.id, "edit");
-  const { props, body, hasBody } = normalizeProps(params.props);
+  const { props, body, hasBody, icon } = normalizeProps(params.props);
   const explicitTitle = normalizeTitle(params.title);
   // Whitespace-only body is treated as "not provided": `pages edit --content ""`
   // would otherwise silently replace the page with nothing.
   const markdown = body !== undefined && body.trim() !== "" ? body : undefined;
 
-  if (!markdown && !props && !explicitTitle) {
+  if (!markdown && !props && !explicitTitle && icon === undefined) {
     throw new InputError(
-      "edit 需要 props（含 props.body_content）或 title（至少一项）；空调用不会修改页面。"
+      "edit 需要 props（含 props.body_content / props.icon）、title 或 props.icon 至少一项；空调用不会修改页面。"
     );
   }
 
-  // Needed to map props, resolve the title column, and check the reserved body_content name.
+  // Needed to map props, resolve the title column, and check the reserved keys.
   const schema = await schemaForPage(runner, id);
-  assertBodyContentAvailable(schema, hasBody);
+  assertReservedKeysAvailable(schema, hasBody, icon);
 
   let properties: JsonObject = {};
   const propertyNames: string[] = [];
@@ -1363,51 +1581,69 @@ async function editPage(
   }
 
   if (markdown) {
-    const editResult = await runner(["pages", "edit", id, `--content=${markdown}`, "--json"]);
+    const editResult = await runner({ args: ["pages", "edit", id, `--content=${markdown}`, "--json"] });
     if (!editResult.ok) throw ntnFailure("ntn pages edit", editResult);
 
     const edited = parseJsonMaybe(editResult.stdout);
-    if (propertyNames.length > 0) {
-      const patchResult = await runner(patchArgs(id, properties));
+    if (propertyNames.length > 0 || icon !== undefined) {
+      const patchResult = await runner({ args: patchArgs(id, properties, icon) });
       if (!patchResult.ok) {
-        throw ntnFailure("PATCH 页面属性", patchResult, `页面 ${id} 内容已更新，但属性未写入`);
+        throw ntnFailure(
+          "PATCH 页面属性/icon",
+          patchResult,
+          `页面 ${id} 内容已更新，但${propertyNames.length > 0 ? "属性" : ""}${
+            propertyNames.length > 0 && icon ? "和 icon" : icon ? "icon" : ""
+          }未写入`
+        );
       }
     }
     const url = pageUrlFromRaw(edited, id);
-    return okResult(
-      "edit",
-      [
-        `已更新页面 ${id} 的内容`,
-        url ? `URL: ${url}` : "",
-        propertyNames.length ? `已写入属性：${propertyNames.join(", ")}` : "",
-      ]
-        .filter(Boolean)
-        .join("\n"),
-      {
-        id,
-        url,
-        changed: propertyNames.length ? ["body_content", "properties"] : ["body_content"],
-        properties: propertyNames,
-      }
-    );
+    return pageValue("edit", {
+      id,
+      ...(url ? { url } : {}),
+      ...(icon ? { icon: icon.display } : {}),
+      properties: propertyNames,
+      changed: [
+        "body_content",
+        ...(propertyNames.length > 0 ? ["properties"] : []),
+        ...(icon ? ["icon"] : []),
+      ],
+    });
   }
 
-  const patchResult = await runner(patchArgs(id, properties));
-  if (!patchResult.ok) throw ntnFailure("PATCH 页面属性", patchResult);
+  // Icon-only edit: one PATCH, no property map, no content rewrite.
+  if (propertyNames.length === 0 && icon !== undefined) {
+    const iconOnly = await runner({ args: patchArgs(id, {}, icon) });
+    if (!iconOnly.ok) throw ntnFailure("PATCH 页面 icon", iconOnly);
+    const patchedIcon = parseJsonMaybe(iconOnly.stdout);
+    const url = pageUrlFromRaw(patchedIcon, id);
+    return pageValue("edit", {
+      id,
+      ...(url ? { url } : {}),
+      icon: icon.display,
+      properties: [],
+      changed: ["icon"],
+    });
+  }
+
+  const patchResult = await runner({ args: patchArgs(id, properties, icon) });
+  if (!patchResult.ok) throw ntnFailure("PATCH 页面属性/icon", patchResult);
   const patched = parseJsonMaybe(patchResult.stdout);
   const url = pageUrlFromRaw(patched, id);
 
-  return okResult(
-    "edit",
-    [`已更新页面 ${id} 的属性`, `URL: ${url}`, `属性：${propertyNames.join(", ")}`].join("\n"),
-    { id, url, changed: ["properties"], properties: propertyNames }
-  );
+  return pageValue("edit", {
+    id,
+    ...(url ? { url } : {}),
+    ...(icon ? { icon: icon.display } : {}),
+    properties: propertyNames,
+    changed: [...(propertyNames.length > 0 ? ["properties"] : []), ...(icon ? ["icon"] : [])],
+  });
 }
 
 async function attachPage(
   params: NotionPageParams,
   runner: NtnRunner
-): Promise<ToolResult> {
+): Promise<PageToolValue> {
   const id = requireId(params.id, "attach");
 
   // Reject database/data-source parents before spending an ntn call on them.
@@ -1450,38 +1686,28 @@ async function attachPage(
       );
     }
 
-    const result = await runner([
-      "api",
-      `v1/pages/${id}/move`,
-      "-X",
-      "POST",
-      "--data",
-      JSON.stringify({ parent: { page_id: targetParentId } }),
-    ]);
+    const result = await runner({
+      args: [
+        "api",
+        `v1/pages/${id}/move`,
+        "-X",
+        "POST",
+        "--data",
+        JSON.stringify({ parent: { page_id: targetParentId } }),
+      ],
+    });
     if (!result.ok) throw ntnFailure(`把页面 ${id} 挂到 ${targetParentId} 下`, result);
 
     const moved = parseJsonMaybe(result.stdout);
     const url = pageUrlFromRaw(moved, id);
-    return okResult(
-      "attach",
-      [
-        `已把页面 ${id} 挂到页面 ${targetParentId} 下`,
-        url ? `URL: ${url}` : "",
-        cycle.status === "partial"
-          ? "注意：页面祖先链未能完整读取，深层环检查为 best-effort（cycle_check: partial）"
-          : "",
-        "changed: parent",
-      ]
-        .filter(Boolean)
-        .join("\n"),
-      {
-        id,
-        url,
-        parent: formatParent(container.createParent),
-        cycle_check: cycle.status,
-        changed: ["parent"],
-      }
-    );
+    return pageValue("attach", {
+      id,
+      url,
+      parent: formatParent(container.createParent),
+      cycle_check: cycle.status,
+      properties: [],
+      changed: ["parent"],
+    });
   }
 
   if (container.kind !== "row") {
@@ -1521,24 +1747,16 @@ async function attachPage(
   // Idempotent only when the requested link is the WHOLE relation. `[P, X]` + attach to P
   // still holds a second, different parent, so it needs yes:true and a real replace PATCH.
   if (parentAlreadySet && currentParents.length === 1) {
-    const url = pageUrl(id);
-    return okResult(
-      "attach",
-      [
-        `行 ${id} 已经在父行 ${container.rowParentId} 下（Parent-item 列：${relation.name}），无需改动`,
-        `URL: ${url}`,
-        "changed: (none)",
-      ].join("\n"),
-      {
-        id,
-        url,
-        parent: formatParent(container.createParent),
-        parent_item_property: relation.name,
-        parent_item_row_id: container.rowParentId,
-        already_linked: true,
-        changed: [],
-      }
-    );
+    return pageValue("attach", {
+      id,
+      url: pageUrl(id),
+      parent: formatParent(container.createParent),
+      parent_item_property: relation.name,
+      parent_item_row_id: container.rowParentId,
+      already_linked: true,
+      properties: [],
+      changed: [],
+    });
   }
   if (currentParents.length > 0 && params.yes !== true) {
     throw new InputError(
@@ -1565,50 +1783,41 @@ async function attachPage(
 
   // Overwrite replaces the link (caller consented with yes:true when one existed).
   const properties: JsonObject = { [relation.name]: { relation: [{ id: container.rowParentId }] } };
-  const patchResult = await runner(patchArgs(id, properties));
+  const patchResult = await runner({ args: patchArgs(id, properties) });
   if (!patchResult.ok) throw ntnFailure(`设置 ${relation.name}（Parent-item）relation`, patchResult);
 
   const patched = parseJsonMaybe(patchResult.stdout);
   const url = pageUrlFromRaw(patched, id);
-  return okResult(
-    "attach",
-    [
-      `已把行 ${id} 挂到父行 ${container.rowParentId} 下`,
-      `Parent-item 列：${relation.name}`,
-      currentParents.length > 0 ? `替换了原来的父级：${currentParents.join(", ")}` : "",
-      url ? `URL: ${url}` : "",
-    ]
-      .filter(Boolean)
-      .join("\n"),
-    {
-      id,
-      url,
-      parent: formatParent(container.createParent),
-      parent_item_property: relation.name,
-      parent_item_row_id: container.rowParentId,
-      ...(currentParents.length > 0 ? { replaced_parent_ids: currentParents } : {}),
-      cycle_check: "walked",
-      changed: ["parent_item_relation"],
-    }
-  );
+  return pageValue("attach", {
+    id,
+    url,
+    parent: formatParent(container.createParent),
+    parent_item_property: relation.name,
+    parent_item_row_id: container.rowParentId,
+    ...(currentParents.length > 0 ? { replaced_parent_ids: currentParents } : {}),
+    cycle_check: "walked",
+    properties: [],
+    changed: ["parent_item_relation"],
+  });
 }
 
 async function trashPage(
   params: NotionPageParams,
   runner: NtnRunner
-): Promise<ToolResult> {
+): Promise<PageToolValue> {
   const id = requireId(params.id, "trash");
   if (params.yes !== true) {
     throw new InputError(
       "trash 会删除（移入回收站）页面，必须显式传 yes: true 才会调用 ntn；本次没有调用 ntn。"
     );
   }
-  const result = await runner(["pages", "trash", id, "--yes"]);
+  const result = await runner({ args: ["pages", "trash", id, "--yes"] });
   if (!result.ok) throw ntnFailure("ntn pages trash", result);
 
-  return okResult("trash", `已把页面 ${id} 移入回收站\nURL: ${pageUrl(id)}`, {
+  return pageValue("trash", {
     id,
     url: pageUrl(id),
+    properties: [],
     changed: ["trashed"],
   });
 }
@@ -1617,111 +1826,125 @@ async function trashPage(
  * Registration
  * ------------------------------------------------------------------ */
 
-export function registerNotionPage(pi: ExtensionAPI, deps: NotionPageDeps = {}): void {
-  const runner: NtnRunner = deps.runNtn ?? ((args) => runNtn({ args }));
+/** The model-facing parameters, in the enforced DSH JSON Schema subset. */
+const PAGE_PARAMETERS = {
+  type: "object",
+  properties: {
+    action: {
+      type: "string",
+      enum: ["create", "edit", "attach", "trash"],
+      description: "create | edit | attach | trash",
+    },
+    id: {
+      type: "string",
+      description:
+        "Page or row id (required for edit/attach/trash; create takes its container from parent).",
+    },
+    parent: {
+      type: "string",
+      description:
+        "create/attach: page:<id> | database:<id> | data-source:<id>, or a bare page/row id (a row id means a child row under that row). Attach only accepts page:<id> or a row id.",
+    },
+    title: {
+      type: "string",
+      description:
+        "Page title. create: sets the title (also used when props carry the title property). edit: updates the title property.",
+    },
+    props: {
+      type: "object",
+      additionalProperties: true,
+      description:
+        'Object map of property name → simplified value ({} = omit). Two reserved keys are page fields, not columns: body_content is the page Markdown body, and icon is the page icon (an emoji like "🎯", an http(s) image URL, or null to clear it). Examples: {"body_content":"# 标题\\n\\n正文","Status":"进行中","标签":["a","b"],"截止日期":"2025-01-31","Done":true} and {"icon":"🎯"}.',
+    },
+    yes: {
+      type: "boolean",
+      description:
+        "trash: must be true, otherwise the tool refuses without calling ntn. attach (row→row): consent to replacing an existing Parent-item link that points at a different parent.",
+    },
+  },
+  required: ["action"],
+  additionalProperties: false,
+} as const;
 
-  pi.registerTool({
+const PAGE_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    ok: { type: "boolean", const: true },
+    action: { type: "string", enum: ["create", "edit", "attach", "trash"] },
+    id: { type: "string" },
+    url: { type: "string" },
+    title: { type: "string" },
+    parent: { type: "string" },
+    properties: { type: "array", items: { type: "string" } },
+    changed: { type: "array", items: { type: "string" } },
+    icon: { oneOf: [{ type: "string" }, { type: "null" }] },
+    parent_item_row_id: { type: "string" },
+    parent_item_property: { type: "string" },
+    already_linked: { type: "boolean" },
+    replaced_parent_ids: { type: "array", items: { type: "string" } },
+    cycle_check: { type: "string" },
+  },
+  required: ["ok", "action", "properties", "changed"],
+  additionalProperties: false,
+} as const;
+
+/**
+ * Build the `notion_page` tool definition.
+ * `deps` exists for tests: injecting a fake runner replaces `runNtn`.
+ */
+export function createNotionPageTool(deps: NotionPageDeps = {}): NotionTool<PageToolValue> {
+  const runner: NtnRunner = deps.runNtn ?? runNtn;
+
+  return defineNotionTool<PageToolValue>({
     name: "notion_page",
-    label: "Notion Page",
     description:
-      "Create, edit, attach, or trash a Notion page through the official ntn CLI. " +
-      "Body Markdown goes in props.body_content (the top-level content parameter was removed in 1.0.1). " +
+      "Create, edit, attach (re-parent) or trash one Notion page. " +
+      "put the page Markdown in props.body_content and the page icon in props.icon; there is no top-level " +
+      "content or icon parameter. " +
       "action=create needs parent: page:<id> | database:<id> | data-source:<id>, or a bare database row id " +
-      "(child row: it is linked through the data source's Parent-item / self-relation column). " +
-      "props are applied with a follow-up property PATCH; in a database a title is required (via title, the title " +
-      "property, or a leading \"# Heading\" in body_content). If that follow-up write fails, the new page is trashed " +
-      "automatically and the error reports partial:false + created_id + rollback:\"trashed\", or partial:true + " +
-      "created_id + rollback:\"trash_failed\" when the cleanup also failed. " +
-      "action=edit needs id and props (body_content and/or " +
-      "columns) and/or title. action=attach needs id + parent and only re-parents: page→page uses the move endpoint, " +
-      "row→row sets the Parent-item relation; it is NOT a file upload. Row attach refuses Parent-item cycles and " +
-      "refuses to overwrite a different existing parent unless yes:true (same parent = no-op). " +
-      "action=trash needs id and yes:true or nothing " +
-      "is called. props is an OBJECT map keyed by property NAME (several keys = several properties, {} = no change): " +
-      "\"body_content\":\"# Title\\n\\ntext\", \"Status\":\"Done\", \"Tags\":[\"a\",\"b\"], \"Due\":\"2025-01-31\", \"Done\":true. " +
-      "Values are converted by property type; unknown names and read-only properties are rejected with hint_properties. " +
-      "No default properties are invented.",
-    promptSnippet:
-      "Create/edit/attach/trash Notion pages; body via props.body_content, props map = property name → value",
-    promptGuidelines: [
-      "notion_page: put page Markdown in props.body_content; there is no top-level content parameter.",
-      "notion_page: props is an object map keyed by exact property name; {} means no property change, and trash requires yes:true.",
-      "notion_page create in a database needs a title (title param, the title property, or a leading \"# Heading\" in props.body_content); read hint_properties from the error to see writable columns.",
-      "notion_page attach re-parents an existing page or row (page→page move, row→row Parent-item relation); it is not a file upload and takes no props/title.",
-      "notion_page attach row→row refuses cycle-forming moves and refuses to replace a different existing Parent-item parent unless yes:true; re-attaching the same parent is a no-op.",
-      "notion_page create is atomic: if the property/Parent-item PATCH fails, the new page is trashed; details.rollback says trashed/trash_failed/unknown_id (partial:true means something was left behind).",
-    ],
-    parameters: Type.Object({
-      action: Type.Union(
-        [Type.Literal("create"), Type.Literal("edit"), Type.Literal("attach"), Type.Literal("trash")],
-        { description: "create | edit | attach | trash" }
-      ),
-      id: Type.Optional(
-        Type.String({
-          description:
-            "Page or row id (required for edit/attach/trash; create takes its container from parent).",
-        })
-      ),
-      parent: Type.Optional(
-        Type.String({
-          description:
-            "create/attach: page:<id> | database:<id> | data-source:<id>, or a bare page/row id (a row id means a child row under that row). Attach only accepts page:<id> or a row id.",
-        })
-      ),
-      title: Type.Optional(
-        Type.String({
-          description:
-            "Page title. create: sets the title (also used when props carry the title property). edit: updates the title property.",
-        })
-      ),
-      props: Type.Optional(
-        Type.Record(Type.String(), Type.Unknown(), {
-          description:
-            "Object map of property name → simplified value ({} = omit). Reserved key body_content is the page Markdown body. Example: {\"body_content\":\"# 标题\\n\\n正文\",\"Status\":\"进行中\",\"标签\":[\"a\",\"b\"],\"截止日期\":\"2025-01-31\",\"Done\":true}",
-        })
-      ),
-      yes: Type.Optional(
-        Type.Boolean({
-          description:
-            "trash: must be true, otherwise the tool refuses without calling ntn. attach (row→row): consent to replacing an existing Parent-item link that points at a different parent.",
-        })
-      ),
-    }),
+      "(a child row, linked through the data source's Parent-item / self-relation column); props are applied " +
+      "by a second request, and a page in a database also needs a title (the title parameter, the title " +
+      "property in props, or a leading \"# Heading\" in props.body_content). If that second request fails the " +
+      "new page is trashed so no half-made page is left behind, and the error says whether cleanup " +
+      "succeeded: rollback reports trashed, trash_failed or unknown_id, and partial:true means something " +
+      "was left behind. " +
+      "action=edit needs id plus at least one of props (body_content / icon / columns) or title. " +
+      "action=attach needs id and parent and only re-parents: page→page moves the page, row→row sets the " +
+      "Parent-item relation, and it is not a file upload; it refuses cycle-forming moves and refuses to " +
+      "replace a different existing parent unless yes:true (the same parent is a no-op). " +
+      "action=trash needs id and yes:true, otherwise nothing is called. " +
+      "props is an object map keyed by property NAME (several keys = several properties, {} = no change), " +
+      "and its values are converted by the column type: unknown names and read-only columns are rejected " +
+      "with the writable columns in hint_properties. No default property values are invented.",
+    timeoutMs: TOOL_TIMEOUTS.page,
+    // Every action can write (create/edit/attach/trash mutate the workspace), so
+    // page calls stay exclusive: never overlap two of them.
+    isConcurrencySafe: () => false,
+    parameters: PAGE_PARAMETERS as unknown as Record<string, unknown>,
+    output: {
+      schema: PAGE_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+      render: (_args, value) => textBlocks(describePageValue(value)),
+    },
 
-    async execute(_toolCallId, params) {
-      const raw = params as unknown as Record<string, unknown>;
+    async execute(args, exec) {
+      const raw = args;
       const action = raw.action;
-      // The removed top-level `content` is rejected explicitly (no alias): silently ignoring it
-      // would let a caller believe the body was written.
-      if (raw.content !== undefined) {
-        return inputErrorResult(
-          new InputError(
-            "notion_page 已移除顶层 content（1.0.1 起不再支持，也没有别名）；正文请放到 props.body_content（Markdown 字符串）。"
-          ),
-          action
-        );
-      }
       // A typo or the rejected `move` name must not fall through to trash.
       if (typeof action !== "string" || !Object.prototype.hasOwnProperty.call(ALLOWED_PARAMS, action)) {
-        return inputErrorResult(
-          new InputError(
-            `未知 action ${describeValue(action)}：只支持 create / edit / attach / trash（移动/挂载用 attach，没有 move）。`
-          ),
-          action
+        throw new InputError(
+          `未知 action ${describeValue(action)}：只支持 create / edit / attach / trash（移动/挂载用 attach，没有 move）。`
         );
       }
+      if (exec.signal?.aborted) throw abortError();
       const typedAction = action as Action;
-      try {
-        rejectUnexpectedParams(raw, typedAction);
-        const typed = params as NotionPageParams;
-        if (typedAction === "create") return await createPage(typed, runner);
-        if (typedAction === "edit") return await editPage(typed, runner);
-        if (typedAction === "attach") return await attachPage(typed, runner);
-        return await trashPage(typed, runner);
-      } catch (error) {
-        if (error instanceof InputError) return inputErrorResult(error, action);
-        throw error;
-      }
+      rejectUnexpectedParams(raw, typedAction);
+      const typed = args as unknown as NotionPageParams;
+      // Every ntn spawn of this call observes the call's cancellation signal.
+      const run = bindSignal(runner, exec.signal);
+      if (typedAction === "create") return await createPage(typed, run);
+      if (typedAction === "edit") return await editPage(typed, run);
+      if (typedAction === "attach") return await attachPage(typed, run);
+      return await trashPage(typed, run);
     },
   });
 }

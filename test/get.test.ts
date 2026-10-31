@@ -1,17 +1,16 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-
 import { extractNotionId } from "../src/lib/ids.ts";
 import type { RunNtnOptions, RunNtnResult } from "../src/lib/runNtn.ts";
-import { executeNotionGet, registerNotionGet } from "../src/tools/get.ts";
+import { createNotionGetTool, executeNotionGet } from "../src/tools/get.ts";
 import type {
   NtnRunner,
   NotionDatabaseResult,
-  NotionGetToolResult,
   NotionPageResult,
 } from "../src/tools/get.ts";
+import { mount, text } from "./fixtures/dsh.ts";
+import type { MountedResult } from "./fixtures/dsh.ts";
 
 const PAGE_ID = "11111111-1111-4111-8111-111111111111";
 const PAGE_ID_BARE = PAGE_ID.replace(/-/g, "");
@@ -153,12 +152,17 @@ function mockNtn(script: (args: string[]) => RunNtnResult): {
   return { run, calls, envs };
 }
 
-function pageDetails(result: NotionGetToolResult): NotionPageResult {
+/** Mount the real notion_get definition with the fake runner injected, the way DSH does. */
+function getTool(run: NtnRunner) {
+  return mount(createNotionGetTool(run));
+}
+
+function pageDetails(result: MountedResult<unknown>): NotionPageResult {
   assert.equal(result.details.type, "page");
   return result.details as NotionPageResult;
 }
 
-function databaseDetails(result: NotionGetToolResult): NotionDatabaseResult {
+function databaseDetails(result: MountedResult<unknown>): NotionDatabaseResult {
   assert.equal(result.details.type, "database");
   return result.details as NotionDatabaseResult;
 }
@@ -205,10 +209,11 @@ describe("extractNotionId", () => {
 describe("notion_get: pages", () => {
   it("returns Markdown by default with a single `ntn pages get` call", async () => {
     const { run, calls } = mockNtn(() => ok(PAGE_MD));
-    const result = await executeNotionGet({ id_or_url: PAGE_ID }, run);
+    const result = await getTool(run).execute("call-1", { id_or_url: PAGE_ID });
 
     assert.deepEqual(calls, [["pages", "get", PAGE_ID]]);
-    assert.equal(result.content[0].text, PAGE_MD);
+    assert.equal(result.isError, false);
+    assert.equal(text(result), PAGE_MD);
     const details = pageDetails(result);
     assert.equal(details.id, PAGE_ID);
     assert.equal(details.format, "md");
@@ -220,22 +225,22 @@ describe("notion_get: pages", () => {
     const { run } = mockNtn(() =>
       ok(PAGE_MD_TRUNCATED, "warning: Page content was truncated. Re-run `ntn pages get`")
     );
-    const result = await executeNotionGet({ id_or_url: PAGE_ID }, run);
+    const result = await getTool(run).execute("call-1b", { id_or_url: PAGE_ID });
     assert.equal(pageDetails(result).truncated, true);
     // details are not shown to the model: the warning has to be in the text too
-    assert.match(result.content[0].text, /\[notion_get\] ntn truncated this page/);
+    assert.match(text(result), /\[notion_get\] ntn truncated this page/);
   });
 
   it("does not treat unrelated stderr containing 'truncated' as truncation", async () => {
     const { run } = mockNtn(() => ok(PAGE_MD, "warning: 0 blocks truncated"));
-    const result = await executeNotionGet({ id_or_url: PAGE_ID }, run);
+    const result = await getTool(run).execute("call-1c", { id_or_url: PAGE_ID });
     assert.equal(pageDetails(result).truncated, undefined);
-    assert.doesNotMatch(result.content[0].text, /ntn truncated this page/);
+    assert.doesNotMatch(text(result), /ntn truncated this page/);
   });
 
   it("passes --json and returns structured page metadata in json format", async () => {
     const { run, calls } = mockNtn(() => ok(PAGE_JSON));
-    const result = await executeNotionGet({ id_or_url: PAGE_ID, format: "json" }, run);
+    const result = await getTool(run).execute("call-1d", { id_or_url: PAGE_ID, format: "json" });
 
     assert.deepEqual(calls, [["pages", "get", PAGE_ID, "--json"]]);
     const details = pageDetails(result);
@@ -257,12 +262,13 @@ describe("notion_get: pages", () => {
       unknown_block_ids: [],
     });
     // json format keeps the structured payload as the model-facing text
-    assert.deepEqual(JSON.parse(result.content[0].text), details);
+    assert.deepEqual(JSON.parse(text(result)), details);
   });
 
   it("surfaces truncation and unknown blocks from json output", async () => {
     const { run } = mockNtn(() => ok(PAGE_JSON_TRUNCATED));
-    const details = pageDetails(await executeNotionGet({ id_or_url: PAGE_ID, format: "json" }, run));
+    const result = await getTool(run).execute("call-1e", { id_or_url: PAGE_ID, format: "json" });
+    const details = pageDetails(result);
     assert.equal(details.truncated, true);
     assert.deepEqual(details.unknown_block_ids, ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]);
   });
@@ -365,7 +371,7 @@ describe("notion_get: databases", () => {
 
   it("returns schema, all data source ids and no rows", async () => {
     const { run, calls } = mockNtn(databaseScript());
-    const result = await executeNotionGet({ id_or_url: DB_ID }, run);
+    const result = await getTool(run).execute("call-2", { id_or_url: DB_ID });
     const details = databaseDetails(result);
 
     assert.deepEqual(calls, [
@@ -399,16 +405,17 @@ describe("notion_get: databases", () => {
       ]
     );
 
-    const text = result.content[0].text;
-    assert.match(text, /Test DB/);
-    assert.match(text, new RegExp(DS_1));
-    assert.match(text, /Name: title/);
-    assert.match(text, /notion_query/);
+    const body = text(result);
+    assert.match(body, /Test DB/);
+    assert.match(body, new RegExp(DS_1));
+    assert.match(body, /Name: title/);
+    assert.match(body, /notion_query/);
   });
 
   it("keeps the resolved ids when a schema call fails, and reports a warning", async () => {
     const { run } = mockNtn(databaseScript({ failSchemaFor: DS_1 }));
-    const details = databaseDetails(await executeNotionGet({ id_or_url: DB_ID }, run));
+    const result = await getTool(run).execute("call-3", { id_or_url: DB_ID });
+    const details = databaseDetails(result);
 
     assert.deepEqual(details.data_source_ids, [DS_1, DS_2]);
     assert.deepEqual(details.properties, [
@@ -457,7 +464,7 @@ describe("notion_get: databases", () => {
       throw new Error(`unexpected ntn args: ${args.join(" ")}`);
     });
 
-    const result = await executeNotionGet({ id_or_url: DB_ID }, run);
+    const result = await getTool(run).execute("call-4", { id_or_url: DB_ID });
     const details = databaseDetails(result);
     const byName = new Map(details.properties.map((property) => [property.name, property]));
 
@@ -479,10 +486,10 @@ describe("notion_get: databases", () => {
       { data_source_id: DS_1, property: "Parent-item" },
     ]);
 
-    const text = result.content[0].text;
-    assert.match(text, /Total: rollup — read-only/);
-    assert.match(text, /Parent-item: relation — .*self.*Parent-item candidate/);
-    assert.match(text, /Parent-item candidates \(use one with notion_page attach/);
+    const body = text(result);
+    assert.match(body, /Total: rollup — read-only/);
+    assert.match(body, /Parent-item: relation — .*self.*Parent-item candidate/);
+    assert.match(body, /Parent-item candidates \(use one with notion_page attach/);
   });
 
   it("accepts a database URL", async () => {
@@ -496,7 +503,8 @@ describe("notion_get: databases", () => {
 
   it("detects a database in json format too", async () => {
     const { run, calls } = mockNtn(databaseScript());
-    const details = databaseDetails(await executeNotionGet({ id_or_url: DB_ID, format: "json" }, run));
+    const result = await getTool(run).execute("call-5", { id_or_url: DB_ID, format: "json" });
+    const details = databaseDetails(result);
     assert.deepEqual(calls[0], ["pages", "get", DB_ID, "--json"]);
     assert.deepEqual(details.data_source_ids, [DS_1, DS_2]);
   });
@@ -519,7 +527,8 @@ describe("notion_get: databases", () => {
       throw new Error(`unexpected ntn args: ${args.join(" ")}`);
     });
 
-    const details = databaseDetails(await executeNotionGet({ id_or_url: DB_ID }, run));
+    const result = await getTool(run).execute("call-6", { id_or_url: DB_ID });
+    const details = databaseDetails(result);
     assert.deepEqual(details.data_source_ids, [DS_1, DS_2]);
     assert.equal(calls.filter((args) => args[1] === `v1/data_sources/${DS_1}`).length, 1);
   });
@@ -572,30 +581,19 @@ describe("notion_get: databases", () => {
   });
 });
 
-describe("registerNotionGet", () => {
-  it("registers notion_get with the documented parameters and uses the injected runner", async () => {
-    const tools: {
-      name: string;
-      parameters: { required?: string[]; properties?: Record<string, unknown> };
-      execute: (
-        toolCallId: string,
-        params: { id_or_url: string; format?: "md" | "json" }
-      ) => Promise<NotionGetToolResult>;
-    }[] = [];
-    const pi = {
-      registerTool: (tool: (typeof tools)[number]) => tools.push(tool),
-    } as unknown as ExtensionAPI;
-
+describe("createNotionGetTool", () => {
+  it("defines notion_get with the documented parameters and uses the injected runner", async () => {
     const { run, calls } = mockNtn(() => ok(PAGE_MD));
-    registerNotionGet(pi, run);
+    const tool = getTool(run);
 
-    assert.equal(tools.length, 1);
-    assert.equal(tools[0].name, "notion_get");
-    assert.deepEqual(tools[0].parameters.required, ["id_or_url"]);
-    assert.deepEqual(Object.keys(tools[0].parameters.properties ?? {}).sort(), ["format", "id_or_url"]);
+    assert.equal(tool.name, "notion_get");
+    assert.deepEqual(tool.parameters.required, ["id_or_url"]);
+    assert.deepEqual(Object.keys(tool.parameters.properties ?? {}).sort(), ["format", "id_or_url"]);
+    assert.equal(tool.parameters.additionalProperties, false);
 
-    const result = await tools[0].execute("call-1", { id_or_url: PAGE_ID });
+    const result = await tool.execute("call-1", { id_or_url: PAGE_ID });
     assert.deepEqual(calls, [["pages", "get", PAGE_ID]]);
+    assert.equal(result.isError, false);
     assert.equal(result.details.type, "page");
   });
 });

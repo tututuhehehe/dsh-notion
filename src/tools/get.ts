@@ -16,9 +16,8 @@
  * `ntn pages get`; only non-recoverable errors (auth/config, timeouts, 5xx/429) skip the fallback.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
-
+import { abortError, bindSignal, codedError, defineNotionTool, textBlocks, TOOL_TIMEOUTS } from "../dsh/tool.ts";
+import type { NotionTool } from "../dsh/tool.ts";
 import { extractNotionId } from "../lib/ids.ts";
 import {
   isWritablePropertyType,
@@ -87,11 +86,6 @@ export type NotionDatabaseResult = {
 
 export type NotionGetResult = NotionPageResult | NotionDatabaseResult;
 
-export type NotionGetToolResult = {
-  content: { type: "text"; text: string }[];
-  details: NotionGetResult;
-};
-
 /** Force plain text: ANSI/hyperlink escapes would leak into Markdown and JSON parsing. */
 const NTN_ENV = { NO_COLOR: "1", NO_HYPERLINK: "1" };
 
@@ -107,42 +101,104 @@ const TRANSIENT_ERROR_RE =
 
 type Attempt<T> = { ok: true; value: T } | { ok: false; res: RunNtnResult };
 
-const parameters = Type.Object({
-  id_or_url: Type.String({
-    description:
-      "Notion page or database ID (dashed UUID or 32-character id) or a notion.so / app.notion.com URL.",
-  }),
-  format: Type.Optional(
-    Type.Union([Type.Literal("md"), Type.Literal("json")], {
+/** The model-facing parameters, in the enforced DSH JSON Schema subset. */
+const GET_PARAMETERS = {
+  type: "object",
+  properties: {
+    id_or_url: {
+      type: "string",
+      description:
+        "Notion page or database ID (dashed UUID or 32-character id) or a notion.so / app.notion.com URL.",
+    },
+    format: {
+      type: "string",
+      enum: ["md", "json"],
       description:
         "Page output. 'md' (default) returns the Markdown body with properties as frontmatter; " +
         "'json' returns the structured page payload (markdown plus url/title/truncation metadata). " +
         "Databases are always returned as schema, regardless of format.",
-    })
-  ),
-});
+    },
+  },
+  required: ["id_or_url"],
+  additionalProperties: false,
+} as const;
 
-export function registerNotionGet(pi: ExtensionAPI, run: NtnRunner = runNtn): void {
-  pi.registerTool<typeof parameters, NotionGetResult>({
+/** Canonical-value schema: a tagged union of the page and database payloads. */
+const GET_OUTPUT_SCHEMA = {
+  oneOf: [
+    {
+      type: "object",
+      properties: {
+        type: { type: "string", const: "page" },
+        id: { type: "string" },
+        url: { type: "string" },
+        title: { type: "string" },
+        format: { type: "string", enum: ["md", "json"] },
+        markdown: { type: "string" },
+        properties: { type: "object", additionalProperties: true },
+        truncated: { type: "boolean" },
+        unknown_block_ids: { type: "array", items: { type: "string" } },
+      },
+      required: ["type", "id", "format", "markdown"],
+      additionalProperties: true,
+    },
+    {
+      type: "object",
+      properties: {
+        type: { type: "string", const: "database" },
+        id: { type: "string" },
+        title: { type: "string" },
+        url: { type: "string" },
+        data_source_ids: { type: "array", items: { type: "string" } },
+        properties: { type: "array", items: { type: "object", additionalProperties: true } },
+        data_sources: { type: "array", items: { type: "object", additionalProperties: true } },
+        parent_item_candidates: { type: "array", items: { type: "object", additionalProperties: true } },
+        warnings: { type: "array", items: { type: "string" } },
+      },
+      required: ["type", "id", "data_source_ids", "properties", "data_sources"],
+      additionalProperties: true,
+    },
+  ],
+} as const;
+
+/** Model-facing text for a canonical page/database value. */
+export function renderGetResult(value: NotionGetResult): string {
+  return value.type === "database" ? renderDatabaseText(value) : renderPageText(value);
+}
+
+/**
+ * Build the `notion_get` tool definition.
+ * `run` exists for tests: injecting a fake runner replaces `runNtn`.
+ */
+export function createNotionGetTool(run: NtnRunner = runNtn): NotionTool<NotionGetResult> {
+  return defineNotionTool<NotionGetResult>({
     name: "notion_get",
-    label: "Notion Get",
     description:
-      "Read a Notion page or inspect a database. Pages return Markdown (format='md', default) or a " +
-      "structured payload with metadata (format='json'). Databases return all data source ids and the " +
-      "property names/types with writable flags and Parent-item / self-relation candidates — rows are never " +
-      "fetched here; use notion_query for rows.",
-    promptSnippet:
-      "Read a Notion page as Markdown or inspect a database's data source ids and property schema",
-    promptGuidelines: [
-      "notion_get accepts an id (dashed or bare) or a Notion URL; use format='json' when you need page metadata such as url, title, truncated or unknown_block_ids.",
-      "Databases come back as schema only (data_source_ids + properties, with writable flags and Parent-item candidates). Pass a data_source_id to notion_query to read rows.",
-      "notion_get flags each property as writable or read-only and marks self-relation / Parent-item candidates; notion_page attach and child-row create use that relation column.",
-      "If a page is truncated, follow up with format='json' to inspect unknown_block_ids, or ask for a narrower page.",
-    ],
-    parameters,
+      "Read one Notion page or inspect one database. A page returns Markdown (format='md', default) with " +
+      "its properties as frontmatter, or a structured payload (format='json') that also carries url, " +
+      "title, truncated and unknown_block_ids. A database returns every data source id plus each " +
+      "property's name, type, writable flag and Parent-item / self-relation candidates; rows are never " +
+      "fetched here, so read them with notion_query. If a page comes back truncated, ask for format='json' " +
+      "to see unknown_block_ids or read a narrower page.",
+    timeoutMs: TOOL_TIMEOUTS.get,
+    // Read-only: safe to run alongside sibling calls.
+    isConcurrencySafe: () => true,
+    parameters: GET_PARAMETERS as unknown as Record<string, unknown>,
+    output: {
+      schema: GET_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+      render: (_args, value) => textBlocks(renderGetResult(value)),
+    },
 
-    async execute(_toolCallId, params) {
-      return executeNotionGet(params, run);
+    async execute(args, exec) {
+      try {
+        if (exec.signal?.aborted) throw abortError();
+        return await executeNotionGet(
+          args as unknown as NotionGetParams,
+          bindSignal(run, exec.signal)
+        );
+      } catch (error) {
+        throw codedError(error);
+      }
     },
   });
 }
@@ -153,7 +209,7 @@ export function registerNotionGet(pi: ExtensionAPI, run: NtnRunner = runNtn): vo
 export async function executeNotionGet(
   params: NotionGetParams,
   run: NtnRunner = runNtn
-): Promise<NotionGetToolResult> {
+): Promise<NotionGetResult> {
   const format = params.format ?? "md";
   if (format !== "md" && format !== "json") {
     throw new Error(`Unsupported format "${String(format)}". Use "md" (default) or "json".`);
@@ -195,7 +251,7 @@ async function runPage(
   id: string,
   format: "md" | "json",
   run: NtnRunner
-): Promise<Attempt<NotionGetToolResult>> {
+): Promise<Attempt<NotionGetResult>> {
   const args = ["pages", "get", id];
   if (format === "json") args.push("--json");
 
@@ -203,13 +259,7 @@ async function runPage(
   if (!res.ok) return { ok: false, res };
 
   const page = format === "json" ? pageFromJson(id, res.stdout) : pageFromMarkdown(id, res);
-  return {
-    ok: true,
-    value: {
-      content: [{ type: "text", text: renderPageText(page) }],
-      details: page,
-    },
-  };
+  return { ok: true, value: page };
 }
 
 function pageFromMarkdown(id: string, res: RunNtnResult): NotionPageResult {
@@ -260,7 +310,7 @@ function pageFromJson(fallbackId: string, stdout: string): NotionPageResult {
   };
 }
 
-async function runDatabase(id: string, run: NtnRunner): Promise<Attempt<NotionGetToolResult>> {
+async function runDatabase(id: string, run: NtnRunner): Promise<Attempt<NotionGetResult>> {
   const resolveRes = await run({
     args: ["datasources", "resolve", id, "--json"],
     env: NTN_ENV,
@@ -325,13 +375,7 @@ async function runDatabase(id: string, run: NtnRunner): Promise<Attempt<NotionGe
     ...(warnings.length > 0 ? { warnings } : {}),
   };
 
-  return {
-    ok: true,
-    value: {
-      content: [{ type: "text", text: renderDatabaseText(result) }],
-      details: result,
-    },
-  };
+  return { ok: true, value: result };
 }
 
 type DataSourceRef = { id: string; name?: string };

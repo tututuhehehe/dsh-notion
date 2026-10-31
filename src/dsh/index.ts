@@ -1,18 +1,18 @@
 /**
- * DSH host plugin entry: four consolidated Notion tools over the official ntn
- * CLI. This is the port of pi-notion v1.1.0 — the tool implementations in
- * ../tools and ../lib are unchanged; ./adapter bridges pi's registerTool API to
- * DSH's ctx.tools.register.
+ * DSH host plugin entry: four consolidated Notion tools over the official `ntn` CLI.
  *
- * No Config schema is declared: DSH's shipped Web client does not render
- * generic forms from a Config schema, so the token is configured through the
- * NOTION_API_TOKEN environment variable or the ./notion-token file instead.
+ * Each tool is a plain DSH ToolDefinition (see ./tool.ts) registered into `ctx.tools`,
+ * so its name, description and parameter schema reach the model directly and its
+ * canonical value is validated before anything is rendered.
+ *
+ * No Config schema is declared: the shipped Web client does not render generic forms
+ * from a Config schema, so the token comes from the NOTION_API_TOKEN environment
+ * variable or the `notion-token` file inside the plugin directory instead.
  */
-import { registerNotionGet } from "../tools/get.ts";
-import { registerNotionPage } from "../tools/page.ts";
-import { registerNotionQuery } from "../tools/query.ts";
-import { registerNotionSearch } from "../tools/search.ts";
-import { createPiRegistry } from "./adapter.ts";
+import { createNotionGetTool } from "../tools/get.ts";
+import { createNotionPageTool } from "../tools/page.ts";
+import { createNotionQueryTool } from "../tools/query.ts";
+import { createNotionSearchTool } from "../tools/search.ts";
 import { readConfig } from "./config.ts";
 import { makeRunner } from "./runner.ts";
 
@@ -28,10 +28,9 @@ type NotionContext = {
 
 export function apply(ctx: NotionContext, config: unknown): void {
   const run = makeRunner(() => readConfig(config));
-  const pi = createPiRegistry((tool) => ctx.tools.register(tool));
 
-  registerNotionSearch(pi, { run });
-  registerNotionGet(pi, run);
-  registerNotionPage(pi, { runNtn: run });
-  registerNotionQuery(pi, { runNtn: run });
+  ctx.tools.register(createNotionSearchTool({ run }));
+  ctx.tools.register(createNotionGetTool(run));
+  ctx.tools.register(createNotionPageTool({ runNtn: run }));
+  ctx.tools.register(createNotionQueryTool({ runNtn: run }));
 }

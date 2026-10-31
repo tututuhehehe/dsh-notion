@@ -3,14 +3,17 @@ import assert from "node:assert/strict";
 
 import {
   MAX_QUERY_LIMIT,
+  createNotionQueryTool,
   parseQueryResponse,
   parseResolveDataSources,
   queryDataSource,
-  registerNotionQuery,
   type QueryInputError,
+  type QueryResult,
   type RunNtnFn,
 } from "../src/tools/query.ts";
 import type { RunNtnResult } from "../src/lib/runNtn.ts";
+import { mount, text } from "./fixtures/dsh.ts";
+import type { MountedTool } from "./fixtures/dsh.ts";
 import {
   ACCEPTANCE,
   ACCEPTANCE_DATABASE_ID,
@@ -53,16 +56,11 @@ function fakeRunner(responses: RunNtnResult[]): { run: RunNtnFn; calls: Call[] }
   return { run, calls };
 }
 
-function registeredTool(run: RunNtnFn) {
-  let tool: Record<string, any> | undefined;
-  const pi = {
-    registerTool(config: Record<string, any>) {
-      tool = config;
-    },
-  };
-  registerNotionQuery(pi as any, { runNtn: run });
-  assert.ok(tool, "registerNotionQuery must register a tool");
-  return tool!;
+/** Mount the real notion_query definition the way DSH does, with an injected fake runner. */
+function registeredTool(run: RunNtnFn): MountedTool<QueryResult> {
+  const tool = mount(createNotionQueryTool({ runNtn: run }));
+  assert.equal(tool.name, "notion_query");
+  return tool;
 }
 
 function argValue(args: string[], flag: string): string | undefined {
@@ -96,6 +94,7 @@ describe("notion_query registration", () => {
     assert.ok(tool.parameters.properties.filter);
     assert.ok(tool.parameters.properties.sort);
     assert.ok(tool.parameters.properties.include_content);
+    assert.equal(tool.parameters.additionalProperties, false);
   });
 
   it("returns JSON content and matching details", async () => {
@@ -188,7 +187,7 @@ describe("notion_query parameters", () => {
     const { run, calls } = fakeRunner([ok(listResponse([]))]);
     await queryDataSource({ database_or_data_source: "ds-1", filter }, run);
     const raw = argValue(calls[0].args, "--filter");
-    assert.ok(raw);
+    if (raw === undefined) throw new Error("expected a --filter argument");
     assert.deepEqual(JSON.parse(raw), filter);
   });
 
@@ -569,7 +568,7 @@ describe("notion_query under", () => {
     });
 
     assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /没有可用的 Parent-item/);
+    assert.match(text(result), /没有可用的 Parent-item/);
     assert.deepEqual(result.details.relation_properties, []);
     assert.deepEqual(
       result.details.hint_properties.map((entry: { name: string }) => entry.name),

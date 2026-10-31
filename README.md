@@ -108,6 +108,12 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
   "props": { "body_content": "说明", "Status": "进行中", "标签": ["验收"],
              "截止日期": "2026-01-31", "Done": false } }
 
+// 设图标：emoji、外链图片，或 null 清除
+{ "action": "create", "parent": "page:<page-id>", "title": "标题",
+  "props": { "body_content": "# 标题\n\n正文", "icon": "🎯" } }
+{ "action": "edit", "id": "<page-id>", "props": { "icon": "https://example.com/logo.png" } }
+{ "action": "edit", "id": "<page-id>", "props": { "icon": null } }
+
 // 改正文 / 改列 / 两者都改
 { "action": "edit", "id": "<page-id>", "props": { "body_content": "# 新正文", "Status": "Done" } }
 
@@ -118,7 +124,14 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
 { "action": "trash", "id": "<page-id>", "yes": true }
 ```
 
-`props` 是**属性名 → 值**的对象 map，按列类型自动转换（title/rich_text、number、select/status、multi_select、date、checkbox、url/email/phone、people/relation）。`props.body_content` 是保留键，表示页面正文 Markdown，不会被当成列写入。未知列名、只读列、类型不符都会报错并返回可写列清单，绝不静默写错列。
+`props` 是**属性名 → 值**的对象 map，按列类型自动转换（title/rich_text、number、select/status、multi_select、date、checkbox、url/email/phone、people/relation）。非列名的保留键有两个：
+
+| 保留键 | 含义 | 取值 |
+| --- | --- | --- |
+| `props.body_content` | 页面正文 Markdown | 字符串 |
+| `props.icon` | 页面图标 | 单个 emoji（`"🎯"`）、`http(s)` 图片 URL、已构好的 Notion icon 对象（`{"type":"emoji","emoji":"🎯"}`）、或 `null` 清除 |
+
+保留键不会被当成列写入；如果数据源里**真的有**同名列，写入会直接报错而不是猜你的意图。未知列名、只读列、类型不符都会报错并返回可写列清单，绝不静默写错列。
 
 ### notion_query
 
@@ -139,12 +152,42 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
 - **写入可回滚**：`create` 是两步写（建页 + 属性 PATCH），第二步失败会自动把新页 trash 掉，并报告 `partial` / `rollback`。
 - **关系安全**：`attach` 行→行会做 Parent-item 环检测；覆盖已有父级必须显式 `yes:true`。
 - **不猜列**：`notion_get` 标出可写列和 Parent-item 候选列，`notion_page` / `notion_query under` 直接复用同一套选择逻辑。
+- **图标是页面字段，不是列**：Notion CLI 的 `pages create/edit` 没有 `--icon`，插件把 `props.icon` 归一化后并入同一次属性 PATCH（只有 icon 时发 icon-only 请求），create 时图标也参与回滚判定。
+
+## DSH 集成方式
+
+每个工具都是一个原生 DSH `ToolDefinition`，直接 `ctx.tools.register`：
+
+```ts
+{
+  name, description, parameters,      // 模型可见：名称 + 描述 + JSON Schema（DSH 强制子集）
+  output: { schema, render },         // 返回值的规范 JSON 契约 + 渲染成文本块
+  execute(args, exec)                 // 工具体：返回规范值，抛错即失败结果
+}
+```
+
+因此模型的全部认知只来自 **description + 参数描述**——DSH 没有独立的 prompt/guideline 通道。插件把使用规则（保留键、必填项、回滚语义、分页方式）写在这两处，而不是散落在别处；错误信息里的 `hint_properties` 是纠正错误的第三条通道。
+
+`execute` 返回的是领域值（如 `{ ok, action, id, url, parent, properties, changed }`），文本由 `output.render` 派生，因此同一个定义在原生 function calling 和 PTC（`run_code`）两种呈现方式下都成立。
+
+### 错误码
+
+DSH 把抛出的错误渲染成 `Error: <message>`，只对它自己的 `HarnessError` 保留结构化 `{ name, code }`；普通 Error 的 `code` 会被丢弃。所以本插件把错误类别写进消息开头，确保模型与日志都能看到：
+
+| 前缀 | 含义 | 模型该怎么做 |
+| --- | --- | --- |
+| `[INVALID_INPUT]` | 参数不可用（未知列名、只读列、保留键冲突、id 非法…） | 读消息里的可写列清单，改参数重试 |
+| `[NTN_FAILED]` | `ntn` 本身失败（未登录、无效 token、Notion API 报错、exit ≠ 0） | 检查 token / workspace / 权限，或原样上报 |
+| `[ABORTED]` | 调用被取消或超时，子进程已被杀掉 | 通常无需重试，或换更小的查询 |
+| `[PARTIAL_WRITE]` | 后续写入失败且回滚也失败，工作区留下了半成品 | 用消息中给出的 id 手动 `trash` 或 `edit` 清理 |
+
+成功回滚的 create 不报 `[PARTIAL_WRITE]`，而是保留真正失败的那个类别（`[NTN_FAILED]` / `[INVALID_INPUT]`），并附带 `partial: false`。
 
 ## 后续
 
 - 评论读写
 - 文件上传（`notion_file`，与 attach 无关）
-- 页面 icon / cover
+- 页面 cover（icon 已支持：`props.icon`）
 - 更完整的 people / mention 解析
 
 ## 开发
@@ -152,13 +195,14 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
 ```bash
 npm install
 npm run build        # 打包 dist/index.js（esbuild）
-npm test             # 单元测试（mock，不需要 token）
+npm test             # 单元测试（mock，不需要 token、不联网）
+npm run typecheck    # tsc --noEmit
 ```
 
 插件源码结构：
 
 ```
-src/dsh/      # DSH Host 适配层（ctx.tools.register、配置、ntn 调用）
+src/dsh/      # DSH Host 层：tool.ts 工具契约、index.ts 注册、config/runner（token 与 ntn 调用）
 src/tools/    # 四个工具的实现
 src/lib/      # 共享工具库（id 解析、schema 提取、ntn runner 等）
 test/         # 单元测试（不依赖真实 Notion）
@@ -199,7 +243,17 @@ plugin_manager install_bundle target=/absolute/path/to/dsh-notion
                                      "filter": { "property": "Done", "checkbox": { "equals": false } } } }
 ```
 
-`notion_page` takes `action: create | edit | attach | trash`; page Markdown goes in `props.body_content`; all other `props` keys are property names converted by column type.
+`notion_page` takes `action: create | edit | attach | trash`. Two `props` keys are page fields rather than columns: `body_content` is the Markdown body, and `icon` is the page icon (an emoji such as `"🎯"`, an http(s) image URL, or `null` to clear it). Every other `props` key is a property name converted by column type.
+
+### Integration
+
+Each tool is a native DSH `ToolDefinition` registered through `ctx.tools.register`: `name`, `description` and `parameters` are what the model sees, `output.schema` / `output.render` define how a successful canonical value is validated and rendered, and `execute` returns that value (a thrown error becomes the call's error result). DSH has no separate prompt/guideline channel, so usage rules live in the description and the parameter descriptions.
+
+Each tool declares a per-call `timeoutMs` (enforced by `dsh-tool-call-timeout-policy`) and `isConcurrencySafe` (read-only tools run in parallel, `notion_page` stays exclusive), and every `ntn` spawn observes `exec.signal`, so a cancelled or timed-out call kills the child process instead of leaving it running.
+
+### Error codes
+
+DSH renders a thrown error as `Error: <message>` and keeps a structured `{ name, code }` only for its own `HarnessError`; a plain Error's `code` is dropped. This plugin therefore puts the category at the front of the message: `[INVALID_INPUT]`, `[NTN_FAILED]`, `[ABORTED]`, `[PARTIAL_WRITE]` (a failed write whose rollback also failed, so a half-made page remains — the message carries the id to clean up).
 
 ### License
 

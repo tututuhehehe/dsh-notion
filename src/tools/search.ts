@@ -11,9 +11,8 @@
  *   data_source，所以只在**发请求时**翻译（`value: "data_source"`），返回里再翻回 `database`。
  * - 依赖注入 runner：单测拿假 runner 顶替 runNtn，不需要 PATH 上的 ntn、不需要真 Notion 账号。
  */
-import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
-
+import { abortError, bindSignal, codedError, defineNotionTool, textBlocks, TOOL_TIMEOUTS } from "../dsh/tool.ts";
+import type { NotionTool } from "../dsh/tool.ts";
 import { parseJsonStdout, runNtn } from "../lib/runNtn.ts";
 import type { RunNtnOptions, RunNtnResult } from "../lib/runNtn.ts";
 
@@ -276,67 +275,86 @@ export function formatOutcome(outcome: SearchOutcome): string {
 }
 
 /**
- * 注册 notion_search。
- * `deps` 只给单测用：注入假 runner 就等于 mock 掉了 runNtn（不碰 PATH、不联网）。
+ * Build the `notion_search` tool definition.
+ * `deps` exists for tests: injecting a fake runner replaces `runNtn` (no PATH lookup, no network).
  */
-export function registerNotionSearch(pi: ExtensionAPI, deps: Partial<SearchDeps> = {}): void {
+export function createNotionSearchTool(deps: Partial<SearchDeps> = {}): NotionTool<SearchOutcome> {
   const runner = deps.run ?? defaultDeps.run;
 
-  pi.registerTool({
+  return defineNotionTool<SearchOutcome>({
     name: "notion_search",
-    label: "Notion Search",
     description:
-      "Search the Notion workspace by title through the official `ntn` CLI. Returns id, title, URL and " +
-      "object type (page|database) for each hit. This finds objects only: read a page's content with " +
-      "notion_get, and filter/sort rows of a returned database with notion_query.",
-    promptSnippet:
-      "Search Notion by title: id/title/url/object per hit, optional page-vs-database filter (limit 10, max 25)",
-    promptGuidelines: [
-      "Notion search matches titles only (page and database names), not page body text — pass a short keyword, not a sentence.",
-      "Use filter_object:'page' or 'database' to cut noise; a returned database's id is a data source id for notion_query.",
-      "Results are already limited: refine the query instead of raising limit, which is capped at 25.",
-    ],
-    parameters: Type.Object({
-      query: Type.String({ description: "Title keyword to match, searched verbatim (not full-text page search)." }),
-      limit: Type.Optional(
-        Type.Integer({
-          minimum: 1,
+      "Search the Notion workspace by title and return every hit's id, title, URL and object type " +
+      "(page|database). Titles only: page body text is never searched, so pass a short keyword rather " +
+      "than a sentence, and use filter_object to cut noise. Read a hit with notion_get; a returned " +
+      "database's id is a data source id for notion_query. Refine the query instead of raising limit, " +
+      "which is capped at 25.",
+    timeoutMs: TOOL_TIMEOUTS.search,
+    // Read-only and independent of every other call: safe to run alongside siblings.
+    isConcurrencySafe: () => true,
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description:
+            "Title keyword to match, searched verbatim (not full-text page search).",
+        },
+        limit: {
+          type: "integer",
           description: `Max results (default ${DEFAULT_LIMIT}). Values above ${MAX_LIMIT} are clamped to ${MAX_LIMIT}.`,
-        })
-      ),
-      filter_object: Type.Optional(
-        Type.Union([Type.Literal("page"), Type.Literal("database")], {
+        },
+        filter_object: {
+          type: "string",
+          enum: ["page", "database"],
           description: "Restrict hits to pages or databases (data sources). Omit to search both.",
-        })
-      ),
-    }),
-    outputSchema: Type.Object({
-      results: Type.Array(
-        Type.Object({
-          id: Type.String(),
-          title: Type.String(),
-          url: Type.String(),
-          object: Type.String(),
-        })
-      ),
-    }),
+        },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          limit: { type: "integer" },
+          results: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "string" },
+                title: { type: "string" },
+                url: { type: "string" },
+                object: { type: "string" },
+              },
+              required: ["id", "title", "url", "object"],
+              additionalProperties: false,
+            },
+          },
+          hasMore: { type: "boolean" },
+        },
+        required: ["query", "limit", "results", "hasMore"],
+        additionalProperties: false,
+      },
+      render: (_args, outcome) => textBlocks(formatOutcome(outcome)),
+    },
 
-    async execute(_toolCallId, params, _signal, onUpdate): Promise<AgentToolResult<SearchDetails>> {
-      // 先归一化再发 onUpdate：脏参数要在花钱/起进程之前失败
-      const query = normalizeQuery(params.query);
-      const limit = normalizeLimit(params.limit);
-
-      onUpdate?.({
-        content: [{ type: "text", text: `Searching Notion: ${query}` }],
-        details: { query, limit, filter_object: params.filter_object, count: 0, pending: true },
-      });
-
-      const outcome = await searchNotion({ query, limit, filter_object: params.filter_object }, runner);
-      return {
-        content: [{ type: "text", text: formatOutcome(outcome) }],
-        details: { query: outcome.query, limit: outcome.limit, filter_object: params.filter_object, count: outcome.results.length },
-        structuredContent: { results: outcome.results },
-      };
+    async execute(args, exec) {
+      const params = args as unknown as SearchParams;
+      try {
+        // Normalize before anything spawns: dirty arguments must fail without spending a call.
+        const query = normalizeQuery(params.query);
+        const limit = normalizeLimit(params.limit);
+        if (exec.signal?.aborted) throw abortError();
+        return await searchNotion(
+          { query, limit, filter_object: params.filter_object },
+          bindSignal(runner, exec.signal)
+        );
+      } catch (error) {
+        throw codedError(error);
+      }
     },
   });
 }

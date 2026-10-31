@@ -16,9 +16,8 @@
  * filter; a caller filter that already targets the same relation column is refused rather than
  * silently rewritten.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
-
+import { abortError, bindSignal, defineNotionTool, NOTION_ERROR_CODES, NotionToolError, textBlocks, TOOL_TIMEOUTS } from "../dsh/tool.ts";
+import type { NotionTool } from "../dsh/tool.ts";
 import { parseResolveDataSources } from "../lib/datasources.ts";
 import type { ResolvedDataSource } from "../lib/datasources.ts";
 import { extractNotionId } from "../lib/ids.ts";
@@ -70,13 +69,6 @@ export type QueryResult = {
   results: QueryRow[];
   next_cursor: string | null;
   has_more: boolean;
-};
-
-/** Tool return shape: success carries QueryResult, input errors carry structured details. */
-type ToolResult = {
-  content: { type: "text"; text: string }[];
-  details: Record<string, unknown>;
-  isError?: boolean;
 };
 
 export type NotionQueryDeps = {
@@ -439,85 +431,116 @@ export async function queryDataSource(
   return result;
 }
 
-export function registerNotionQuery(pi: ExtensionAPI, deps: NotionQueryDeps = {}): void {
+const QUERY_PARAMETERS = {
+  type: "object",
+  properties: {
+    database_or_data_source: {
+      type: "string",
+      minLength: 1,
+      description:
+        "Notion data source id, database id, or Notion URL. If the database has multiple data sources, pass one data source id explicitly.",
+    },
+    limit: {
+      type: "integer",
+      description: `Max rows per page (default ${DEFAULT_QUERY_LIMIT}, clamped to ${MAX_QUERY_LIMIT}).`,
+    },
+    start_cursor: {
+      oneOf: [{ type: "string" }, { type: "null" }],
+      description:
+        "Pagination cursor from a previous response's next_cursor. Omit for the first page.",
+    },
+    filter: {
+      type: "object",
+      additionalProperties: true,
+      description: "Raw Notion filter JSON object, passed through verbatim.",
+    },
+    under: {
+      type: "string",
+      description:
+        "Only rows linked to this parent row (id or Notion URL), filtered through the data source's Parent-item / self-relation column. Combined with filter via AND; refuses when filter already targets that same relation column.",
+    },
+    sort: {
+      oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }],
+      description: 'Sort spec "Property asc|desc", or an ordered array of specs for multiple sorts.',
+    },
+    include_content: {
+      type: "boolean",
+      description:
+        "Also fetch each row's Markdown with ntn pages get (default false; one extra call per row).",
+    },
+  },
+  required: ["database_or_data_source"],
+  additionalProperties: false,
+} as const;
+
+const QUERY_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    results: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          url: { oneOf: [{ type: "string" }, { type: "null" }] },
+          properties: { type: "object", additionalProperties: true },
+          markdown: { type: "string" },
+          markdown_error: { type: "string" },
+        },
+        required: ["id", "url", "properties"],
+        additionalProperties: false,
+      },
+    },
+    next_cursor: { oneOf: [{ type: "string" }, { type: "null" }] },
+    has_more: { type: "boolean" },
+  },
+  required: ["results", "next_cursor", "has_more"],
+  additionalProperties: false,
+} as const;
+
+/** Model-facing text: the query payload as JSON, which is what callers page through. */
+function renderQueryResult(result: QueryResult): string {
+  return JSON.stringify(result, null, 2);
+}
+
+/**
+ * Build the `notion_query` tool definition.
+ * `deps` exists for tests: injecting a fake runner replaces `runNtn`.
+ */
+export function createNotionQueryTool(deps: NotionQueryDeps = {}): NotionTool<QueryResult> {
   const runner = deps.runNtn ?? runNtn;
 
-  pi.registerTool({
+  return defineNotionTool<QueryResult>({
     name: "notion_query",
-    label: "Notion Query",
     description:
-      "Query pages in a known Notion data source (or database) with a Notion filter, sort specs, " +
-      "and cursor pagination. Returns { results: [{ id, url, properties }], next_cursor, has_more }. " +
-      "under=<parent row id|URL> returns only that parent's child rows (Parent-item relation). " +
-      "This is not workspace keyword search: use notion_search to find a page or database by title, " +
-      "and notion_get to read its schema or Markdown.",
-    promptSnippet:
-      "Query a known Notion data source/database with filter, sort, pagination; not keyword search",
-    promptGuidelines: [
-      "notion_query needs a data source or database id/URL. Use notion_search first when you only know a keyword or title.",
-      "Pass filter as a Notion filter JSON object (for example {\"property\":\"Status\",\"select\":{\"equals\":\"Open\"}}); sort as \"Property asc|desc\" or an array of those strings.",
-      "Use under to list only the child rows of one parent row (id or URL); it filters the data source's Parent-item column and is ANDed with filter. Do not also filter that column in filter.",
-      "Pagination: when has_more is true, call again with next_cursor as start_cursor. Do not raise limit to work around paging; limit is capped at 100.",
-      "include_content defaults to false and costs one extra ntn pages get call per row; enable it only when the row Markdown is actually needed.",
-    ],
-    parameters: Type.Object({
-      database_or_data_source: Type.String({
-        minLength: 1,
-        description:
-          "Notion data source id, database id, or Notion URL. If the database has multiple data sources, pass one data source id explicitly.",
-      }),
-      limit: Type.Optional(
-        Type.Integer({
-          minimum: 1,
-          description: `Max rows per page (default ${DEFAULT_QUERY_LIMIT}, clamped to ${MAX_QUERY_LIMIT}).`,
-        })
-      ),
-      start_cursor: Type.Optional(
-        Type.Union([Type.String(), Type.Null()], {
-          description:
-            "Pagination cursor from a previous response's next_cursor. Omit or null for the first page.",
-        })
-      ),
-      filter: Type.Optional(
-        Type.Record(Type.String(), Type.Unknown(), {
-          description: "Raw Notion filter JSON object, passed through verbatim.",
-        })
-      ),
-      under: Type.Optional(
-        Type.String({
-          minLength: 1,
-          description:
-            "Only rows linked to this parent row (id or Notion URL), filtered through the data source's Parent-item / self-relation column. Combined with filter via AND; refuses when filter already targets that same relation column.",
-        })
-      ),
-      sort: Type.Optional(
-        Type.Union([Type.String(), Type.Array(Type.String())], {
-          description:
-            'Sort spec "Property asc|desc", or an ordered array of specs for multiple sorts.',
-        })
-      ),
-      include_content: Type.Optional(
-        Type.Boolean({
-          description:
-            "Also fetch each row's Markdown with ntn pages get (default false; one extra call per row).",
-        })
-      ),
-    }),
+      "Query the rows of a known Notion data source (or database) with a Notion filter, sort specs and " +
+      "cursor pagination; returns rows, next_cursor and has_more. This is not keyword search: find the " +
+      "data source with notion_search first when you only know a title, and read its schema with " +
+      "notion_get. Pass filter as a raw Notion filter JSON object and sort as \"Property asc|desc\" or an " +
+      "array of those. Use under to list only the child rows of one parent row; it filters the data " +
+      "source's Parent-item column and is ANDed with filter, so do not also filter that column in " +
+      "filter. When has_more is true, call again with next_cursor as start_cursor instead of raising " +
+      "limit, which is capped at 100. include_content defaults to false and costs one extra ntn pages " +
+      "get call per row.",
+    timeoutMs: TOOL_TIMEOUTS.query,
+    // Read-only: safe to run alongside sibling calls.
+    isConcurrencySafe: () => true,
+    parameters: QUERY_PARAMETERS as unknown as Record<string, unknown>,
+    output: {
+      schema: QUERY_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+      render: (_args, value) => textBlocks(renderQueryResult(value)),
+    },
 
-    async execute(_toolCallId, params): Promise<ToolResult> {
+    async execute(args, exec) {
       try {
-        const result = await queryDataSource(params as NotionQueryParams, runner);
-        return {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-          details: result,
-        };
+        if (exec.signal?.aborted) throw abortError();
+        return await queryDataSource(
+          args as unknown as NotionQueryParams,
+          bindSignal(runner, exec.signal)
+        );
       } catch (error) {
         if (error instanceof QueryInputError) {
-          return {
-            content: [{ type: "text", text: `notion_query: ${error.message}` }],
-            details: { ok: false, error: error.message, ...error.details },
-            isError: true,
-          };
+          throw new NotionToolError(error.message, { code: NOTION_ERROR_CODES.invalidInput, details: error.details });
         }
         throw error;
       }
