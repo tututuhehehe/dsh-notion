@@ -163,7 +163,7 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
 
 `yes` 与 `recursive` 是两件事：`yes` 表示「我确认要删除」，`recursive` 表示「我确认连同子页面一起删除」。只有 `recursive` 而没有 `yes` 仍然会被拒绝。
 
-子页面检查走 `GET v1/blocks/{id}/children`，最多翻 4 页（200 个子块）——正常页面树远小于这个量。
+子页面检查走 `GET v1/blocks/{id}/children`，会顺着 `next_cursor` **翻到最后一页**再判断。不能只翻一页：该接口是按**块**分页的（默认每页 100 个块），一个大页面里大量段落会把子页面挤到后面的页，漏读就会漏报子页面、进而误判可以删除。翻页上限只作为失控保护（10000 块），真到达上限时**拒绝删除**而不是猜。
 
 ## 包容输入
 
@@ -302,7 +302,7 @@ DSH renders a thrown error as `Error: <message>` and keeps a structured `{ name,
 
 - **A database or data source is refused outright**, even with `yes: true` — removing one destroys its data sources and every row, which stays a human decision.
 - **An already-archived target reports success** (`already_linked: true`) instead of surfacing Notion's `400 Can't edit block that is archived`, so a retry is harmless.
-- **A page with child pages is refused** with the child ids unless `recursive: true` is also passed, because Notion archives the whole subtree. `yes` and `recursive` are separate consents.
+- **A page with child pages is refused** with the child ids unless `recursive: true` is also passed, because Notion archives the whole subtree. `yes` and `recursive` are separate consents. The child list is read from `GET v1/blocks/{id}/children` following `next_cursor` to the end: that endpoint pages over **blocks**, so one page of 100 blocks can hide child pages behind paragraphs, and a truncated read would under-report the subtree. The page cap is a runaway guard only, and reaching it refuses the delete rather than guessing.
 
 ### Tolerant arguments
 
