@@ -1867,25 +1867,58 @@ async function attachPage(
 type TrashTarget =
   | { kind: "page"; archived: boolean }
   | { kind: "database" }
-  | { kind: "unknown" };
+  /** No probe claimed the id, so it is not an object this token can see. */
+  | { kind: "missing" }
+  /**
+   * A probe failed for a reason other than "not found" (auth, timeout, 5xx). The
+   * type is unknowable, and proceeding could delete something we could not even
+   * read, so trash stops here instead of guessing.
+   */
+  | { kind: "unreadable"; reason: string };
+
+/**
+ * Whether an ntn failure means "this id is not that kind of object".
+ *
+ * Two shapes count: a 404 (nothing with this id is visible) and Notion's 400
+ * "Provided ID X is a database, not a page" — the id is real but is a different
+ * object kind, which is exactly what the next probe should try. Anything else
+ * (401, timeout, 5xx) is NOT this, because continuing would delete an object we
+ * could not read.
+ */
+function isNotFound(res: RunNtnResult): boolean {
+  if (res.ok) return false;
+  const text = `${res.stderr}\n${res.stdout}`;
+  return /404|not_found|object_not_found|Could not find|is a (database|data source|page), not a/i.test(
+    text
+  );
+}
 
 /** Classify a trash target by asking the API; never guesses from the id string. */
 async function classifyTrashTarget(
   runner: NtnRunner,
   id: string
 ): Promise<TrashTarget> {
-  const page = await runner({ args: ["api", `v1/pages/${id}`] });
-  if (page.ok) {
-    const raw = parseJsonMaybe(page.stdout);
-    const archived =
-      isPlainObject(raw) && (raw.archived === true || raw.in_trash === true);
-    return { kind: "page", archived };
+  const probes: { kind: "page" | "database"; path: string }[] = [
+    { kind: "page", path: `v1/pages/${id}` },
+    { kind: "database", path: `v1/databases/${id}` },
+    { kind: "database", path: `v1/data_sources/${id}` },
+  ];
+  for (const probe of probes) {
+    const res = await runner({ args: ["api", probe.path] });
+    if (res.ok) {
+      if (probe.kind === "database") return { kind: "database" };
+      const raw = parseJsonMaybe(res.stdout);
+      const archived =
+        isPlainObject(raw) && (raw.archived === true || raw.in_trash === true);
+      return { kind: "page", archived };
+    }
+    // A non-404 failure says nothing about the target's type, and a later probe
+    // would only replace a useful error with a misleading 404.
+    if (!isNotFound(res)) {
+      return { kind: "unreadable", reason: (res.stderr || res.stdout).trim() };
+    }
   }
-  const database = await runner({ args: ["api", `v1/databases/${id}`] });
-  if (database.ok) return { kind: "database" };
-  const dataSource = await runner({ args: ["api", `v1/data_sources/${id}`] });
-  if (dataSource.ok) return { kind: "database" };
-  return { kind: "unknown" };
+  return { kind: "missing" };
 }
 
 /** Direct child pages of one page, from `GET v1/blocks/{id}/children`. */
@@ -1960,6 +1993,19 @@ async function trashPage(
   }
 
   const target = await classifyTrashTarget(runner, id);
+  if (target.kind === "unreadable") {
+    throw ntnFailure(
+      `确认页面 ${id} 的类型（page / database / data source）`,
+      { ok: false, stdout: "", stderr: target.reason, code: null }
+    );
+  }
+  if (target.kind === "missing") {
+    throw new InputError(
+      `页面 ${id} 不存在，或没有被当前的 Notion integration 共享（••• → Connections），因此无法删除。` +
+        "请先用 notion_search 确认 id 正确。",
+      { id, target: "missing" }
+    );
+  }
   if (target.kind === "database") {
     // Use the global default: Notion refusal here is a policy choice of the plugin,
     // not a malformed argument, so `inputError`'s "fix your arguments" framing

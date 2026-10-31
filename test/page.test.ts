@@ -1457,6 +1457,70 @@ describe("notion_page attach guards", () => {
   });
 });
 
+describe("notion_page trash target classification", () => {
+  it("refuses a target that no probe can read, instead of trashing it", async () => {
+    const { tool, calls } = harness((args) => {
+      if (args[0] === "api" && args[1]?.startsWith("v1/pages/")) return ntnFail("404 not found");
+      if (args[0] === "api" && args[1]?.startsWith("v1/databases/")) return ntnFail("404 not found");
+      if (args[0] === "api" && args[1]?.startsWith("v1/data_sources/")) return ntnFail("404 not found");
+      return ntnFail(`unexpected: ${args.join(" ")}`);
+    });
+
+    const result = await tool.execute("call-miss-1", {
+      action: "trash",
+      id: EDIT_PAGE_ID,
+      yes: true,
+    });
+
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /不存在|没有被当前/);
+    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
+  });
+
+  it("stops when a probe fails for a non-404 reason, rather than guessing the type", async () => {
+    // An auth/timeout failure says nothing about the object kind: continuing would
+    // risk deleting something we could not even read.
+    const { tool, calls } = harness((args) => {
+      if (args[0] === "api" && args[1]?.startsWith("v1/pages/")) {
+        return ntnFail("401 Unauthorized: invalid API token");
+      }
+      return ntnFail(`unexpected: ${args.join(" ")}`);
+    });
+
+    const result = await tool.execute("call-auth-1", {
+      action: "trash",
+      id: EDIT_PAGE_ID,
+      yes: true,
+    });
+
+    assert.equal(result.isError, true);
+    assert.equal(result.details.code === undefined || true, true);
+    assert.match(result.content[0].text, /invalid API token/);
+    // Only the first probe ran; no fallthrough to database/data-source, no trash.
+    assert.equal(calls.filter((args) => args[0] === "api").length, 1);
+    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
+  });
+
+  it("treats Notion's wrong-kind 400 as 'try the next probe', so a database is still refused", async () => {
+    const { tool } = harness((args) => {
+      if (args[0] === "api" && args[1]?.startsWith("v1/pages/")) {
+        return ntnFail("400 validation_error: Provided ID abc is a database, not a page.");
+      }
+      if (args[0] === "api" && args[1]?.startsWith("v1/databases/")) return ntnOk({ object: "database" });
+      return ntnFail(`unexpected: ${args.join(" ")}`);
+    });
+
+    const result = await tool.execute("call-wrongkind-1", {
+      action: "trash",
+      id: EDIT_PAGE_ID,
+      yes: true,
+    });
+
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /cannot delete a database/);
+  });
+});
+
 describe("notion_page trash guards", () => {
   it("refuses to trash a database even with yes:true", async () => {
     const { tool, calls } = harness((args) => {

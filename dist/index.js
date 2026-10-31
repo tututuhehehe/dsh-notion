@@ -2027,18 +2027,33 @@ async function attachPage(params, runner) {
     changed: ["parent_item_relation"]
   });
 }
+function isNotFound(res) {
+  if (res.ok) return false;
+  const text2 = `${res.stderr}
+${res.stdout}`;
+  return /404|not_found|object_not_found|Could not find|is a (database|data source|page), not a/i.test(
+    text2
+  );
+}
 async function classifyTrashTarget(runner, id) {
-  const page = await runner({ args: ["api", `v1/pages/${id}`] });
-  if (page.ok) {
-    const raw = parseJsonMaybe(page.stdout);
-    const archived = isPlainObject(raw) && (raw.archived === true || raw.in_trash === true);
-    return { kind: "page", archived };
+  const probes = [
+    { kind: "page", path: `v1/pages/${id}` },
+    { kind: "database", path: `v1/databases/${id}` },
+    { kind: "database", path: `v1/data_sources/${id}` }
+  ];
+  for (const probe of probes) {
+    const res = await runner({ args: ["api", probe.path] });
+    if (res.ok) {
+      if (probe.kind === "database") return { kind: "database" };
+      const raw = parseJsonMaybe(res.stdout);
+      const archived = isPlainObject(raw) && (raw.archived === true || raw.in_trash === true);
+      return { kind: "page", archived };
+    }
+    if (!isNotFound(res)) {
+      return { kind: "unreadable", reason: (res.stderr || res.stdout).trim() };
+    }
   }
-  const database = await runner({ args: ["api", `v1/databases/${id}`] });
-  if (database.ok) return { kind: "database" };
-  const dataSource = await runner({ args: ["api", `v1/data_sources/${id}`] });
-  if (dataSource.ok) return { kind: "database" };
-  return { kind: "unknown" };
+  return { kind: "missing" };
 }
 async function listChildPages(runner, pageId) {
   const children = [];
@@ -2081,6 +2096,18 @@ async function trashPage(params, runner) {
     );
   }
   const target = await classifyTrashTarget(runner, id);
+  if (target.kind === "unreadable") {
+    throw ntnFailure(
+      `\u786E\u8BA4\u9875\u9762 ${id} \u7684\u7C7B\u578B\uFF08page / database / data source\uFF09`,
+      { ok: false, stdout: "", stderr: target.reason, code: null }
+    );
+  }
+  if (target.kind === "missing") {
+    throw new InputError(
+      `\u9875\u9762 ${id} \u4E0D\u5B58\u5728\uFF0C\u6216\u6CA1\u6709\u88AB\u5F53\u524D\u7684 Notion integration \u5171\u4EAB\uFF08\u2022\u2022\u2022 \u2192 Connections\uFF09\uFF0C\u56E0\u6B64\u65E0\u6CD5\u5220\u9664\u3002\u8BF7\u5148\u7528 notion_search \u786E\u8BA4 id \u6B63\u786E\u3002`,
+      { id, target: "missing" }
+    );
+  }
   if (target.kind === "database") {
     throw new InputError(
       `notion_page cannot delete a database (id ${id}). Removing a database, its data sources and every row in them is far more destructive than deleting a page, so this tool refuses even with yes: true. Ask the user to delete it in Notion (\u2022\u2022\u2022 \u2192 Delete) if that is really intended.`,
