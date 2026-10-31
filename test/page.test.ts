@@ -449,7 +449,7 @@ describe("notion_page create", () => {
     );
   });
 
-  it("rejects a bare id that is not a readable page with prefix guidance", async () => {
+  it("passes an ntn failure through with its own code, without nesting a second prefix", async () => {
     const { tool, calls } = harness(() => ntnFail("404 object_not_found"));
     const result = await tool.execute("call-11", {
       action: "create",
@@ -458,6 +458,25 @@ describe("notion_page create", () => {
     });
     assert.equal(result.isError, true);
     assert.equal(calls.length, 1);
+    // A 404 from ntn is [NTN_FAILED]; wrapping it as INVALID_INPUT would blame the
+    // arguments and put two [CODE] markers in one message.
+    assert.match(result.content[0].text, /^Error: \[NTN_FAILED\] /);
+    assert.equal((result.content[0].text.match(/\[[A-Z_]+\]/g) ?? []).length, 1);
+  });
+
+  it("still guides the caller when a bare id is genuinely not a page", async () => {
+    // A readable page with no parent: the id shape is the caller's problem here.
+    const { tool } = harness((args) => {
+      if (args[0] === "api" && args[1]?.startsWith("v1/pages/")) return ntnOk({ object: "page" });
+      return ntnFail(`unexpected: ${args.join(" ")}`);
+    });
+    const result = await tool.execute("call-11b", {
+      action: "create",
+      parent: ACCEPTANCE.dataSourceId,
+      props: { Name: "x" },
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
     assert.match(result.content[0].text, /database:<id> \/ data-source:<id>/);
   });
 });
@@ -1457,6 +1476,86 @@ describe("notion_page attach guards", () => {
   });
 });
 
+describe("notion_page child enumeration must be complete or refuse", () => {
+  /** A page whose children endpoint answers with the given body. */
+  function harnessWithChildren(body: string) {
+    return harness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
+        return ntnOk({ object: "page", id: EDIT_PAGE_ID, archived: false, parent: DS_PARENT });
+      }
+      if (args[0] === "api" && args[1] === `v1/blocks/${EDIT_PAGE_ID}/children`) {
+        return ntnOk(body);
+      }
+      if (args[0] === "pages" && args[1] === "trash") return ntnOk("trashed");
+      return ntnFail(`unexpected: ${args.join(" ")}`);
+    });
+  }
+
+  it("refuses when the children response is not JSON, instead of assuming no children", async () => {
+    const { tool, calls } = harnessWithChildren('warning: retried\n{"results":[]}');
+    const result = await tool.execute("call-enum-1", {
+      action: "trash",
+      id: EDIT_PAGE_ID,
+      yes: true,
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /无法解析|拒绝删除/);
+    // Fail closed: the delete must not happen on a read we could not parse.
+    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
+  });
+
+  it("refuses when has_more is true but no cursor is offered", async () => {
+    const { tool, calls } = harnessWithChildren(
+      JSON.stringify({ results: [{ id: "x", type: "paragraph" }], has_more: true })
+    );
+    const result = await tool.execute("call-enum-2", {
+      action: "trash",
+      id: EDIT_PAGE_ID,
+      yes: true,
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /next_cursor|拒绝删除/);
+    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
+  });
+
+  it("counts an inline child database as subtree content", async () => {
+    const { tool, calls } = harnessWithChildren(
+      JSON.stringify({
+        results: [{ id: "db1", type: "child_database", child_database: { title: "Inline DB" } }],
+        has_more: false,
+      })
+    );
+    const result = await tool.execute("call-enum-3", {
+      action: "trash",
+      id: EDIT_PAGE_ID,
+      yes: true,
+    });
+    assert.equal(result.isError, true);
+    assert.deepEqual(result.details.children, ["db1"]);
+    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
+  });
+
+  it("reports a nesting container, but not a table (which every row also marks)", async () => {
+    const { tool } = harnessWithChildren(
+      JSON.stringify({
+        results: [
+          { id: "tbl", type: "table", has_children: true, table: {} },
+          { id: "tgl", type: "toggle", has_children: true, toggle: {} },
+        ],
+        has_more: false,
+      })
+    );
+    const result = await tool.execute("call-enum-4", {
+      action: "trash",
+      id: EDIT_PAGE_ID,
+      yes: true,
+    });
+    assert.equal(result.isError, true);
+    // A table would refuse every ordinary page, so only the toggle is subtree content.
+    assert.deepEqual(result.details.children, ["tgl"]);
+  });
+});
+
 describe("notion_page trash target classification", () => {
   it("refuses a target that no probe can read, instead of trashing it", async () => {
     const { tool, calls } = harness((args) => {
@@ -1576,7 +1675,10 @@ describe("notion_page trash guards", () => {
     });
 
     assert.equal(result.isError, false, result.content[0].text);
-    assert.deepEqual(result.details.changed, ["trashed"]);
+    // Nothing was written, so nothing is claimed as changed.
+    assert.deepEqual(result.details.changed, []);
+    assert.equal(result.details.already_archived, true);
+    assert.match(result.content[0].text, /本来就在回收站/);
     // Idempotent: no trash call was needed.
     assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
   });

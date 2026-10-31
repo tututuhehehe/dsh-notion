@@ -856,6 +856,12 @@ async function classifyBareParent(
   try {
     page = readPage ? await readPage(id) : await fetchPageObject(runner, id);
   } catch (error) {
+    // Only a "this id is not a page" answer is the caller's mistake. An auth,
+    // timeout or spawn failure says nothing about the id, and rewriting it as
+    // INVALID_INPUT would send the model to change arguments that were fine —
+    // and would nest a second [CODE] prefix inside the first. A coded error
+    // passes through untouched so its own kind survives.
+    if (error instanceof NotionToolError) throw error;
     const detail = error instanceof Error ? error.message : String(error);
     throw new InputError(
       `无法把 ${id} 当作 parent：读取它作为页面失败${detail ? `（${truncate(detail, 300)}）` : ""}。` +
@@ -1270,11 +1276,10 @@ export type PageToolValue = {
   /** create when the parent was a database row. */
   parent_item_row_id?: string;
   parent_item_property?: string;
-  /**
-   * attach: the page/row is already under the requested parent; nothing was written.
-   * trash: the target was already archived, so the call succeeded without a write.
-   */
+  /** attach: the page/row is already under the requested parent; nothing was written. */
   already_linked?: boolean;
+  /** trash: the target was already in the trash, so the call succeeded without a write. */
+  already_archived?: boolean;
   /** attach row→row: the Parent-item values that were replaced. */
   replaced_parent_ids?: string[];
   /** attach: how far the cycle check got ("walked" | "partial" | "cycle"). */
@@ -1347,6 +1352,15 @@ export function describePageValue(value: PageToolValue): string {
       .join("\n");
   }
 
+  if (value.already_archived) {
+    return [
+      `页面 ${value.id} 本来就在回收站里，本次没有执行删除`,
+      value.url ? `URL: ${value.url}` : "",
+      "changed: (none)",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
   return [`已把页面 ${value.id} 移入回收站`, value.url ? `URL: ${value.url}` : ""]
     .filter(Boolean)
     .join("\n");
@@ -1921,6 +1935,23 @@ async function classifyTrashTarget(
   return { kind: "missing" };
 }
 
+/**
+ * Block types that can nest a page or database inside a page.
+ *
+ * Deliberately narrow: `has_children` is set by structural blocks too (tables and
+ * their rows), and treating all of them as subtree content would refuse to delete
+ * any page containing a table. These are the containers a page can hide behind.
+ */
+const NESTING_BLOCK_TYPES = new Set([
+  "toggle",
+  "column_list",
+  "column",
+  "synced_block",
+  "link_to_page",
+  "template",
+  "callout",
+]);
+
 /** Direct child pages of one page, from `GET v1/blocks/{id}/children`. */
 async function listChildPages(
   runner: NtnRunner,
@@ -1942,21 +1973,64 @@ async function listChildPages(
       throw ntnFailure(`列出页面 ${pageId} 的子块`, result);
     }
     const parsed = parseJsonMaybe(result.stdout);
-    if (!isPlainObject(parsed)) break;
+    if (!isPlainObject(parsed)) {
+      // The child list is the ONLY evidence this guard has. An unparseable response
+      // is "I could not enumerate", not "there are no children": treating it as empty
+      // would approve a subtree delete blind, so refuse instead.
+      throw inputError(
+        `页面 ${pageId} 的子块列表无法解析，不能确认它有多少子页面，因此拒绝删除。` +
+          `ntn 输出：${truncate((result.stdout || "").trim(), 200)}`,
+        { id: pageId, enumerable: false }
+      );
+    }
     const results = Array.isArray(parsed.results) ? parsed.results : [];
     for (const block of results) {
       if (!isPlainObject(block)) continue;
-      if (block.type !== "child_page") continue;
       if (typeof block.id !== "string") continue;
-      const title =
-        isPlainObject(block.child_page) && typeof block.child_page.title === "string"
-          ? block.child_page.title
-          : "(untitled)";
-      children.push({ id: block.id, title });
+      if (block.type === "child_page") {
+        const title =
+          isPlainObject(block.child_page) && typeof block.child_page.title === "string"
+            ? block.child_page.title
+            : "(untitled)";
+        children.push({ id: block.id, title });
+        continue;
+      }
+      // An inline database is its own object with rows; it is archived with the page.
+      if (block.type === "child_database") {
+        const title =
+          isPlainObject(block.child_database) && typeof block.child_database.title === "string"
+            ? block.child_database.title
+            : "(untitled database)";
+        children.push({ id: block.id, title });
+        continue;
+      }
+      // Only container types that can actually hold a page or database are walked.
+      // `has_children` alone is far too broad: every table and table_row reports it,
+      // which would make ordinary pages permanently undeletable. Toggles, columns,
+      // synced blocks and links can nest a page, so they are reported.
+      if (
+        block.has_children === true &&
+        NESTING_BLOCK_TYPES.has(String(block.type))
+      ) {
+        const type = String(block.type);
+        const payload = isPlainObject(block[type]) ? block[type] : undefined;
+        const title =
+          payload && typeof payload.title === "string"
+            ? payload.title
+            : `(${type} block with nested content)`;
+        children.push({ id: block.id, title });
+      }
     }
     const hasMore = parsed.has_more === true;
     const next = typeof parsed.next_cursor === "string" ? parsed.next_cursor : undefined;
-    if (!hasMore || !next) return children;
+    if (!hasMore) return children;
+    if (!next) {
+      // More blocks exist but no cursor was offered: the enumeration is incomplete.
+      throw inputError(
+        `页面 ${pageId} 的子块报告 has_more=true 却没有 next_cursor，无法读完子页面列表，因此拒绝删除。`,
+        { id: pageId, enumerable: false }
+      );
+    }
     cursor = next;
     if (page === MAX_PAGES - 1) {
       // Refuse rather than approve a delete over a subtree we could not enumerate.
@@ -2020,12 +2094,14 @@ async function trashPage(
   }
 
   if (target.kind === "page" && target.archived) {
+    // Nothing was written: the page was already in the trash. Saying "trashed" here
+    // would claim an effect that did not happen and hide that from the caller.
     return pageValue("trash", {
       id,
       url: pageUrl(id),
       properties: [],
-      changed: ["trashed"],
-      already_linked: true,
+      changed: [],
+      already_archived: true,
     });
   }
 
@@ -2120,6 +2196,7 @@ const PAGE_OUTPUT_SCHEMA = {
     parent_item_row_id: { type: "string" },
     parent_item_property: { type: "string" },
     already_linked: { type: "boolean" },
+    already_archived: { type: "boolean" },
     replaced_parent_ids: { type: "array", items: { type: "string" } },
     cycle_check: { type: "string" },
   },

@@ -236,11 +236,13 @@ export function readEnum<T extends string>(
 
 function spellingList<T extends string>(spellings: readonly Spelling<T>[]): string {
   return spellings
-    .map((spelling) =>
-      spelling.aliases.length === 0
+    .map((spelling) => {
+      // Drop an alias that merely repeats the value: `md (also "md")` is noise.
+      const aliases = spelling.aliases.filter((alias) => fold(alias) !== fold(spelling.value));
+      return aliases.length === 0
         ? spelling.value
-        : `${spelling.value} (also ${spelling.aliases.map((a) => `"${a}"`).join(", ")})`
-    )
+        : `${spelling.value} (also ${aliases.map((alias) => `"${alias}"`).join(", ")})`;
+    })
     .join(" | ");
 }
 

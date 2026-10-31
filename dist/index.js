@@ -78,9 +78,10 @@ function readEnum(raw, field, spellings) {
   );
 }
 function spellingList(spellings) {
-  return spellings.map(
-    (spelling) => spelling.aliases.length === 0 ? spelling.value : `${spelling.value} (also ${spelling.aliases.map((a) => `"${a}"`).join(", ")})`
-  ).join(" | ");
+  return spellings.map((spelling) => {
+    const aliases = spelling.aliases.filter((alias) => fold(alias) !== fold(spelling.value));
+    return aliases.length === 0 ? spelling.value : `${spelling.value} (also ${aliases.map((alias) => `"${alias}"`).join(", ")})`;
+  }).join(" | ");
 }
 function fold(value) {
   return value.trim().toLowerCase().replace(/[\s_-]+/g, "");
@@ -1282,6 +1283,7 @@ async function classifyBareParent(runner, id, action, readPage) {
   try {
     page = readPage ? await readPage(id) : await fetchPageObject(runner, id);
   } catch (error) {
+    if (error instanceof NotionToolError) throw error;
     const detail = error instanceof Error ? error.message : String(error);
     throw new InputError(
       `\u65E0\u6CD5\u628A ${id} \u5F53\u4F5C parent\uFF1A\u8BFB\u53D6\u5B83\u4F5C\u4E3A\u9875\u9762\u5931\u8D25${detail ? `\uFF08${truncate(detail, 300)}\uFF09` : ""}\u3002${action} \u7684\u88F8 id \u5FC5\u987B\u662F\u9875\u9762\u6216\u6570\u636E\u5E93\u884C\uFF1B\u5982\u679C\u5B83\u662F database \u6216 data source\uFF0C\u8BF7\u5199\u6210 database:<id> / data-source:<id>\u3002`,
@@ -1651,6 +1653,13 @@ function describePageValue(value) {
       value.url ? `URL: ${value.url}` : "",
       value.cycle_check === "partial" ? "\u6CE8\u610F\uFF1A\u9875\u9762\u7956\u5148\u94FE\u672A\u80FD\u5B8C\u6574\u8BFB\u53D6\uFF0C\u6DF1\u5C42\u73AF\u68C0\u67E5\u4E3A best-effort\uFF08cycle_check: partial\uFF09" : "",
       "changed: parent"
+    ].filter(Boolean).join("\n");
+  }
+  if (value.already_archived) {
+    return [
+      `\u9875\u9762 ${value.id} \u672C\u6765\u5C31\u5728\u56DE\u6536\u7AD9\u91CC\uFF0C\u672C\u6B21\u6CA1\u6709\u6267\u884C\u5220\u9664`,
+      value.url ? `URL: ${value.url}` : "",
+      "changed: (none)"
     ].filter(Boolean).join("\n");
   }
   return [`\u5DF2\u628A\u9875\u9762 ${value.id} \u79FB\u5165\u56DE\u6536\u7AD9`, value.url ? `URL: ${value.url}` : ""].filter(Boolean).join("\n");
@@ -2055,6 +2064,15 @@ async function classifyTrashTarget(runner, id) {
   }
   return { kind: "missing" };
 }
+var NESTING_BLOCK_TYPES = /* @__PURE__ */ new Set([
+  "toggle",
+  "column_list",
+  "column",
+  "synced_block",
+  "link_to_page",
+  "template",
+  "callout"
+]);
 async function listChildPages(runner, pageId) {
   const children = [];
   let cursor;
@@ -2066,18 +2084,42 @@ async function listChildPages(runner, pageId) {
       throw ntnFailure(`\u5217\u51FA\u9875\u9762 ${pageId} \u7684\u5B50\u5757`, result);
     }
     const parsed = parseJsonMaybe(result.stdout);
-    if (!isPlainObject(parsed)) break;
+    if (!isPlainObject(parsed)) {
+      throw inputError(
+        `\u9875\u9762 ${pageId} \u7684\u5B50\u5757\u5217\u8868\u65E0\u6CD5\u89E3\u6790\uFF0C\u4E0D\u80FD\u786E\u8BA4\u5B83\u6709\u591A\u5C11\u5B50\u9875\u9762\uFF0C\u56E0\u6B64\u62D2\u7EDD\u5220\u9664\u3002ntn \u8F93\u51FA\uFF1A${truncate((result.stdout || "").trim(), 200)}`,
+        { id: pageId, enumerable: false }
+      );
+    }
     const results = Array.isArray(parsed.results) ? parsed.results : [];
     for (const block of results) {
       if (!isPlainObject(block)) continue;
-      if (block.type !== "child_page") continue;
       if (typeof block.id !== "string") continue;
-      const title = isPlainObject(block.child_page) && typeof block.child_page.title === "string" ? block.child_page.title : "(untitled)";
-      children.push({ id: block.id, title });
+      if (block.type === "child_page") {
+        const title = isPlainObject(block.child_page) && typeof block.child_page.title === "string" ? block.child_page.title : "(untitled)";
+        children.push({ id: block.id, title });
+        continue;
+      }
+      if (block.type === "child_database") {
+        const title = isPlainObject(block.child_database) && typeof block.child_database.title === "string" ? block.child_database.title : "(untitled database)";
+        children.push({ id: block.id, title });
+        continue;
+      }
+      if (block.has_children === true && NESTING_BLOCK_TYPES.has(String(block.type))) {
+        const type = String(block.type);
+        const payload = isPlainObject(block[type]) ? block[type] : void 0;
+        const title = payload && typeof payload.title === "string" ? payload.title : `(${type} block with nested content)`;
+        children.push({ id: block.id, title });
+      }
     }
     const hasMore = parsed.has_more === true;
     const next = typeof parsed.next_cursor === "string" ? parsed.next_cursor : void 0;
-    if (!hasMore || !next) return children;
+    if (!hasMore) return children;
+    if (!next) {
+      throw inputError(
+        `\u9875\u9762 ${pageId} \u7684\u5B50\u5757\u62A5\u544A has_more=true \u5374\u6CA1\u6709 next_cursor\uFF0C\u65E0\u6CD5\u8BFB\u5B8C\u5B50\u9875\u9762\u5217\u8868\uFF0C\u56E0\u6B64\u62D2\u7EDD\u5220\u9664\u3002`,
+        { id: pageId, enumerable: false }
+      );
+    }
     cursor = next;
     if (page === MAX_PAGES - 1) {
       throw inputError(
@@ -2119,8 +2161,8 @@ async function trashPage(params, runner) {
       id,
       url: pageUrl(id),
       properties: [],
-      changed: ["trashed"],
-      already_linked: true
+      changed: [],
+      already_archived: true
     });
   }
   if (target.kind === "page") {
@@ -2198,6 +2240,7 @@ var PAGE_OUTPUT_SCHEMA = {
     parent_item_row_id: { type: "string" },
     parent_item_property: { type: "string" },
     already_linked: { type: "boolean" },
+    already_archived: { type: "boolean" },
     replaced_parent_ids: { type: "array", items: { type: "string" } },
     cycle_check: { type: "string" }
   },
@@ -2452,6 +2495,8 @@ async function queryDataSource(params, runner = runNtn) {
     );
   }
   const rawCursor = params.start_cursor;
+  const rawInclude = params.include_content;
+  const includeContent = rawInclude === void 0 ? false : readBoolean(rawInclude, "include_content");
   const limit = readQueryLimit(params.limit);
   const sorts = normalizeSort(params.sort);
   const startCursor = rawCursor === void 0 || rawCursor === null || typeof rawCursor === "string" && rawCursor.trim() === "" ? void 0 : readString(rawCursor, "start_cursor");
@@ -2466,7 +2511,10 @@ async function queryDataSource(params, runner = runNtn) {
   if (!query.ok) {
     const resolved = await resolveDataSources(target, runner);
     if (resolved.length > 1) {
-      throw new Error(describeDataSources(target, resolved));
+      throw new QueryInputError(describeDataSources(target, resolved), {
+        target,
+        data_source_ids: resolved.map((dataSource) => dataSource.id)
+      });
     }
     if (resolved.length === 1 && resolved[0].id !== target) {
       const retry = await runner({ args: buildQueryArgs(resolved[0].id, options) });
@@ -2492,7 +2540,8 @@ async function queryDataSource(params, runner = runNtn) {
       `Could not parse ntn datasources query output for ${target}: ${error instanceof Error ? error.message : String(error)}`
     );
   }
-  if (params.include_content === true) {
+  result = { ...result, limit };
+  if (includeContent) {
     await attachMarkdown(result.results, runner);
   }
   return result;
@@ -2555,7 +2604,8 @@ var QUERY_OUTPUT_SCHEMA = {
       }
     },
     next_cursor: { oneOf: [{ type: "string" }, { type: "null" }] },
-    has_more: { type: "boolean" }
+    has_more: { type: "boolean" },
+    limit: { type: "integer" }
   },
   required: ["results", "next_cursor", "has_more"],
   additionalProperties: false
@@ -2616,11 +2666,15 @@ function normalizeLimit(limit) {
 }
 function buildSearchBody(params) {
   const body = { query: params.query, page_size: params.limit };
-  if (params.filter_object) {
+  if (params.filter_object !== void 0) {
+    const object = readEnum(params.filter_object, "filter_object", [
+      { value: "page", aliases: ["pages"] },
+      { value: "database", aliases: ["databases", "data_source", "data_sources", "db"] }
+    ]);
     body.filter = {
       property: "object",
       // Notion 2025-09 起把 database 改名为 data_source；旧值会被接口判非法。
-      value: params.filter_object === "database" ? "data_source" : "page"
+      value: object === "database" ? "data_source" : "page"
     };
   }
   return body;

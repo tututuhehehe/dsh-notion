@@ -106,6 +106,8 @@ describe("notion_query registration", () => {
       results: [{ id: "page-1", url: "https://www.notion.so/page-1", properties: ROW.properties }],
       next_cursor: "c2",
       has_more: true,
+      // Echoed so a caller can see the page size that actually applied.
+      limit: 25,
     });
     assert.deepEqual(result.details, payload);
   });

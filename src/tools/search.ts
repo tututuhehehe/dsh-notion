@@ -17,6 +17,7 @@ import {
   codedError,
   defineNotionTool,
   inputError,
+  readEnum,
   readInteger,
   textBlocks,
   TOOL_TIMEOUTS,
@@ -108,11 +109,18 @@ export function normalizeLimit(limit: unknown): number {
  */
 export function buildSearchBody(params: { query: string; limit: number; filter_object?: FilterObject }): Record<string, unknown> {
   const body: Record<string, unknown> = { query: params.query, page_size: params.limit };
-  if (params.filter_object) {
+  if (params.filter_object !== undefined) {
+    // Normalize rather than compare to one literal: `"data_source"` is Notion's
+    // current name, and the old `=== "database" ? ... : "page"` turned every other
+    // value into a page-only search — silently the opposite of what was asked.
+    const object = readEnum(params.filter_object, "filter_object", [
+      { value: "page" as FilterObject, aliases: ["pages"] },
+      { value: "database" as FilterObject, aliases: ["databases", "data_source", "data_sources", "db"] },
+    ]);
     body.filter = {
       property: "object",
       // Notion 2025-09 起把 database 改名为 data_source；旧值会被接口判非法。
-      value: params.filter_object === "database" ? "data_source" : "page",
+      value: object === "database" ? "data_source" : "page",
     };
   }
   return body;

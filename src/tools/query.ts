@@ -24,6 +24,7 @@ import {
   inputError,
   NOTION_ERROR_CODES,
   NotionToolError,
+  readBoolean,
   readInteger,
   readString,
   describe,
@@ -82,6 +83,11 @@ export type QueryResult = {
   results: QueryRow[];
   next_cursor: string | null;
   has_more: boolean;
+  /**
+   * The page size actually requested from Notion after clamping. Echoed so a
+   * caller that asked for more than the maximum can see what it really got.
+   */
+  limit?: number;
 };
 
 export type NotionQueryDeps = {
@@ -421,6 +427,9 @@ export async function queryDataSource(
   }
 
   const rawCursor = (params as { start_cursor?: unknown }).start_cursor;
+  const rawInclude = (params as { include_content?: unknown }).include_content;
+  const includeContent =
+    rawInclude === undefined ? false : readBoolean(rawInclude, "include_content");
   const limit = readQueryLimit((params as { limit?: unknown }).limit);
   const sorts = normalizeSort((params as { sort?: unknown }).sort as string | string[] | undefined);
   const startCursor =
@@ -446,7 +455,12 @@ export async function queryDataSource(
     // failed, resolve explicitly. One data source → retry by id. Several → make the caller pick.
     const resolved = await resolveDataSources(target, runner);
     if (resolved.length > 1) {
-      throw new Error(describeDataSources(target, resolved));
+      // Picking one of several data sources is the caller's decision, so this is
+      // an input error, not an ntn failure; the ids go in details for the caller.
+      throw new QueryInputError(describeDataSources(target, resolved), {
+        target,
+        data_source_ids: resolved.map((dataSource) => dataSource.id),
+      });
     }
     if (resolved.length === 1 && resolved[0].id !== target) {
       const retry = await runner({ args: buildQueryArgs(resolved[0].id, options) });
@@ -478,7 +492,11 @@ export async function queryDataSource(
     );
   }
 
-  if (params.include_content === true) {
+  // Echo the page size that actually applied: a clamped request is otherwise
+  // invisible, and the caller has no way to know it did not get what it asked for.
+  result = { ...result, limit };
+
+  if (includeContent) {
     await attachMarkdown(result.results, runner);
   }
   return result;
@@ -548,6 +566,7 @@ const QUERY_OUTPUT_SCHEMA = {
     },
     next_cursor: { oneOf: [{ type: "string" }, { type: "null" }] },
     has_more: { type: "boolean" },
+    limit: { type: "integer" },
   },
   required: ["results", "next_cursor", "has_more"],
   additionalProperties: false,
