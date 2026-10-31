@@ -48,8 +48,14 @@ function expandHome(path: string): string {
 /** Resolve tokenFile: absolute and ~/... stay as-is, anything else is plugin-relative. */
 export function resolveTokenFile(raw: string): string {
   if (!raw) return join(PLUGIN_ROOT, DEFAULT_TOKEN_FILE);
+  // `expandHome` already returns an ABSOLUTE path, and `path.join` does not reset
+  // on an absolute segment the way `path.resolve` does — joining it onto the plugin
+  // root produced `<plugin>/Users/me/secret`, so the file silently failed to load
+  // and the plugin looked unauthenticated. Expand first, then join only when the
+  // value is still relative.
+  if (raw.startsWith("~")) return expandHome(raw);
   if (raw.startsWith("/")) return raw;
-  return join(PLUGIN_ROOT, expandHome(raw));
+  return join(PLUGIN_ROOT, raw);
 }
 
 function text(value: unknown): string {

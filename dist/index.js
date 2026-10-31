@@ -2881,8 +2881,9 @@ function expandHome(path) {
 }
 function resolveTokenFile(raw) {
   if (!raw) return join(PLUGIN_ROOT, DEFAULT_TOKEN_FILE);
+  if (raw.startsWith("~")) return expandHome(raw);
   if (raw.startsWith("/")) return raw;
-  return join(PLUGIN_ROOT, expandHome(raw));
+  return join(PLUGIN_ROOT, raw);
 }
 function text(value) {
   return typeof value === "string" ? value.trim() : "";

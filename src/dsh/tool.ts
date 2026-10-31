@@ -300,18 +300,6 @@ export function readString(raw: unknown, field: string): string {
   return raw.trim();
 }
 
-/** A JSON object argument (blank when absent). */
-export function readObject(raw: unknown, field: string): JsonObject | undefined {
-  if (raw === undefined || raw === null) return undefined;
-  if (typeof raw !== "object" || Array.isArray(raw)) {
-    throw inputError(`${field} must be a JSON object, got ${describe(raw)}.`, {
-      field,
-      value: raw,
-    });
-  }
-  return raw as JsonObject;
-}
-
 /** Short, safe rendering of a caller-supplied value for an error message. */
 export function describe(value: unknown): string {
   try {

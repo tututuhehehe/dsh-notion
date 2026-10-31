@@ -2,15 +2,49 @@
  * Test harness that mounts a `NotionTool` the way the DSH tool registry does.
  *
  * Unit tests inject fake `ntn` runners (no PATH lookup, no network, no token) and then
- * talk to the tool through this harness, so every assertion against the model-facing
- * envelope still exercises the real definition instead of a test-only wrapper.
+ * talk to the tool through this harness, so every assertion still exercises the real
+ * definition instead of a test-only wrapper.
  *
- * The materialization mirrors DSH's own tool registry:
- *   - success: `{ isError: false, value, details: value, content: render(args, value) }`
- *   - thrown body: `{ isError: true, details: error.details ?? {}, error, content: [text("Error: <message>")] }`
- * That is what `toolErrorResult` renders, so the error text keeps DSH's `Error: ` prefix.
+ * What is modelled faithfully (from `dsh-tools/lib/index.js`):
+ *   - success: the registry snapshots the body's return value as the canonical `value`,
+ *     validates it against `output.schema`, and derives the content via `output.render`;
+ *   - failure: `toolErrorResult` renders `Error: <message>` and keeps `{ name, code }`
+ *     only for its own `HarnessError` instances.
+ *
+ * What is deliberately ADDED for assertions: `details`. The real registry has no such
+ * field — it exposes `value` on success and `error` on failure. `details` is a
+ * test-only convenience that surfaces the canonical value (success) or the thrown
+ * error's `.details` payload (failure) so tests can read structured data without
+ * re-deriving it from the rendered text. Assertions on it test this plugin's own
+ * error/canonical payloads, not a DSH contract.
+ *
+ * `assertOutput` is exported so a test can run the REAL schema check the registry
+ * performs; `mount` calls it on every success so an output/schema mismatch fails here
+ * rather than shipping.
  */
 import type { NotionTool, TextBlock } from "../../src/dsh/tool.ts";
+import {
+  assertSupportedJsonSchema,
+  validateJsonSchemaValue,
+} from "./dsh-json-schema.ts";
+
+/**
+ * Assert a definition's schemas and a canonical value the way the registry does.
+ *
+ * The registry validates a successful body's value against `output.schema` before
+ * anything is rendered; `mount` calls this on every success, so a mismatch fails the
+ * test instead of shipping.
+ */
+export function assertOutput<Value>(tool: NotionTool<Value>, value: unknown): void {
+  assertSupportedJsonSchema(tool.parameters);
+  assertSupportedJsonSchema(tool.output.schema);
+  const violations = validateJsonSchemaValue(tool.output.schema, value, "value");
+  if (violations.length > 0) {
+    throw new Error(
+      `${tool.name} returned a value its own output.schema rejects: ${violations.join("; ")}`
+    );
+  }
+}
 
 export type MountedResult<Value = unknown> = {
   /** DSH sets this explicitly to true/false, never leaves it undefined. */
@@ -60,6 +94,8 @@ export function mount<Value>(tool: NotionTool<Value>): MountedTool<Value> {
     async execute(_callId, params, signal) {
       try {
         const value = await tool.execute(params, signal ? { signal } : {});
+        // Fail here (not in production) if the value does not satisfy the declared schema.
+        assertOutput(tool, value);
         return {
           isError: false,
           value,

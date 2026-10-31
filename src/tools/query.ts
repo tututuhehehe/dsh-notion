@@ -120,22 +120,10 @@ function summarizeFailure(result: RunNtnResult, action: string): string {
  * The schema already enforces minimum 1, but execute() is also reachable directly (tests,
  * programmatic callers), so keep the check here as well.
  */
-export function normalizeLimit(limit?: number): number {
-  const value = limit ?? DEFAULT_QUERY_LIMIT;
-  if (!Number.isInteger(value)) {
-    throw new Error(`limit must be an integer, got ${String(limit)}.`);
-  }
-  if (value <= 0) {
-    throw new Error(`limit must be greater than 0, got ${value}.`);
-  }
-  return Math.min(value, MAX_QUERY_LIMIT);
-}
-
 /**
- * The tool's own limit reading: tolerant where {@link normalizeLimit} is strict.
- * A fractional or numeric-string count is a harmless phrasing difference, so it
- * is truncated rather than rejected; `<= 0` stays an error because no intended
- * page size produces it.
+ * The tool's own limit reading. A fractional or numeric-string count is a harmless
+ * phrasing difference, so it is truncated rather than rejected.
+ * `<= 0` stays an error because no intended page size produces it.
  */
 function readQueryLimit(raw: unknown): number {
   if (raw === undefined || raw === null) return DEFAULT_QUERY_LIMIT;
