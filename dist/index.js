@@ -2043,7 +2043,8 @@ async function classifyTrashTarget(runner, id) {
 async function listChildPages(runner, pageId) {
   const children = [];
   let cursor;
-  for (let page = 0; page < 4; page += 1) {
+  const MAX_PAGES = 100;
+  for (let page = 0; page < MAX_PAGES; page += 1) {
     const query = cursor ? `?start_cursor=${encodeURIComponent(cursor)}` : "";
     const result = await runner({ args: ["api", `v1/blocks/${pageId}/children${query}`] });
     if (!result.ok) {
@@ -2061,8 +2062,14 @@ async function listChildPages(runner, pageId) {
     }
     const hasMore = parsed.has_more === true;
     const next = typeof parsed.next_cursor === "string" ? parsed.next_cursor : void 0;
-    if (!hasMore || !next) break;
+    if (!hasMore || !next) return children;
     cursor = next;
+    if (page === MAX_PAGES - 1) {
+      throw inputError(
+        `\u9875\u9762 ${pageId} \u7684\u5B50\u5757\u8D85\u8FC7 ${MAX_PAGES} \u9875\u4ECD\u672A\u5217\u5B8C\uFF0C\u65E0\u6CD5\u786E\u8BA4\u5B83\u6709\u591A\u5C11\u5B50\u9875\u9762\uFF0C\u56E0\u6B64\u62D2\u7EDD\u5220\u9664\u3002\u8BF7\u5728 Notion \u91CC\u624B\u52A8\u786E\u8BA4\u5E76\u5220\u9664\u3002`,
+        { id: pageId, children_enumerated: children.length, enumerable: false }
+      );
+    }
   }
   return children;
 }

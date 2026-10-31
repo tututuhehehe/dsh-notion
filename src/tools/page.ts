@@ -1895,9 +1895,14 @@ async function listChildPages(
 ): Promise<{ id: string; title: string }[]> {
   const children: { id: string; title: string }[] = [];
   let cursor: string | undefined;
-  // Bounded: a page with a huge child list is pathological, and the caller only
-  // needs enough ids to decide. 200 children is far beyond a normal tree.
-  for (let page = 0; page < 4; page += 1) {
+  // Walk the whole child list, not a fixed page count: the default page returns
+  // 100 BLOCKS (not 100 child pages), so a page with many paragraphs can hide
+  // child pages on a later page. Stopping early would under-report the subtree
+  // and let the guard approve a delete that removes children it never listed.
+  // The bound is a runaway guard only (a page would need 10_000 blocks to hit it),
+  // and reaching it refuses instead of guessing.
+  const MAX_PAGES = 100;
+  for (let page = 0; page < MAX_PAGES; page += 1) {
     const query = cursor ? `?start_cursor=${encodeURIComponent(cursor)}` : "";
     const result = await runner({ args: ["api", `v1/blocks/${pageId}/children${query}`] });
     if (!result.ok) {
@@ -1918,8 +1923,16 @@ async function listChildPages(
     }
     const hasMore = parsed.has_more === true;
     const next = typeof parsed.next_cursor === "string" ? parsed.next_cursor : undefined;
-    if (!hasMore || !next) break;
+    if (!hasMore || !next) return children;
     cursor = next;
+    if (page === MAX_PAGES - 1) {
+      // Refuse rather than approve a delete over a subtree we could not enumerate.
+      throw inputError(
+        `页面 ${pageId} 的子块超过 ${MAX_PAGES} 页仍未列完，无法确认它有多少子页面，因此拒绝删除。` +
+          "请在 Notion 里手动确认并删除。",
+        { id: pageId, children_enumerated: children.length, enumerable: false }
+      );
+    }
   }
   return children;
 }
