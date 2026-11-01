@@ -1,30 +1,77 @@
+// TypeScript config for dsh-notion.
+//
+// `npm run typecheck` runs `tsc --noEmit` against this file. Before it existed,
+// that script printed the compiler's help text and exited 1 without checking
+// anything — which is how an illegal JSON-Schema keyword (`minLength`, which DSH
+// refuses) survived in a tool definition. Keep this file working.
 {
   "compilerOptions": {
     "target": "ES2022",
-    "lib": [
-      "ES2022"
-    ],
+    "lib": ["ES2022"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+
+    // `strict` includes `strictNullChecks`, which is the part that catches real
+    // "this value may be null/undefined" bugs — a function returning
+    // `string | undefined` gets flagged at the call site. That is the protection
+    // worth having here, and it is on.
     "strict": true,
     "noImplicitOverride": true,
     "noFallthroughCasesInSwitch": true,
+
+    // `exactOptionalPropertyTypes` is off on purpose: the tools build result
+    // objects by spreading optional fields (`...(title ? { title } : {})`), which
+    // is correct at runtime but does not type-check under this flag without
+    // rewriting every construction site into a different idiom.
     "exactOptionalPropertyTypes": false,
+
+    // DELIBERATELY NOT ENABLED: `noUncheckedIndexedAccess`.
+    //
+    // It makes `arr[0]` typed `T | undefined` instead of `T`, i.e. it assumes any
+    // index may be out of range. Enabling it was measured at 191 errors: 164 in
+    // test/, 27 in src/. Re-measure rather than trusting those exact counts
+    // (adding a test moves them); the ~6:1 test/src split does not. Every src/ hit
+    // sits behind an already-proven guarantee, so the flag adds no finding here:
+    //
+    //   src/tools/query.ts  `resolved[0]` — the two branches immediately above it
+    //                       throw on `length > 1` and on `length === 0`, so length
+    //                       is exactly 1 when the index is read.
+    //   src/tools/get.ts    `schemaResults[i]` / `refs[i]` — both derive from the
+    //                       same `dataSourceIds.map(...)` spread into one
+    //                       `Promise.all`, so the arrays are always the same length.
+    //   src/lib/ids.ts      `matches[matches.length - 1]` — `matches` is null-checked
+    //                       and returned from first, so length is >= 1 when read.
+    //   the rest            fixed literal indexes (`argv[0]`, `parts[1]`) on values
+    //                       already validated above.
+    //
+    // The test/ errors are the reason the flag cannot be partially useful: it
+    // is a global option, so those would have to be silenced first (with `!`, which
+    // asserts the opposite of what the flag exists to prove) before src/ got any
+    // benefit. Silencing them with `!` is strictly worse than leaving the flag off.
+    //
+    // Also note this is a COMPILE-TIME only setting: it does not change the emitted
+    // bundle (`dist/index.js` is byte-identical either way) and cannot affect how a
+    // tool behaves at runtime. The 219 tests pass under both settings.
+    //
+    // If someone still wants it, the honest route is a second tsconfig for `src/`
+    // alone — not blanket `!` in test/. That is a separate migration task with its
+    // own review, not a drive-by setting change.
+
+    // Source imports carry `.ts` extensions because Node runs the tests directly
+    // with type stripping (`node --test "test/**/*.test.ts"`), and esbuild bundles
+    // from the same files. This lets tsc resolve those imports as written.
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": false,
     "esModuleInterop": true,
     "skipLibCheck": true,
+
+    // Type-check only: esbuild produces dist/index.js. `tsc` never emits.
     "noEmit": true,
-    "types": [
-      "node"
-    ]
+
+    // `@types/node` is the only ambient package; without it `node:fs`, `process`
+    // and `AbortSignal` are all unresolved.
+    "types": ["node"]
   },
-  "include": [
-    "src/**/*.ts",
-    "test/**/*.ts"
-  ],
-  "exclude": [
-    "node_modules",
-    "dist"
-  ]
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
 }
