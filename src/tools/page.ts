@@ -2611,15 +2611,16 @@ const EDIT_ITEM_SCHEMA = {
     old_str: {
       type: "string",
       description:
-        "Required, non-empty. The existing text to find. A SUBSTRING MATCHES — you may replace one word, one " +
-        "sentence, or several whole blocks; you do NOT have to repeat the whole paragraph. " +
-        "MATCHING RUNS ON PLAIN TEXT, WITH ONE RULE: the substring must lie ENTIRELY WITHIN ONE RICH-TEXT RUN " +
-        "and must NOT CONTAIN A FORMATTING MARKER. So for a paragraph shown as `Alpha **bold** omega`, these " +
-        "work: `Alpha `, `bold`, ` omega` — and these DON'T: `**bold**` (contains a marker), `Alpha bold` " +
-        "(crosses from plain text into the bold run), `Alpha **bold** omega` (contains a marker). " +
-        "PRACTICAL RULE, verified live: pick a short marker-free fragment from WITHIN a single run rather than " +
-        "copying the markup; if a unique fragment is impossible, send the whole paragraph with its markers and it " +
-        "will NOT match — instead choose a fragment on one side of the formatting. " +
+        "Required, non-empty. The existing text to find. A SUBSTRING matches, so you may replace one word, one " +
+        "sentence, or several blocks — you do NOT have to resend the whole paragraph. " +
+        "SIMPLEST CORRECT RULE: COPY WHAT notion_get SHOWED YOU, MARKERS AND ALL. That always matches, at any " +
+        "length, across any formatting (verified live: on `A first **B bold** C middle` the values " +
+        "`**B bold**`, `A first **B bold** C middle`, and the whole paragraph all match). " +
+        "A MARKER-FREE PLAIN substring ALSO works, but ONLY if it lies entirely inside ONE formatting run: for " +
+        "`Alpha **bold** omega`, `bold` and `Alpha ` match, while `Alpha bold` does NOT (it crosses from plain " +
+        "text into the bold run). " +
+        "So the ONE way to fail is a plain substring that straddles a formatting boundary — e.g. stripping the " +
+        "** of a phrase that spans plain and bold text. When unsure, copy the markers. " +
         "Adjacent blocks can be matched together with \\n; that merges them into one block on replace, so only " +
         "do it when you intend to merge. " +
         "A `$` may be written EITHER bare or escaped here — both match (verified), so copying the \\\\$ that notion_get renders works.",

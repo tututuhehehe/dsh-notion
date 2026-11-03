@@ -302,17 +302,26 @@ Multiple matches found for "<old_str>". Found N matches...
 
 ### 五个容易踩的细节
 
-**`old_str` 匹配的是块的纯文本，不是 Markdown。** 如果页面上是 `**加粗BBB**`：
+**`old_str` 的两种合法写法。** 页面是 `Alpha **bold** omega` 时：
 
 ```jsonc
-// ✅ 匹配得到，且加粗格式原样保留
-{ "old_str": "加粗BBB", "new_str": "加粗CCC" }
+// ✅ 方式一：照抄 notion_get 显示的 Markdown（带记号）。任意长度、跨任意格式都能命中
+{ "old_str": "**bold**" }
+{ "old_str": "Alpha **bold** omega" }
 
-// ❌ 带上星号反而匹配不到纯文本
-{ "old_str": "**加粗BBB**" }
+// ✅ 方式二：纯文本片段，但必须完整落在同一个格式片段内
+{ "old_str": "bold" }
+{ "old_str": "Alpha " }
+
+// ❌ 唯一的失败写法：纯文本，但跨过了格式边界
+{ "old_str": "Alpha bold" }
 ```
 
-同理，`# 标题`、`> 引用`、`- 列表项` 这些 Markdown 记号不要写进 `old_str`。`notion_get` 返回的是 Markdown，所以**从它里面复制 `old_str` 时要把记号去掉**。
+**规矩一句话：不确定就照抄记号。** 剥掉记号只在「整段都落在同一个格式片段内」时才行。
+
+实测确认（5 个格式片段的段落 `A first **B bold** C middle `D code` E last`）：带记号的 `**B bold**`、`` `D code` ``、`A first **B bold** C middle` 以及整段**全部命中**；纯文本 `B bold`、`C middle` 也命中；但 `first B`、`bold C`、`middle D` 这类**跨边界**的纯文本全部失败。
+
+`# 标题`、`- 列表项`、代码块内的文字同理：**整个块照抄**或**块内单片段**都能命中，跨片段的纯文本不行。
 
 **`new_str` 里的换行决定块结构。** 单个 `\n` 是**同一个块内的换行**（soft break）；`\n\n` 是**分成两个块**。想生成新的段落、标题、列表项，就用 `\n\n` 隔开。
 
