@@ -89,6 +89,7 @@ import {
   TOOL_TIMEOUTS,
 } from "../dsh/tool.ts";
 import type { JsonObject, NotionTool } from "../dsh/tool.ts";
+import { TOOL_DESCRIPTIONS } from "../text/tools.ts";
 import { parseResolveDataSources } from "../lib/datasources.ts";
 import { failureHint, failureStatus, snippet } from "../lib/failures.ts";
 import { extractNotionId } from "../lib/ids.ts";
@@ -2858,17 +2859,7 @@ export function createNotionPageCreateTool(deps: NotionPageDeps = {}): NotionToo
 
   return defineNotionTool<PageToolValue>({
     name: "notion_page_create",
-    description:
-      "Create one Notion page or database row. This tool never modifies an existing page — use " +
-      "notion_page_edit for that. " +
-      "`parent` is OPTIONAL: omit it to create the page at the WORKSPACE ROOT (Notion's own default; such a " +
-      "page has only a title, so props cannot carry columns). " +
-      "A page created inside a database needs a title: the `title` parameter, the title property in props, or " +
-      "a leading \"# Heading\" in body_content. " +
-      "Creating takes a SECOND request for the columns and icon. If that request fails the new page is trashed " +
-      "so no half-made page is left behind, and the error reports whether the cleanup worked (`rollback`) — " +
-      "partial:true means something was left behind. " +
-      "A successful result reports the title, the body it wrote, the columns and the icon separately.",
+    description: TOOL_DESCRIPTIONS.pageCreate,
     timeoutMs: TOOL_TIMEOUTS.page,
     // Every operation here can write, so page calls stay exclusive: never overlap two.
     isConcurrencySafe: () => false,
@@ -2911,19 +2902,7 @@ export function createNotionPageEditTool(deps: NotionPageDeps = {}): NotionTool<
 
   return defineNotionTool<PageToolValue>({
     name: "notion_page_edit",
-    description:
-      "Change an existing Notion page: find-and-replace its text, append Markdown, update title/columns/icon, " +
-      "and/or move it. A single call may combine all of these. " +
-      "THE STEPS ARE INDEPENDENT: they run in this order — (1) body content, (2) title/props/icon, " +
-      "(3) parent move — and a failure in one does NOT cancel the others. A failed old_str is a bad argument, " +
-      "not a broken page, so a valid title change or move still happens. The result then reports 部分成功 with " +
-      "exactly what landed and what did not: retry ONLY the failed part, because resending the whole call " +
-      "re-applies the parts that already succeeded. " +
-      "`changed` lists what actually happened. " +
-      "There is NO whole-page replace in this tool: to rewrite everything, delete the old text with edits " +
-      "(new_str \"\") and append the new text in a second call. " +
-      "When the returned body was truncated the result says so — truncated markdown is not the full page, so do " +
-      "not derive the next old_str from it.",
+    description: TOOL_DESCRIPTIONS.pageEdit,
     timeoutMs: TOOL_TIMEOUTS.page,
     isConcurrencySafe: () => false,
     parameters: EDIT_PARAMETERS as unknown as JsonObject,
@@ -3000,14 +2979,7 @@ export function createNotionPageTrashTool(deps: NotionPageDeps = {}): NotionTool
 
   return defineNotionTool<PageToolValue>({
     name: "notion_page_trash",
-    description:
-      "Move one Notion page or database row to the trash. " +
-      "yes:true is required, otherwise nothing is called. " +
-      "Three guards a bare delete does not give you: a database or data source is refused even with yes:true " +
-      "(deleting one destroys its rows too — ask the user to do it in Notion); a page that is already in the trash " +
-      "returns success with already_archived:true instead of an error; and a page with child pages is refused " +
-      "unless recursive:true, because Notion archives the whole subtree — the error lists the child ids so you can " +
-      "show the user exactly what else would go. Trash is idempotent: calling it twice is safe.",
+    description: TOOL_DESCRIPTIONS.pageTrash,
     timeoutMs: TOOL_TIMEOUTS.page,
     isConcurrencySafe: () => false,
     parameters: TRASH_PARAMETERS as unknown as JsonObject,

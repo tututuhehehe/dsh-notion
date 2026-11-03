@@ -32,6 +32,7 @@ import {
   TOOL_TIMEOUTS,
 } from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
+import { TOOL_DESCRIPTIONS } from "../text/tools.ts";
 import { parseResolveDataSources } from "../lib/datasources.ts";
 import { describeFailure } from "../lib/failures.ts";
 import type { ResolvedDataSource } from "../lib/datasources.ts";
@@ -578,16 +579,7 @@ export function createNotionQueryTool(deps: NotionQueryDeps = {}): NotionTool<Qu
 
   return defineNotionTool<QueryResult>({
     name: "notion_query",
-    description:
-      "Query the rows of a known Notion data source (or database) with a Notion filter, sort specs and " +
-      "cursor pagination; returns rows, next_cursor and has_more. This is not keyword search: find the " +
-      "data source with notion_search first when you only know a title, and read its schema with " +
-      "notion_get. Pass filter as a raw Notion filter JSON object and sort as \"Property asc|desc\" or an " +
-      "array of those. Use under to list only the child rows of one parent row; it filters the data " +
-      "source's Parent-item column and is ANDed with filter, so do not also filter that column in " +
-      "filter. When has_more is true, call again with next_cursor as start_cursor instead of raising " +
-      "limit, which is capped at 100. include_content defaults to false and costs one extra ntn pages " +
-      "get call per row.",
+    description: TOOL_DESCRIPTIONS.query,
     timeoutMs: TOOL_TIMEOUTS.query,
     // Read-only: safe to run alongside sibling calls.
     isConcurrencySafe: () => true,

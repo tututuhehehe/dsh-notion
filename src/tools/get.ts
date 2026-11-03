@@ -28,6 +28,7 @@ import {
   TOOL_TIMEOUTS,
 } from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
+import { TOOL_DESCRIPTIONS } from "../text/tools.ts";
 import { describeFailure, failureHint } from "../lib/failures.ts";
 import { extractNotionId } from "../lib/ids.ts";
 import {
@@ -184,13 +185,7 @@ export function renderGetResult(value: NotionGetResult): string {
 export function createNotionGetTool(run: NtnRunner = runNtn): NotionTool<NotionGetResult> {
   return defineNotionTool<NotionGetResult>({
     name: "notion_get",
-    description:
-      "Read one Notion page or inspect one database. A page returns Markdown (format='md', default) with " +
-      "its properties as frontmatter, or a structured payload (format='json') that also carries url, " +
-      "title, truncated and unknown_block_ids. A database returns every data source id plus each " +
-      "property's name, type, writable flag and Parent-item / self-relation candidates; rows are never " +
-      "fetched here, so read them with notion_query. If a page comes back truncated (rare), format='json' " +
-      "shows unknown_block_ids; the truncated Markdown lists the next steps.",
+    description: TOOL_DESCRIPTIONS.get,
     timeoutMs: TOOL_TIMEOUTS.get,
     // Read-only: safe to run alongside sibling calls.
     isConcurrencySafe: () => true,

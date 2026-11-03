@@ -23,6 +23,7 @@ import {
   TOOL_TIMEOUTS,
 } from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
+import { TOOL_DESCRIPTIONS } from "../text/tools.ts";
 import { describeFailure, snippet } from "../lib/failures.ts";
 import { parseJsonStdout, runNtn } from "../lib/runNtn.ts";
 import type { RunNtnOptions, RunNtnResult } from "../lib/runNtn.ts";
@@ -267,14 +268,7 @@ export function createNotionSearchTool(deps: Partial<SearchDeps> = {}): NotionTo
 
   return defineNotionTool<SearchOutcome>({
     name: "notion_search",
-    description:
-      "Search Notion by TITLE; returns id, title, URL and object type (page|database). " +
-      "MATCHING IS TOKEN-OR, NOT SUBSTRING: the query is split into words and any title containing ANY ONE of " +
-      "them comes back, ranked — so a long query yields loosely-related hits, not just the one you meant. " +
-      'Wrap a known EXACT title in double quotes ("PRD · notion_page") to get exactly that hit. ' +
-      "TITLES only: body text is never searched, and a 0-hit result does NOT prove absence (a fresh page may " +
-      "not be indexed for a second or two; retry once). A hit is not proof it is the right object: verify " +
-      "with notion_get. Use filter_object or limit to narrow; prefer refining the query over raising limit.",
+    description: TOOL_DESCRIPTIONS.search,
     timeoutMs: TOOL_TIMEOUTS.search,
     // Read-only and independent of every other call: safe to run alongside siblings.
     isConcurrencySafe: () => true,
