@@ -58,17 +58,24 @@ const PARENT_ROW_ID = "33333333-3333-4333-8333-333333333333";
 const OTHER_ROW_ID = "44444444-4444-4444-8444-444444444444";
 
 describe("notion_page registration", () => {
-  it("exposes create/edit/attach/trash, no top-level content and no top-level icon", () => {
+  it("exposes create/edit/attach/trash, accepts a top-level content alias, no top-level icon", () => {
     const { tool } = harness();
     const properties = tool.parameters?.properties ?? {};
-    assert.deepEqual(Object.keys(properties).sort(), ["action", "id", "parent", "props", "recursive", "title", "yes"]);
-    assert.equal("content" in properties, false);
+    assert.deepEqual(
+      Object.keys(properties).sort(),
+      ["action", "confirm_shrink", "content", "id", "parent", "props", "recursive", "title", "yes"]
+    );
+    // `content` is accepted as an alias for props.body_content (the intuitive name a
+    // caller reaches for first); `icon` stays props-only.
+    assert.equal("content" in properties, true);
     // icon is a reserved key inside props, never a top-level parameter.
     assert.equal("icon" in properties, false);
     assert.equal(tool.parameters?.additionalProperties, false);
     assert.deepEqual(tool.parameters?.required, ["action"]);
     assert.match(tool.description ?? "", /props\.body_content/);
     assert.match(tool.description ?? "", /props\.icon/);
+    // The replace semantics must be stated up front: it is how the body is lost silently.
+    assert.match(tool.description ?? "", /REPLACES the entire page body/);
   });
 });
 
@@ -186,25 +193,51 @@ describe("notion_page create", () => {
     assert.deepEqual(result.details.properties, []);
   });
 
-  it("rejects the removed top-level content for every action without calling ntn", async () => {
-    const { tool, calls } = harness();
-
-    for (const action of ["create", "edit", "attach", "trash"]) {
-      const result = await tool.execute(`content-${action}`, {
-        action,
-        id: EDIT_PAGE_ID,
-        parent: `page:${ACCEPTANCE.parentPageId}`,
-        content: "# body",
-        yes: true,
-      });
-      assert.equal(result.isError, true);
-      // DSH's schema has additionalProperties:false; the body still fails loudly instead of
-      // silently dropping the argument, and says where the Markdown really goes.
-      assert.match(text(result), /多余的参数：.*content/);
-      if (action === "create" || action === "edit") {
-        assert.match(text(result), /props\.body_content/);
+  it("accepts top-level content as an alias for props.body_content", async () => {
+    const { tool, calls } = harness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) return pageWithParent(DS_PARENT);
+      if (args[0] === "api" && args[1]?.startsWith("v1/data_sources/")) return ntnOk(DATA_SOURCE_SCHEMA);
+      if (args[0] === "api" && args[1] === `v1/blocks/${EDIT_PAGE_ID}/children`) {
+        return ntnOk({ results: [], has_more: false });
       }
-    }
+      if (args[0] === "pages" && args[1] === "create") return pageCreateResponse(NEW_PAGE_ID);
+      if (args[0] === "pages" && args[1] === "edit") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
+      return ntnFail(`unexpected: ${args.join(" ")}`);
+    });
+
+    const result = await tool.execute("content-alias-1", {
+      action: "edit",
+      id: EDIT_PAGE_ID,
+      content: "# 用 content 传正文",
+    });
+    assert.equal(result.isError, false, text(result));
+    const editCall = calls.find((args) => args[0] === "pages" && args[1] === "edit");
+    assert.ok(editCall, "content must reach pages edit as the body");
+    assert.equal(editCall[3], "--content=# 用 content 传正文");
+  });
+
+  it("refuses content and props.body_content together as ambiguous", async () => {
+    const { tool, calls } = harness();
+    const result = await tool.execute("content-alias-2", {
+      action: "edit",
+      id: EDIT_PAGE_ID,
+      content: "# a",
+      props: { body_content: "# b" },
+    });
+    assert.equal(result.isError, true);
+    assert.match(text(result), /不要同时传/);
+    assert.equal(calls.length, 0);
+  });
+
+  it("still rejects other unknown top-level parameters", async () => {
+    const { tool, calls } = harness();
+    const result = await tool.execute("content-alias-3", {
+      action: "edit",
+      id: EDIT_PAGE_ID,
+      definitely_not_a_param: 1,
+    });
+    assert.equal(result.isError, true);
+    assert.match(text(result), /多余的参数/);
     assert.equal(calls.length, 0);
   });
 
@@ -685,6 +718,129 @@ describe("notion_page icon", () => {
   });
 });
 
+describe("notion_page: body replacement cannot lose content silently", () => {
+  /**
+   * `ntn pages edit --content` REPLACES the whole body. A model that means "fix one
+   * paragraph" and sends only that paragraph used to destroy the rest while the tool
+   * reported success, so these tests pin the two things that make that visible:
+   * the returned size transition, and the refusal when the body shrinks drastically.
+   */
+  const LONG_BODY = Array.from({ length: 30 }, (_, i) => `第 ${i} 段：${"内容".repeat(20)}`).join("\n\n");
+
+  /** A page whose blocks hold `chars` characters of text. */
+  function harnessWithExisting(chars: number): ReturnType<typeof harness> {
+    const text = "字".repeat(chars);
+    return harness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) return pageWithParent(DS_PARENT);
+      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
+        return ntnOk(DATA_SOURCE_SCHEMA);
+      }
+      if (args[0] === "api" && args[1] === `v1/blocks/${EDIT_PAGE_ID}/children`) {
+        return ntnOk({
+          results: [{ id: "b1", type: "paragraph", has_children: false, paragraph: {
+            rich_text: [{ plain_text: text }],
+          } }],
+          has_more: false,
+        });
+      }
+      if (args[0] === "pages" && args[1] === "edit") {
+        return ntnOk({ object: "page", id: EDIT_PAGE_ID });
+      }
+      if (args[2] === "-X") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
+      return ntnFail(`unexpected: ${args.join(" ")}`);
+    });
+  }
+
+  it("refuses a replacement that keeps under half the body, naming both sizes", async () => {
+    const { tool, calls } = harnessWithExisting(1200);
+    const result = await tool.execute("call-shrink-1", {
+      action: "edit",
+      id: EDIT_PAGE_ID,
+      props: { body_content: "只改第二段" },
+    });
+
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /整页替换/);
+    assert.match(result.content[0].text, /1200/);
+    assert.match(result.content[0].text, /confirm_shrink/);
+    assert.equal(result.details.body_chars_before, 1200);
+    // Nothing may be written when the guard refuses.
+    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "edit"), false);
+  });
+
+  it("proceeds when confirm_shrink:true is given, and reports the transition", async () => {
+    const { tool, calls } = harnessWithExisting(1200);
+    const result = await tool.execute("call-shrink-2", {
+      action: "edit",
+      id: EDIT_PAGE_ID,
+      props: { body_content: "整页重写后的新内容" },
+      confirm_shrink: true,
+    });
+
+    assert.equal(result.isError, false, result.content[0].text);
+    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "edit"), true);
+    assert.equal(result.details.body_chars_before, 1200);
+    assert.equal(result.details.body_chars_after, "整页重写后的新内容".length);
+    // The model must be told what it did, not just "updated".
+    assert.match(result.content[0].text, /1200 字 → 9 字/);
+  });
+
+  it("reports the size transition even when the edit is allowed", async () => {
+    const { tool } = harnessWithExisting(500);
+    const grown = `${LONG_BODY}`;
+    const result = await tool.execute("call-shrink-3", {
+      action: "edit",
+      id: EDIT_PAGE_ID,
+      props: { body_content: grown },
+    });
+    assert.equal(result.isError, false, result.content[0].text);
+    assert.equal(result.details.body_chars_before, 500);
+    assert.match(result.content[0].text, /正文已整页替换/);
+  });
+
+  it("does not guard pages with little text (nothing meaningful to protect)", async () => {
+    // Under the threshold, a short replacement is a normal rewrite, not a wrecking ball.
+    const { tool } = harnessWithExisting(20);
+    const result = await tool.execute("call-shrink-4", {
+      action: "edit",
+      id: EDIT_PAGE_ID,
+      props: { body_content: "短" },
+    });
+    assert.equal(result.isError, false, result.content[0].text);
+  });
+
+  it("still edits when the current size cannot be read", async () => {
+    // A failed measurement must degrade to "size unknown", never block the edit.
+    const { tool } = harness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) return pageWithParent(DS_PARENT);
+      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
+        return ntnOk(DATA_SOURCE_SCHEMA);
+      }
+      if (args[0] === "api" && args[1]?.includes("/children")) return ntnFail("500 boom");
+      if (args[0] === "pages" && args[1] === "edit") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
+      if (args[2] === "-X") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
+      return ntnFail(`unexpected: ${args.join(" ")}`);
+    });
+    const result = await tool.execute("call-shrink-5", {
+      action: "edit",
+      id: EDIT_PAGE_ID,
+      props: { body_content: "x" },
+    });
+    assert.equal(result.isError, false, result.content[0].text);
+    assert.equal(result.details.body_chars_before, undefined);
+  });
+
+  it("never applies the shrink guard to edits that leave the body alone", async () => {
+    const { tool } = harnessWithExisting(5000);
+    const result = await tool.execute("call-shrink-6", {
+      action: "edit",
+      id: EDIT_PAGE_ID,
+      props: { icon: "🎯" },
+    });
+    assert.equal(result.isError, false, result.content[0].text);
+  });
+});
+
 describe("notion_page edit", () => {
   it("refuses edit with neither props nor title, without calling ntn", async () => {
     const { tool, calls } = harness();
@@ -712,10 +868,13 @@ describe("notion_page edit", () => {
     });
 
     assert.equal(result.isError, false);
-    assert.equal(calls.length, 2);
-    assert.deepEqual(calls[1].slice(0, 3), ["pages", "edit", EDIT_PAGE_ID]);
-    assert.equal(calls[1][3], "--content=# New body");
-    assert.equal(calls[1][4], "--json");
+    // A body edit now measures the page first so the returned value can report the
+    // size transition; the blocks read is unscripted here, so it degrades to
+    // "size unknown" and the edit proceeds.
+    const editCall = calls.find((args) => args[0] === "pages" && args[1] === "edit");
+    assert.ok(editCall);
+    assert.equal(editCall[3], "--content=# New body");
+    assert.equal(editCall[4], "--json");
     assert.deepEqual(result.details.changed, ["body_content"]);
   });
 
@@ -774,10 +933,11 @@ describe("notion_page edit", () => {
     });
 
     assert.equal(result.isError, false);
-    assert.equal(calls.length, 4);
-    assert.equal(calls[2][0], "pages");
-    assert.equal(calls[2][1], "edit");
-    assert.equal(calls[3][3], "PATCH");
+    // Schema read, page measurement, pages edit, then the property PATCH.
+    const editIdx = calls.findIndex((args) => args[0] === "pages" && args[1] === "edit");
+    const patchIdx = calls.findIndex((args) => args[3] === "PATCH");
+    assert.ok(editIdx >= 0 && patchIdx >= 0);
+    assert.ok(editIdx < patchIdx, "body edit must run before the property PATCH");
     assert.deepEqual(result.details.changed, ["body_content", "properties"]);
   });
 

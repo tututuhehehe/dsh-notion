@@ -120,6 +120,12 @@ export interface NotionPageParams {
    * archives the whole subtree, so this must be explicit.
    */
   recursive?: boolean;
+  /**
+   * edit only: consent to replace a substantial body with text under half its
+   * current length. `body_content` REPLACES the page, so this separates "I meant
+   * to rewrite it" from "I meant to fix one paragraph".
+   */
+  confirm_shrink?: boolean;
 }
 
 interface ParsedParent {
@@ -482,9 +488,33 @@ function requireId(raw: unknown, action: "edit" | "attach" | "trash"): string {
  * all of them mean consent, and only an explicit falsy value means no consent.
  * `title` keeps its own validation (no newlines) so it is left as authored.
  */
+/**
+ * Fold the top-level `content` alias into `props.body_content`.
+ *
+ * `content` is the name a caller reaches for first — body text is not a column, so
+ * looking for it under `props` is unintuitive. Accepting it costs nothing and saves
+ * the round trip a rejection would cause. Passing both is genuinely ambiguous, so
+ * that case is refused rather than picking one.
+ */
+function withBodyAlias(raw: Record<string, unknown>): Record<string, unknown> | undefined {
+  const props = raw.props;
+  if (raw.content === undefined) return props === undefined ? undefined : (props as Record<string, unknown>);
+  if (!isPlainObject(props)) {
+    if (props !== undefined) return props as Record<string, unknown>;
+    return { body_content: raw.content };
+  }
+  if (props.body_content !== undefined) {
+    throw inputError(
+      "content 和 props.body_content 是同一个东西，不要同时传（把正文写在其中一个里即可）。",
+      { content: raw.content }
+    );
+  }
+  return { ...props, body_content: raw.content };
+}
+
 function normalizePageArgs(raw: Record<string, unknown>, action: Action): NotionPageParams {
   const yes = raw.yes === undefined ? undefined : readBoolean(raw.yes, "yes");
-  const props = raw.props;
+  const props = withBodyAlias(raw);
   if (action === "trash" && yes !== true) {
     throw inputError(
       'trash 会删除（移入回收站）页面，必须显式传 yes: true（或 "true" / "yes" / 1）才会调用 ntn；本次没有调用 ntn。',
@@ -501,27 +531,33 @@ function normalizePageArgs(raw: Record<string, unknown>, action: Action): Notion
     ...(raw.recursive === undefined
       ? {}
       : { recursive: readBoolean(raw.recursive, "recursive") }),
+    ...(raw.confirm_shrink === undefined
+      ? {}
+      : { confirm_shrink: readBoolean(raw.confirm_shrink, "confirm_shrink") }),
   };
 }
 
 /** Parameters each action may carry; anything else is a caller mistake, not something to ignore. */
 const ALLOWED_PARAMS: Record<Action, readonly string[]> = {
   create: ["action", "parent", "title", "props"],
-  edit: ["action", "id", "title", "props"],
+  edit: ["action", "id", "title", "props", "confirm_shrink"],
   attach: ["action", "id", "parent", "yes"],
   trash: ["action", "id", "yes", "recursive"],
 };
 
 const UNEXPECTED_PARAMS_MESSAGE: Record<Action, string> = {
   create: "create 只接受 { action, parent, title, props }（正文写在 props.body_content）。",
-  edit: "edit 只接受 { action, id, title, props }（正文写在 props.body_content）。",
+  edit: "edit 只接受 { action, id, title, props, confirm_shrink }（正文写在 props.body_content）。",
   attach:
     "attach 只接受 { action, id, parent, yes }，不接受 props/title（也就没有 body_content）；改内容或标题请用 edit。yes 只用于同意覆盖已有的 Parent-item 链接。",
   trash: "trash 只接受 { action, id, yes, recursive }。",
 };
 
+/** Top-level parameters accepted as aliases for a reserved props key. */
+const TOP_LEVEL_BODY_ALIAS = "content";
+
 function rejectUnexpectedParams(params: Record<string, unknown>, action: Action): void {
-  const allowed = ALLOWED_PARAMS[action];
+  const allowed = [...ALLOWED_PARAMS[action], TOP_LEVEL_BODY_ALIAS];
   const unexpected = Object.keys(params).filter(
     (key) => params[key] !== undefined && !allowed.includes(key)
   );
@@ -1273,6 +1309,15 @@ export type PageToolValue = {
   changed: string[];
   /** Icon as sent: an emoji, an image URL, a description, or null when cleared. */
   icon?: string | null;
+  /**
+   * edit with `body_content`: how much text the page had before and after.
+   *
+   * `ntn pages edit --content` REPLACES the whole body, so this is the only
+   * signal that distinguishes "I edited one section" from "I deleted every other
+   * section". Always present when the body was replaced.
+   */
+  body_chars_before?: number;
+  body_chars_after?: number;
   /** create when the parent was a database row. */
   parent_item_row_id?: string;
   parent_item_property?: string;
@@ -1304,8 +1349,13 @@ export function describePageValue(value: PageToolValue): string {
 
   if (value.action === "edit") {
     const what = value.changed.includes("body_content") ? "内容" : "属性";
+    const size =
+      value.body_chars_before !== undefined && value.body_chars_after !== undefined
+        ? `正文已整页替换：${value.body_chars_before} 字 → ${value.body_chars_after} 字`
+        : "";
     return [
       `已更新页面 ${value.id} 的${what}`,
+      size,
       value.url ? `URL: ${value.url}` : "",
       value.changed.includes("body_content") && value.changed.includes("properties")
         ? `已写入属性：${props}`
@@ -1653,6 +1703,33 @@ async function editPage(
   }
 
   if (markdown) {
+    // `pages edit --content` replaces the whole body. Measure what is there first so
+    // the caller is told what it is about to lose, and so an accidental one-section
+    // "fix" cannot pass silently.
+    const beforeChars = await pageTextLength(runner, id);
+    const afterChars = markdown.length;
+    if (
+      beforeChars !== undefined &&
+      beforeChars >= SHRINK_GUARD_MIN_CHARS &&
+      afterChars < beforeChars * SHRINK_CONFIRM_RATIO &&
+      params.confirm_shrink !== true
+    ) {
+      const pct = Math.round((1 - afterChars / beforeChars) * 100);
+      throw new InputError(
+        `edit 的 body_content 会【整页替换】现有正文，不是追加、不是局部修改。` +
+          `这次替换会让正文从约 ${beforeChars} 字变成 ${afterChars} 字（减少 ${pct}%）。` +
+          `为避免误删，确认要整页覆盖请加 confirm_shrink: true；` +
+          `只想改一小段的话，请重发完整正文内容（或改标题/属性/icon 时不要传 body_content）。`,
+        {
+          id,
+          body_chars_before: beforeChars,
+          body_chars_after: afterChars,
+          shrink_ratio: Number((afterChars / beforeChars).toFixed(3)),
+          confirm_required: "confirm_shrink",
+        }
+      );
+    }
+
     const editResult = await runner({ args: ["pages", "edit", id, `--content=${markdown}`, "--json"] });
     if (!editResult.ok) throw ntnFailure("ntn pages edit", editResult);
 
@@ -1675,6 +1752,9 @@ async function editPage(
       ...(url ? { url } : {}),
       ...(icon ? { icon: icon.display } : {}),
       properties: propertyNames,
+      ...(beforeChars !== undefined
+        ? { body_chars_before: beforeChars, body_chars_after: afterChars }
+        : {}),
       changed: [
         "body_content",
         ...(propertyNames.length > 0 ? ["properties"] : []),
@@ -2045,6 +2125,57 @@ async function listChildPages(
 }
 
 /**
+ * How much text a page currently holds, in characters.
+ *
+ * Read from the page's own blocks rather than from `pages get` output, because the
+ * returned Markdown carries a frontmatter header that would inflate the "before"
+ * number. Returns undefined when the page cannot be read, so callers can degrade to
+ * "size unknown" instead of claiming a transition they did not measure.
+ */
+async function pageTextLength(runner: NtnRunner, pageId: string): Promise<number | undefined> {
+  let total = 0;
+  let cursor: string | undefined;
+  for (let page = 0; page < 100; page += 1) {
+    const query = cursor ? `?start_cursor=${encodeURIComponent(cursor)}` : "";
+    const result = await runner({ args: ["api", `v1/blocks/${pageId}/children${query}`] });
+    if (!result.ok) return undefined;
+    const parsed = parseJsonMaybe(result.stdout);
+    if (!isPlainObject(parsed)) return undefined;
+    const results = Array.isArray(parsed.results) ? parsed.results : [];
+    for (const block of results) {
+      if (!isPlainObject(block)) continue;
+      const payload = block[String(block.type)];
+      if (!isPlainObject(payload)) continue;
+      if (Array.isArray(payload.rich_text)) {
+        for (const item of payload.rich_text) {
+          if (isPlainObject(item) && typeof item.plain_text === "string") {
+            total += item.plain_text.length;
+          }
+        }
+      }
+      if (typeof payload.expression === "string") total += payload.expression.length;
+    }
+    const hasMore = parsed.has_more === true;
+    const next = typeof parsed.next_cursor === "string" ? parsed.next_cursor : undefined;
+    if (!hasMore || !next) return total;
+    cursor = next;
+  }
+  return undefined;
+}
+
+/**
+ * A body replacement that removes a large share of the page.
+ *
+ * `ntn pages edit --content` replaces the ENTIRE body. A model that means "fix one
+ * paragraph" and passes only that paragraph silently destroys the rest; the CLI
+ * reports success, so nothing surfaces the loss. This guard makes the destructive
+ * case require an explicit opt-in instead of being the quiet default.
+ */
+const SHRINK_CONFIRM_RATIO = 0.5;
+/** Below this many characters there is nothing meaningful to protect. */
+const SHRINK_GUARD_MIN_CHARS = 200;
+
+/**
  * Trash one page, with three guards that a bare `ntn pages trash` does not give us.
  *
  *   1. A database or data source is refused outright: deleting one is far more
@@ -2160,6 +2291,11 @@ const PAGE_PARAMETERS = {
       description:
         "Page title. create: sets the title (also used when props carry the title property). edit: updates the title property.",
     },
+    content: {
+      type: "string",
+      description:
+        "Page body Markdown. Alias for props.body_content; use one or the other, not both. edit with a body REPLACES the whole page (see the description).",
+    },
     props: {
       type: "object",
       additionalProperties: true,
@@ -2170,6 +2306,11 @@ const PAGE_PARAMETERS = {
       type: "boolean",
       description:
         "trash: must be true, otherwise the tool refuses without calling ntn. attach (row→row): consent to replacing an existing Parent-item link that points at a different parent.",
+    },
+    confirm_shrink: {
+      type: "boolean",
+      description:
+        "edit on a page with substantial body: consent to replacing the whole body with text that is much shorter (under half). edit's body_content REPLACES the page, so this guard exists to stop a one-section fix from erasing everything else.",
     },
     recursive: {
       type: "boolean",
@@ -2193,6 +2334,8 @@ const PAGE_OUTPUT_SCHEMA = {
     properties: { type: "array", items: { type: "string" } },
     changed: { type: "array", items: { type: "string" } },
     icon: { oneOf: [{ type: "string" }, { type: "null" }] },
+    body_chars_before: { type: "integer" },
+    body_chars_after: { type: "integer" },
     parent_item_row_id: { type: "string" },
     parent_item_property: { type: "string" },
     already_linked: { type: "boolean" },
@@ -2225,6 +2368,10 @@ export function createNotionPageTool(deps: NotionPageDeps = {}): NotionTool<Page
       "succeeded: rollback reports trashed, trash_failed or unknown_id, and partial:true means something " +
       "was left behind. " +
       "action=edit needs id plus at least one of props (body_content / icon / columns) or title. " +
+      "WARNING: props.body_content in an edit REPLACES the entire page body — it is not append and " +
+      "not a partial edit, so anything not included in it is deleted. To change one section, resend " +
+      "the complete body; to change only title/properties/icon, do not pass body_content at all. A " +
+      "replacement that leaves under half the previous text is refused unless confirm_shrink:true. " +
       "action=attach needs id and parent and only re-parents: page→page moves the page, row→row sets the " +
       "Parent-item relation, and it is not a file upload; it refuses cycle-forming moves and refuses to " +
       "replace a different existing parent unless yes:true (the same parent is a no-op). " +

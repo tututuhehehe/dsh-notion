@@ -99,9 +99,11 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
 ### notion_page
 
 ```jsonc
-// 新建普通子页（正文放 props.body_content）
+// 新建普通子页（正文放 props.body_content，或用顶层别名 content）
 { "action": "create", "parent": "page:<page-id>", "title": "标题",
   "props": { "body_content": "# 标题\n\n正文" } }
+{ "action": "create", "parent": "page:<page-id>", "title": "标题",
+  "content": "# 标题\n\n正文" }          // 等价写法
 
 // 新建数据库行（可同时写列）
 { "action": "create", "parent": "data-source:<ds-id>", "title": "任务 A",
@@ -128,10 +130,10 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
 
 | 保留键 | 含义 | 取值 |
 | --- | --- | --- |
-| `props.body_content` | 页面正文 Markdown | 字符串 |
+| `props.body_content` | 页面正文 Markdown（顶层 `content` 是它的别名） | 字符串 |
 | `props.icon` | 页面图标 | 单个 emoji（`"🎯"`）、`http(s)` 图片 URL、已构好的 Notion icon 对象（`{"type":"emoji","emoji":"🎯"}`）、或 `null` 清除 |
 
-保留键不会被当成列写入；如果数据源里**真的有**同名列，写入会直接报错而不是猜你的意图。未知列名、只读列、类型不符都会报错并返回可写列清单，绝不静默写错列。
+保留键不会被当成列写入；如果数据源里**真的有**同名列，写入会直接报错而不是猜你的意图。绝不静默写错列。
 
 ### notion_query
 
@@ -144,6 +146,61 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
   "under": "<父行 id>"        // 只查某个父行下的子行（走 Parent-item 关系列）
 }
 ```
+
+## ⚠️ edit 的正文是「整页替换」
+
+`notion_page action="edit"` 里传 `props.body_content`（或别名 `content`）时，底层是
+`ntn pages edit --content`，而 CLI 自己的帮助写的很清楚：
+
+```
+--content <MARKDOWN>    Markdown content to replace the page with
+```
+
+**`replace` —— 整页正文被替换，不是追加，不是局部修改。** 你这次没写进去的内容会消失，
+而 Notion 不会为正文保留版本历史，回收站也救不回来。
+
+```jsonc
+// ❌ 想改中间一段，只发这一段 → 其余全部被删
+{ "action": "edit", "id": "<id>", "props": { "body_content": "## 只改第二段
+
+新内容" } }
+
+// ✅ 改正文 = 重发完整正文
+{ "action": "edit", "id": "<id>", "props": { "body_content": "<完整的、改好的整篇正文>" } }
+
+// ✅ 只改标题/列/图标 → 根本不要传 body_content
+{ "action": "edit", "id": "<id>", "props": { "icon": "🎯", "Status": "完成" } }
+```
+
+### 长度突变保护
+
+`edit` 在覆盖前会先统计现有正文的字数，并把结果**写进返回值**：
+
+```
+已更新页面 <id> 的内容
+正文已整页替换：12000 字 → 340 字
+```
+
+若新正文 **不足原来的一半**（且原文 ≥ 200 字），工具会**直接拒绝**：
+
+```
+[INVALID_INPUT] edit 的 body_content 会【整页替换】现有正文，不是追加、不是局部修改。
+这次替换会让正文从约 12000 字变成 340 字（减少 97%）。确认要整页覆盖请加
+confirm_shrink: true；只想改一小段的话，请重发完整正文内容。
+```
+
+确属整页重写时加 `confirm_shrink: true` 放行：
+
+```jsonc
+{ "action": "edit", "id": "<id>", "props": { "body_content": "<新的整篇正文>" },
+  "confirm_shrink": true }
+```
+
+返回值里始终带 `body_chars_before` / `body_chars_after`，可以据此核对是否真的只有预期变化。
+读不到原文时（网络/权限问题）保护会退化为「长度未知」并放行——**不会因为读不到就卡住你**。
+
+**长文档推荐的写法**：一次性 `create` 写完整篇，之后不要再 `edit` 正文；真要改，
+要么重发全文、要么新建一页再 `trash` 旧的。
 
 ## 删除（trash）的三重保护
 
@@ -297,6 +354,25 @@ Each tool declares a per-call `timeoutMs` (enforced by `dsh-tool-call-timeout-po
 ### Error codes
 
 DSH renders a thrown error as `Error: <message>` and keeps a structured `{ name, code }` only for its own `HarnessError`; a plain Error's `code` is dropped. This plugin therefore puts the category at the front of the message: `[INVALID_INPUT]`, `[NTN_FAILED]`, `[ABORTED]`, `[PARTIAL_WRITE]` (a failed write whose rollback also failed, so a half-made page remains — the message carries the id to clean up).
+
+### ⚠️ An `edit` body REPLACES the whole page
+
+Passing `props.body_content` (or its alias `content`) to `notion_page action="edit"` runs `ntn pages edit --content`, whose own help says "Markdown content to **replace** the page with". Anything you leave out is deleted, Notion keeps no body version history, and the trash does not bring it back.
+
+```jsonc
+// ❌ meaning to fix one section, sending only that section deletes the rest
+{ "action": "edit", "id": "<id>", "props": { "body_content": "## just section two" } }
+
+// ✅ changing the body means resending the complete body
+{ "action": "edit", "id": "<id>", "props": { "body_content": "<the full corrected page>" } }
+
+// ✅ changing only title / properties / icon: do not pass body_content at all
+{ "action": "edit", "id": "<id>", "props": { "icon": "🎯", "Status": "Done" } }
+```
+
+**Shrink guard.** Before replacing, `edit` counts the current body and reports the transition in its result (`body_chars_before` / `body_chars_after`, e.g. "正文已整页替换：12000 字 → 340 字"). A replacement that leaves under half the previous text — on a page with at least 200 characters — is refused with `[INVALID_INPUT]` unless `confirm_shrink: true` is also passed. When the current size cannot be read, the guard degrades to "size unknown" and lets the edit through rather than blocking on an unrelated failure.
+
+For long documents: `create` the whole page once and do not `edit` its body afterwards. If a body edit is genuinely needed, either resend the full text or create a new page and `trash` the old one.
 
 ### Trash safety
 

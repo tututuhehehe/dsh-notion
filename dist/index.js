@@ -1010,9 +1010,24 @@ function requireId(raw, action) {
     `id \u65E0\u6548\uFF1A${describeValue(raw)}\u3002\u53EA\u63A5\u53D7 Notion \u9875\u9762 id\uFF0832 \u4F4D hex / UUID\uFF09\u6216\u8BE5\u9875\u9762\u7684 Notion URL\u3002`
   );
 }
+function withBodyAlias(raw) {
+  const props = raw.props;
+  if (raw.content === void 0) return props === void 0 ? void 0 : props;
+  if (!isPlainObject(props)) {
+    if (props !== void 0) return props;
+    return { body_content: raw.content };
+  }
+  if (props.body_content !== void 0) {
+    throw inputError(
+      "content \u548C props.body_content \u662F\u540C\u4E00\u4E2A\u4E1C\u897F\uFF0C\u4E0D\u8981\u540C\u65F6\u4F20\uFF08\u628A\u6B63\u6587\u5199\u5728\u5176\u4E2D\u4E00\u4E2A\u91CC\u5373\u53EF\uFF09\u3002",
+      { content: raw.content }
+    );
+  }
+  return { ...props, body_content: raw.content };
+}
 function normalizePageArgs(raw, action) {
   const yes = raw.yes === void 0 ? void 0 : readBoolean(raw.yes, "yes");
-  const props = raw.props;
+  const props = withBodyAlias(raw);
   if (action === "trash" && yes !== true) {
     throw inputError(
       'trash \u4F1A\u5220\u9664\uFF08\u79FB\u5165\u56DE\u6536\u7AD9\uFF09\u9875\u9762\uFF0C\u5FC5\u987B\u663E\u5F0F\u4F20 yes: true\uFF08\u6216 "true" / "yes" / 1\uFF09\u624D\u4F1A\u8C03\u7528 ntn\uFF1B\u672C\u6B21\u6CA1\u6709\u8C03\u7528 ntn\u3002',
@@ -1026,23 +1041,25 @@ function normalizePageArgs(raw, action) {
     ...raw.title === void 0 ? {} : { title: raw.title },
     ...props === void 0 ? {} : { props },
     ...yes === void 0 ? {} : { yes },
-    ...raw.recursive === void 0 ? {} : { recursive: readBoolean(raw.recursive, "recursive") }
+    ...raw.recursive === void 0 ? {} : { recursive: readBoolean(raw.recursive, "recursive") },
+    ...raw.confirm_shrink === void 0 ? {} : { confirm_shrink: readBoolean(raw.confirm_shrink, "confirm_shrink") }
   };
 }
 var ALLOWED_PARAMS = {
   create: ["action", "parent", "title", "props"],
-  edit: ["action", "id", "title", "props"],
+  edit: ["action", "id", "title", "props", "confirm_shrink"],
   attach: ["action", "id", "parent", "yes"],
   trash: ["action", "id", "yes", "recursive"]
 };
 var UNEXPECTED_PARAMS_MESSAGE = {
   create: "create \u53EA\u63A5\u53D7 { action, parent, title, props }\uFF08\u6B63\u6587\u5199\u5728 props.body_content\uFF09\u3002",
-  edit: "edit \u53EA\u63A5\u53D7 { action, id, title, props }\uFF08\u6B63\u6587\u5199\u5728 props.body_content\uFF09\u3002",
+  edit: "edit \u53EA\u63A5\u53D7 { action, id, title, props, confirm_shrink }\uFF08\u6B63\u6587\u5199\u5728 props.body_content\uFF09\u3002",
   attach: "attach \u53EA\u63A5\u53D7 { action, id, parent, yes }\uFF0C\u4E0D\u63A5\u53D7 props/title\uFF08\u4E5F\u5C31\u6CA1\u6709 body_content\uFF09\uFF1B\u6539\u5185\u5BB9\u6216\u6807\u9898\u8BF7\u7528 edit\u3002yes \u53EA\u7528\u4E8E\u540C\u610F\u8986\u76D6\u5DF2\u6709\u7684 Parent-item \u94FE\u63A5\u3002",
   trash: "trash \u53EA\u63A5\u53D7 { action, id, yes, recursive }\u3002"
 };
+var TOP_LEVEL_BODY_ALIAS = "content";
 function rejectUnexpectedParams(params, action) {
-  const allowed = ALLOWED_PARAMS[action];
+  const allowed = [...ALLOWED_PARAMS[action], TOP_LEVEL_BODY_ALIAS];
   const unexpected = Object.keys(params).filter(
     (key) => params[key] !== void 0 && !allowed.includes(key)
   );
@@ -1625,8 +1642,10 @@ function describePageValue(value) {
   }
   if (value.action === "edit") {
     const what = value.changed.includes("body_content") ? "\u5185\u5BB9" : "\u5C5E\u6027";
+    const size = value.body_chars_before !== void 0 && value.body_chars_after !== void 0 ? `\u6B63\u6587\u5DF2\u6574\u9875\u66FF\u6362\uFF1A${value.body_chars_before} \u5B57 \u2192 ${value.body_chars_after} \u5B57` : "";
     return [
       `\u5DF2\u66F4\u65B0\u9875\u9762 ${value.id} \u7684${what}`,
+      size,
       value.url ? `URL: ${value.url}` : "",
       value.changed.includes("body_content") && value.changed.includes("properties") ? `\u5DF2\u5199\u5165\u5C5E\u6027\uFF1A${props}` : value.properties.length ? `\u5C5E\u6027\uFF1A${props}` : "",
       value.icon !== void 0 ? `icon: ${value.icon ?? "\uFF08\u5DF2\u6E05\u9664\uFF09"}` : ""
@@ -1856,6 +1875,21 @@ async function editPage(params, runner) {
     if (!propertyNames.includes(titleName)) propertyNames.push(titleName);
   }
   if (markdown) {
+    const beforeChars = await pageTextLength(runner, id);
+    const afterChars = markdown.length;
+    if (beforeChars !== void 0 && beforeChars >= SHRINK_GUARD_MIN_CHARS && afterChars < beforeChars * SHRINK_CONFIRM_RATIO && params.confirm_shrink !== true) {
+      const pct = Math.round((1 - afterChars / beforeChars) * 100);
+      throw new InputError(
+        `edit \u7684 body_content \u4F1A\u3010\u6574\u9875\u66FF\u6362\u3011\u73B0\u6709\u6B63\u6587\uFF0C\u4E0D\u662F\u8FFD\u52A0\u3001\u4E0D\u662F\u5C40\u90E8\u4FEE\u6539\u3002\u8FD9\u6B21\u66FF\u6362\u4F1A\u8BA9\u6B63\u6587\u4ECE\u7EA6 ${beforeChars} \u5B57\u53D8\u6210 ${afterChars} \u5B57\uFF08\u51CF\u5C11 ${pct}%\uFF09\u3002\u4E3A\u907F\u514D\u8BEF\u5220\uFF0C\u786E\u8BA4\u8981\u6574\u9875\u8986\u76D6\u8BF7\u52A0 confirm_shrink: true\uFF1B\u53EA\u60F3\u6539\u4E00\u5C0F\u6BB5\u7684\u8BDD\uFF0C\u8BF7\u91CD\u53D1\u5B8C\u6574\u6B63\u6587\u5185\u5BB9\uFF08\u6216\u6539\u6807\u9898/\u5C5E\u6027/icon \u65F6\u4E0D\u8981\u4F20 body_content\uFF09\u3002`,
+        {
+          id,
+          body_chars_before: beforeChars,
+          body_chars_after: afterChars,
+          shrink_ratio: Number((afterChars / beforeChars).toFixed(3)),
+          confirm_required: "confirm_shrink"
+        }
+      );
+    }
     const editResult = await runner({ args: ["pages", "edit", id, `--content=${markdown}`, "--json"] });
     if (!editResult.ok) throw ntnFailure("ntn pages edit", editResult);
     const edited = parseJsonMaybe(editResult.stdout);
@@ -1875,6 +1909,7 @@ async function editPage(params, runner) {
       ...url2 ? { url: url2 } : {},
       ...icon ? { icon: icon.display } : {},
       properties: propertyNames,
+      ...beforeChars !== void 0 ? { body_chars_before: beforeChars, body_chars_after: afterChars } : {},
       changed: [
         "body_content",
         ...propertyNames.length > 0 ? ["properties"] : [],
@@ -2130,6 +2165,38 @@ async function listChildPages(runner, pageId) {
   }
   return children;
 }
+async function pageTextLength(runner, pageId) {
+  let total = 0;
+  let cursor;
+  for (let page = 0; page < 100; page += 1) {
+    const query = cursor ? `?start_cursor=${encodeURIComponent(cursor)}` : "";
+    const result = await runner({ args: ["api", `v1/blocks/${pageId}/children${query}`] });
+    if (!result.ok) return void 0;
+    const parsed = parseJsonMaybe(result.stdout);
+    if (!isPlainObject(parsed)) return void 0;
+    const results = Array.isArray(parsed.results) ? parsed.results : [];
+    for (const block of results) {
+      if (!isPlainObject(block)) continue;
+      const payload = block[String(block.type)];
+      if (!isPlainObject(payload)) continue;
+      if (Array.isArray(payload.rich_text)) {
+        for (const item of payload.rich_text) {
+          if (isPlainObject(item) && typeof item.plain_text === "string") {
+            total += item.plain_text.length;
+          }
+        }
+      }
+      if (typeof payload.expression === "string") total += payload.expression.length;
+    }
+    const hasMore = parsed.has_more === true;
+    const next = typeof parsed.next_cursor === "string" ? parsed.next_cursor : void 0;
+    if (!hasMore || !next) return total;
+    cursor = next;
+  }
+  return void 0;
+}
+var SHRINK_CONFIRM_RATIO = 0.5;
+var SHRINK_GUARD_MIN_CHARS = 200;
 async function trashPage(params, runner) {
   const id = requireId(params.id, "trash");
   if (params.yes !== true) {
@@ -2208,6 +2275,10 @@ var PAGE_PARAMETERS = {
       type: "string",
       description: "Page title. create: sets the title (also used when props carry the title property). edit: updates the title property."
     },
+    content: {
+      type: "string",
+      description: "Page body Markdown. Alias for props.body_content; use one or the other, not both. edit with a body REPLACES the whole page (see the description)."
+    },
     props: {
       type: "object",
       additionalProperties: true,
@@ -2216,6 +2287,10 @@ var PAGE_PARAMETERS = {
     yes: {
       type: "boolean",
       description: "trash: must be true, otherwise the tool refuses without calling ntn. attach (row\u2192row): consent to replacing an existing Parent-item link that points at a different parent."
+    },
+    confirm_shrink: {
+      type: "boolean",
+      description: "edit on a page with substantial body: consent to replacing the whole body with text that is much shorter (under half). edit's body_content REPLACES the page, so this guard exists to stop a one-section fix from erasing everything else."
     },
     recursive: {
       type: "boolean",
@@ -2237,6 +2312,8 @@ var PAGE_OUTPUT_SCHEMA = {
     properties: { type: "array", items: { type: "string" } },
     changed: { type: "array", items: { type: "string" } },
     icon: { oneOf: [{ type: "string" }, { type: "null" }] },
+    body_chars_before: { type: "integer" },
+    body_chars_after: { type: "integer" },
     parent_item_row_id: { type: "string" },
     parent_item_property: { type: "string" },
     already_linked: { type: "boolean" },
@@ -2251,7 +2328,7 @@ function createNotionPageTool(deps = {}) {
   const runner = deps.runNtn ?? runNtn;
   return defineNotionTool({
     name: "notion_page",
-    description: `Create, edit, attach (re-parent) or trash one Notion page. put the page Markdown in props.body_content and the page icon in props.icon; there is no top-level content or icon parameter. action=create needs parent: page:<id> | database:<id> | data-source:<id>, or a bare database row id (a child row, linked through the data source's Parent-item / self-relation column); props are applied by a second request, and a page in a database also needs a title (the title parameter, the title property in props, or a leading "# Heading" in props.body_content). If that second request fails the new page is trashed so no half-made page is left behind, and the error says whether cleanup succeeded: rollback reports trashed, trash_failed or unknown_id, and partial:true means something was left behind. action=edit needs id plus at least one of props (body_content / icon / columns) or title. action=attach needs id and parent and only re-parents: page\u2192page moves the page, row\u2192row sets the Parent-item relation, and it is not a file upload; it refuses cycle-forming moves and refuses to replace a different existing parent unless yes:true (the same parent is a no-op). action=trash needs id and yes:true, otherwise nothing is called. props is an object map keyed by property NAME (several keys = several properties, {} = no change), and its values are converted by the column type: unknown names and read-only columns are rejected with the writable columns in hint_properties. No default property values are invented.`,
+    description: `Create, edit, attach (re-parent) or trash one Notion page. put the page Markdown in props.body_content and the page icon in props.icon; there is no top-level content or icon parameter. action=create needs parent: page:<id> | database:<id> | data-source:<id>, or a bare database row id (a child row, linked through the data source's Parent-item / self-relation column); props are applied by a second request, and a page in a database also needs a title (the title parameter, the title property in props, or a leading "# Heading" in props.body_content). If that second request fails the new page is trashed so no half-made page is left behind, and the error says whether cleanup succeeded: rollback reports trashed, trash_failed or unknown_id, and partial:true means something was left behind. action=edit needs id plus at least one of props (body_content / icon / columns) or title. WARNING: props.body_content in an edit REPLACES the entire page body \u2014 it is not append and not a partial edit, so anything not included in it is deleted. To change one section, resend the complete body; to change only title/properties/icon, do not pass body_content at all. A replacement that leaves under half the previous text is refused unless confirm_shrink:true. action=attach needs id and parent and only re-parents: page\u2192page moves the page, row\u2192row sets the Parent-item relation, and it is not a file upload; it refuses cycle-forming moves and refuses to replace a different existing parent unless yes:true (the same parent is a no-op). action=trash needs id and yes:true, otherwise nothing is called. props is an object map keyed by property NAME (several keys = several properties, {} = no change), and its values are converted by the column type: unknown names and read-only columns are rejected with the writable columns in hint_properties. No default property values are invented.`,
     timeoutMs: TOOL_TIMEOUTS.page,
     // Every action can write (create/edit/attach/trash mutate the workspace), so
     // page calls stay exclusive: never overlap two of them.
