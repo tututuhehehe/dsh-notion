@@ -481,9 +481,26 @@ npm run typecheck    # tsc --noEmit
 ```
 src/dsh/      # DSH Host 层：tool.ts 工具契约、index.ts 注册、config/runner（token 与 ntn 调用）
 src/tools/    # 工具实现：search / get / query / page（create、edit、trash 三个工具）
-src/lib/      # 共享工具库（id 解析、schema 提取、ntn runner 等）
+src/text/     # ★ 模型可见的全部文案：工具描述 / 参数描述 / 结果句子 / 错误消息
+src/lib/      # 共享工具库（id 解析、schema 提取、ntn runner、失败诊断等）
 test/         # 单元测试（不依赖真实 Notion）
 ```
+
+### 想改文案？只看 `src/text/`
+
+模型看到的每一个字都在这一个文件夹里，不用翻实现代码：
+
+| 文件 | 装什么 | 模型什么时候读到 |
+| --- | --- | --- |
+| `tools.ts` | 六个工具的 description | 选工具**之前** |
+| `params.ts` | 参数说明、`props` 说明、`icon` 三种形式 | 填参数时 |
+| `results.ts` | 结果里的句子（发生了什么） | 成功后 |
+| `errors.ts` | 全部错误消息 | 失败后 |
+
+失败原因的提示表在 `src/lib/failures.ts`（`errors.ts` 说「哪一步失败」，那里说「大概是为什么」）。
+
+写作约定和「什么故意不放在这里」见 [`src/text/README.md`](src/text/README.md)。
+`test/dsh-contract.test.ts` 有两条守卫测试盯着：`throw` 不许自己拼长句、`description:` 不许内联字面量。
 
 ## License
 
