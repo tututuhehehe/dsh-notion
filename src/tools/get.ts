@@ -28,6 +28,7 @@ import {
   TOOL_TIMEOUTS,
 } from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
+import { describeFailure, failureHint } from "../lib/failures.ts";
 import { extractNotionId } from "../lib/ids.ts";
 import {
   isWritablePropertyType,
@@ -188,8 +189,8 @@ export function createNotionGetTool(run: NtnRunner = runNtn): NotionTool<NotionG
       "its properties as frontmatter, or a structured payload (format='json') that also carries url, " +
       "title, truncated and unknown_block_ids. A database returns every data source id plus each " +
       "property's name, type, writable flag and Parent-item / self-relation candidates; rows are never " +
-      "fetched here, so read them with notion_query. If a page comes back truncated, ask for format='json' " +
-      "to see unknown_block_ids or read a narrower page.",
+      "fetched here, so read them with notion_query. If a page comes back truncated (rare), format='json' " +
+      "shows unknown_block_ids; the truncated Markdown lists the next steps.",
     timeoutMs: TOOL_TIMEOUTS.get,
     // Read-only: safe to run alongside sibling calls.
     isConcurrencySafe: () => true,
@@ -247,9 +248,10 @@ export async function executeNotionGet(
   const page = await runPage(id, format, run);
   if (page.ok) return page.value;
 
-  if (isFatalCliError(page.res)) throw new Error(fatalCliMessage(page.res));
+  // 失败文案统一交给 lib/failures.ts：四个工具对 "没装 / 没登录 / 没共享 / 限流"
+  // 的措辞必须一致，各自维护一套 regex 只会让同一个错误在不同工具里说法不同。
+  if (isFatalCliError(page.res)) throw new Error(describeFailure(page.res, "notion_get failed"));
 
-  const pageError = errorSummary(page.res);
   if (shouldTryDatabase(page.res)) {
     // A database id resolves through `datasources resolve`; try it before the
     // data source probe so the common database read keeps its call count. A data
@@ -258,25 +260,30 @@ export async function executeNotionGet(
     const database = await runDatabase(id, run);
     if (database.ok) return database.value;
 
-    if (isFatalCliError(database.res)) throw new Error(fatalCliMessage(database.res));
+    if (isFatalCliError(database.res)) {
+      throw new Error(describeFailure(database.res, "notion_get failed"));
+    }
 
-    const databaseError = errorSummary(database.res);
     const dataSource = await runDataSourceSchema(id, run);
     if (dataSource.ok) return dataSource.value;
 
-    // Report what ntn actually said. Its own hint names the fix (for example
-    // "pass the ID of the database itself"), which our paraphrase would lose.
+    // Report what ntn actually said for each attempt. Only the three-level fallback
+    // produces this context, so the per-attempt one-liners stay here; the actionable
+    // hint comes from the shared module like every other tool's failure text.
+    const hint =
+      failureHint(page.res) ??
+      failureHint(database.res) ??
+      "Make sure the target is shared with the Notion integration (in Notion: ••• → Connections).";
     throw new Error(
       `Could not read ${id} as a page, database or data source.\n` +
-        `- ntn pages get: ${pageError}\n` +
-        `- ntn datasources resolve: ${databaseError}\n` +
+        `- ntn pages get: ${errorSummary(page.res)}\n` +
+        `- ntn datasources resolve: ${errorSummary(database.res)}\n` +
         `- ntn api v1/data_sources: ${dataSource.excerpt}\n` +
-        `Make sure the target is shared with the Notion integration ` +
-        `(in Notion: ••• → Connections).`
+        hint
     );
   }
 
-  throw new Error(`Could not read page ${id}: ${pageError}`);
+  throw new Error(describeFailure(page.res, `notion_get could not read ${id}`));
 }
 
 /**
@@ -597,7 +604,10 @@ function renderPageText(page: NotionPageResult): string {
   const body = page.markdown.trim() ? page.markdown : "(This page has no readable content.)";
   // `details` is not shown to the model, so the truncation warning must be in the text itself.
   return page.truncated
-    ? `${body}\n\n[notion_get] ntn truncated this page; use format="json" to inspect unknown_block_ids, or read a narrower page.`
+    ? `${body}\n\n[notion_get] ntn truncated this page, so the text above is incomplete (rare: most pages, ` +
+        `even very large ones, come back whole). Next: format="json" returns unknown_block_ids, child pages ` +
+        `can be read by their own ids, notion_page_edit takes an exact old_str from the part above, and for ` +
+        `a database notion_query reads its rows with limit / start_cursor.`
     : body;
 }
 
@@ -669,6 +679,10 @@ function formatProperty(property: PropertyInfo): string {
   return `${property.name}: ${property.type}${flags.length ? ` — ${flags.join(", ")}` : ""}`;
 }
 
+/**
+ * 只取第一行错误摘要：三级回退要把每次尝试各列一行，schema 失败也要塞进结果的
+ * warnings/error 字段，完整的失败文案（含 exit code 和 hint）由 lib/failures.ts 负责。
+ */
 function errorSummary(res: RunNtnResult): string {
   const first =
     (res.stderr || res.stdout || "")
@@ -679,6 +693,10 @@ function errorSummary(res: RunNtnResult): string {
   return cleaned || `ntn exited with code ${res.code ?? "null"}`;
 }
 
+/**
+ * 只做路由判断，不生成文案：这三种情况重试成数据库/数据源都不可能成功，所以
+ * 立刻上报，而不是多花两三个 ntn 进程。文案在 lib/failures.ts。
+ */
 function isFatalCliError(res: RunNtnResult): boolean {
   if (res.code === null) return true;
   if (res.code === 4) return true;
@@ -689,21 +707,6 @@ function shouldTryDatabase(res: RunNtnResult): boolean {
   if (isFatalCliError(res)) return false;
   const text = `${res.stderr}\n${res.stdout}`;
   return !TRANSIENT_ERROR_RE.test(text);
-}
-
-function fatalCliMessage(res: RunNtnResult): string {
-  const summary = errorSummary(res);
-  if (res.code === null) {
-    if (/ntn not found on path/i.test(res.stderr)) return res.stderr.trim();
-    if (/timed out/i.test(res.stderr)) {
-      return `Notion CLI timed out: ${summary}. Retry, or read a smaller page.`;
-    }
-    return `Could not run \`ntn\`: ${summary}`;
-  }
-  return (
-    `Notion CLI is not authenticated or configured: ${summary}. ` +
-    `Run \`ntn login\` or set NOTION_API_TOKEN.`
-  );
 }
 
 function parseJsonOrThrow(stdout: string, what: string): unknown {

@@ -229,6 +229,10 @@ describe("notion_get: pages", () => {
     assert.equal(pageDetails(result).truncated, true);
     // details are not shown to the model: the warning has to be in the text too
     assert.match(text(result), /\[notion_get\] ntn truncated this page/);
+    // 旧文案让模型"读更窄的范围"，而 notion_get 根本没有 range 参数——必须换成真能做的步骤
+    assert.doesNotMatch(text(result), /narrower page/);
+    assert.match(text(result), /format="json"/);
+    assert.match(text(result), /notion_page_edit/);
   });
 
   it("does not treat unrelated stderr containing 'truncated' as truncation", async () => {
@@ -309,7 +313,8 @@ describe("notion_get: pages", () => {
     );
     await assert.rejects(
       () => executeNotionGet({ id_or_url: PAGE_ID }, run),
-      /not authenticated or configured.*NOTION_API_TOKEN/s
+      // 文案来自 lib/failures.ts，和其他工具同一套（这里只能断言共享措辞）
+      /notion_get failed: ntn exit 5[\s\S]*Hint: the token was rejected.*NOTION_API_TOKEN/
     );
     assert.equal(calls.length, 1);
   });
@@ -327,15 +332,27 @@ describe("notion_get: pages", () => {
 
   it("does not fall back to the database path on transient errors", async () => {
     const { run, calls } = mockNtn(() => apiError("503 Service Unavailable service_unavailable", "try later"));
-    await assert.rejects(() => executeNotionGet({ id_or_url: PAGE_ID }, run), /Could not read page/);
+    await assert.rejects(
+      () => executeNotionGet({ id_or_url: PAGE_ID }, run),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, new RegExp(`notion_get could not read ${PAGE_ID}: ntn exit 5`));
+        assert.match(message, /Hint: Notion returned a server-side error/);
+        return true;
+      }
+    );
     assert.equal(calls.length, 1);
   });
 
   it("maps spawn and timeout failures to actionable errors", async () => {
     const cases: { stderr: string; expected: RegExp }[] = [
-      { stderr: "ntn timed out after 60000ms", expected: /timed out/ },
-      { stderr: "ntn not found on PATH. Install: npm i -g ntn", expected: /ntn not found on PATH/ },
-      { stderr: "spawn EACCES", expected: /Could not run `ntn`/ },
+      { stderr: "ntn timed out after 60000ms", expected: /killed by our own timeout/ },
+      { stderr: "ntn not found on PATH. Install: npm i -g ntn", expected: /Notion CLI is not installed/ },
+      {
+        stderr: "spawn EACCES",
+        // 共享模块对认不出的失败只回传原始文本，不编造原因
+        expected: /ntn no exit code \(timed out or could not start\)[\s\S]*spawn EACCES/,
+      },
     ];
     for (const { stderr, expected } of cases) {
       const { run, calls } = mockNtn(() => ({ ok: false, stdout: "", stderr, code: null }));
@@ -607,7 +624,8 @@ describe("notion_get: databases", () => {
         assert.match(message, /as a page, database or data source/);
         assert.match(message, /- ntn pages get: .*404/);
         assert.match(message, /- ntn datasources resolve: .*404/);
-        assert.match(message, /shared with the Notion integration/);
+        // 提示改由 lib/failures.ts 提供（与其他工具同一套措辞）
+        assert.match(message, /Hint: .*cannot see it.*Connections/);
         return true;
       }
     );
