@@ -4,8 +4,11 @@
  * Covers the v1.1 behaviors that cannot be proven with mocks:
  *   - child row create under a parent row (bare parent row id → Parent-item relation)
  *   - notion_query `under` returns that child row
- *   - row→row attach moves the child (overwrite needs yes:true; same parent is a no-op)
- *   - cycle refusal (C under B when B is already under C) and self-attach refusal
+ *   - notion_page_edit with a bare row id parent moves the child (overwrite needs yes:true;
+ *     same parent is a no-op)
+ *   - cycle refusal (C under B when B is already under C) and self-move refusal
+ *   - find-and-replace: a matching edit applies, a non-matching one comes back as a
+ *     warning on a successful call, and an appended body_content lands at the end
  *   - trash cleanup of every temp row, including after a failed step
  *
  * Run on the box with a real token:
@@ -17,7 +20,11 @@
 import { sameNotionId } from "../src/lib/properties.ts";
 import type { NotionTool } from "../src/dsh/tool.ts";
 import { createNotionGetTool } from "../src/tools/get.ts";
-import { createNotionPageTool } from "../src/tools/page.ts";
+import {
+  createNotionPageCreateTool,
+  createNotionPageEditTool,
+  createNotionPageTrashTool,
+} from "../src/tools/page.ts";
 import { createNotionQueryTool } from "../src/tools/query.ts";
 import { mount, text } from "./fixtures/dsh.ts";
 import type { MountedResult, MountedTool } from "./fixtures/dsh.ts";
@@ -34,7 +41,9 @@ function register<Value>(tool: NotionTool<Value>): void {
 }
 
 register(createNotionGetTool());
-register(createNotionPageTool());
+register(createNotionPageCreateTool());
+register(createNotionPageEditTool());
+register(createNotionPageTrashTool());
 register(createNotionQueryTool());
 
 function tool(name: string): MountedTool<any> {
@@ -74,10 +83,9 @@ async function createRow(
   parent?: string
 ): Promise<{ id: string; details: Record<string, unknown> }> {
   const title = `e2e ${stamp} ${label}`;
-  const result = await call("notion_page", {
-    action: "create",
+  const result = await call("notion_page_create", {
     parent: parent ?? `data-source:${ACCEPTANCE.dataSourceId}`,
-    props: { body_content: `# ${title}\n\ndsh-notion 1.1 live e2e temp row.` },
+    body_content: `# ${title}\n\ndsh-notion 1.1 live e2e temp row.`,
   });
   if (result.isError) {
     throw new Error(`create ${label} failed: ${text(result)}`);
@@ -120,7 +128,7 @@ async function waitForChild(
 }
 
 async function trash(id: string): Promise<boolean> {
-  const result = await call("notion_page", { action: "trash", id, yes: true });
+  const result = await call("notion_page_trash", { id, yes: true });
   if (!result.isError) {
     const index = created.findIndex((entry) => sameNotionId(entry.id, id));
     if (index >= 0) created.splice(index, 1);
@@ -192,26 +200,24 @@ async function main(): Promise<void> {
     );
 
     // 3. attach row→row: overwrite without yes is refused, with yes it moves.
-    const overwriteRefused = await call("notion_page", {
-      action: "attach",
+    const overwriteRefused = await call("notion_page_edit", {
       id: childB,
       parent: parentC,
     });
     check(
-      "attach without yes refuses to overwrite the existing parent",
+      "a row move without yes refuses to overwrite the existing parent",
       overwriteRefused.isError === true && /yes: true/.test(text(overwriteRefused)),
       text(overwriteRefused).slice(0, 300)
     );
 
-    const moved = await call("notion_page", {
-      action: "attach",
+    const moved = await call("notion_page_edit", {
       id: childB,
       parent: parentC,
       yes: true,
     });
-    check("attach with yes moves B under C", moved.isError !== true, text(moved).slice(0, 300));
+    check("edit with yes moves B under C", moved.isError !== true, text(moved).slice(0, 300));
     check(
-      "attach reports the replaced parent",
+      "the move reports the replaced parent",
       ((moved.details?.replaced_parent_ids as unknown[] | undefined) ?? []).some(
         (id) => typeof id === "string" && sameNotionId(id, parentA)
       )
@@ -224,28 +230,26 @@ async function main(): Promise<void> {
     );
 
     // 4. Re-attaching the same parent is an idempotent no-op.
-    const again = await call("notion_page", {
-      action: "attach",
+    const again = await call("notion_page_edit", {
       id: childB,
       parent: parentC,
     });
     check(
-      "re-attach to the same parent is a no-op",
+      "moving to the same parent is a no-op",
       again.isError !== true && again.details?.already_linked === true,
       text(again).slice(0, 300)
     );
 
     // 5. Self attach and cycles are refused.
-    const selfAttach = await call("notion_page", { action: "attach", id: childB, parent: childB });
+    const selfMove = await call("notion_page_edit", { id: childB, parent: childB });
     check(
-      "self attach is refused",
-      selfAttach.isError === true && /不能挂到自己下面/.test(text(selfAttach)),
-      text(selfAttach).slice(0, 300)
+      "self move is refused",
+      selfMove.isError === true && /不能挂到自己下面/.test(text(selfMove)),
+      text(selfMove).slice(0, 300)
     );
 
     // B is under C, so putting C under B would close the loop C→B→C.
-    const cycle = await call("notion_page", {
-      action: "attach",
+    const cycle = await call("notion_page_edit", {
       id: parentC,
       parent: childB,
       yes: true,
@@ -254,6 +258,62 @@ async function main(): Promise<void> {
       "row cycle (C under B while B is under C) is refused",
       cycle.isError === true && /环/.test(text(cycle)),
       text(cycle).slice(0, 300)
+    );
+
+    // 6. find-and-replace: a hit applies, a miss is a warning on a SUCCESSFUL call.
+    // This is the behavior the old whole-page replace could not express, and the
+    // asymmetric match rule the model has to reason about.
+    const marker = `e2e ${stamp} replace-me`;
+    const seeded = await call("notion_page_edit", {
+      id: parentA,
+      body_content: `\n\n${marker}`,
+    });
+    check("appending body_content succeeds", seeded.isError !== true, text(seeded).slice(0, 300));
+    check(
+      "an append reports appended:true",
+      seeded.details?.appended === true,
+      text(seeded).slice(0, 300)
+    );
+
+    const replaced = await call("notion_page_edit", {
+      id: parentA,
+      edits: [{ old_str: marker, new_str: `${marker} (replaced)` }],
+    });
+    check(
+      "a matching old_str applies and reports 1/1",
+      replaced.isError !== true &&
+        replaced.details?.edits_applied === 1 &&
+        replaced.details?.edits_missed === 0,
+      text(replaced).slice(0, 300)
+    );
+
+    const partiallyMissed = await call("notion_page_edit", {
+      id: parentA,
+      edits: [
+        { old_str: `${marker} (replaced)`, new_str: `${marker} (twice)` },
+        { old_str: `no such text ${stamp}`, new_str: "x" },
+      ],
+    });
+    check(
+      "one hit + one miss SUCCEEDS with a no_match warning",
+      partiallyMissed.isError !== true &&
+        partiallyMissed.details?.edits_applied === 1 &&
+        partiallyMissed.details?.edits_missed === 1 &&
+        Array.isArray(partiallyMissed.details?.warnings) &&
+        partiallyMissed.details.warnings.some(
+          (warning: { code?: string }) => warning.code === "no_match"
+        ),
+      text(partiallyMissed).slice(0, 400)
+    );
+
+    const deleted = await call("notion_page_edit", {
+      id: parentA,
+      edits: [{ old_str: `${marker} (twice)`, new_str: "" }],
+    });
+    check(
+      'new_str:"" deletes the matched text',
+      deleted.isError !== true && deleted.details?.edits_applied === 1,
+      text(deleted).slice(0, 300)
     );
   } finally {
     // 6. Cleanup: trash every temp row, deepest first so no child is left pointing at a trashed parent.

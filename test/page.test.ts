@@ -1,8 +1,25 @@
+/**
+ * `notion_page_create`, `notion_page_edit` and `notion_page_trash`.
+ *
+ * The old single `notion_page` tool carried an `action` parameter and swapped the
+ * whole page body on every content edit. Both are gone: the tool name is now the
+ * action, and a content edit is a find-and-replace. Every suite is written against
+ * a fake `ntn` runner, so assertions are about the contract — the canonical value
+ * the tool returns and the exact argv it hands to `ntn`.
+ *
+ * `mount()` runs DSH's real output-schema validation on every success, so a value
+ * that does not satisfy its own declared schema fails the test that produced it.
+ */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { createNotionPageTool } from "../src/tools/page.ts";
-import type { NtnRunner, PageToolValue } from "../src/tools/page.ts";
+import {
+  createNotionPageCreateTool,
+  createNotionPageEditTool,
+  createNotionPageTrashTool,
+} from "../src/tools/page.ts";
+import type { NtnRunner } from "../src/tools/page.ts";
+import type { NotionTool } from "../src/dsh/tool.ts";
 import type { RunNtnResult } from "../src/lib/runNtn.ts";
 import { mount, text } from "./fixtures/dsh.ts";
 import type { MountedTool } from "./fixtures/dsh.ts";
@@ -19,30 +36,122 @@ import {
   resolveResponse,
 } from "./fixtures/notion.ts";
 
-/** Mount the real tool definition the way DSH does, with a scripted `ntn` runner. */
-function harness(handler: (args: string[]) => RunNtnResult = () => ntnOk("{}")): {
-  tool: MountedTool<PageToolValue>;
-  calls: string[][];
-} {
+/* ------------------------------------------------------------------ *
+ * Harness
+ * ------------------------------------------------------------------ */
+
+type Factory = (deps: { runNtn: NtnRunner }) => NotionTool<any>;
+
+/**
+ * Mount one of the three page tools with a scripted `ntn` runner.
+ *
+ * `calls` records the argv of every spawn, in order, so a test can assert both the
+ * call count and the exact arguments — including that a multi-edit call is ONE
+ * request rather than N.
+ */
+function harness(
+  factory: Factory,
+  handler: (args: string[]) => RunNtnResult = () => ntnOk("{}")
+): { tool: MountedTool<any>; calls: string[][] } {
   const calls: string[][] = [];
   const runner: NtnRunner = async (options) => {
     calls.push(options.args);
     return handler(options.args);
   };
-  const tool = mount(createNotionPageTool({ runNtn: runner }));
-  assert.equal(tool.name, "notion_page");
-  return { tool, calls };
+  return { tool: mount(factory({ runNtn: runner })), calls };
+}
+
+const createHarness = (handler?: (args: string[]) => RunNtnResult) =>
+  harness(createNotionPageCreateTool, handler);
+const editHarness = (handler?: (args: string[]) => RunNtnResult) =>
+  harness(createNotionPageEditTool, handler);
+const trashHarness = (handler?: (args: string[]) => RunNtnResult) =>
+  harness(createNotionPageTrashTool, handler);
+
+const NEW_PAGE_ID = "11111111-1111-4111-8111-111111111111";
+const EDIT_PAGE_ID = "22222222-2222-4222-8222-222222222222";
+const PARENT_ROW_ID = "33333333-3333-4333-8333-333333333333";
+const OTHER_ROW_ID = "44444444-4444-4444-8444-444444444444";
+const OTHER_PARENT_ID = "55555555-5555-4555-8555-555555555555";
+
+const DS_PARENT = { type: "data_source_id", data_source_id: ACCEPTANCE.dataSourceId };
+const PAGE_PARENT = { type: "page_id", page_id: ACCEPTANCE.parentPageId };
+
+type Params = {
+  type?: string;
+  properties: Record<string, any>;
+  required?: string[];
+  additionalProperties?: boolean;
+};
+
+function params(tool: MountedTool<any>): Params {
+  return tool.parameters as Params;
+}
+
+function paramKeys(tool: MountedTool<any>): string[] {
+  return Object.keys(params(tool).properties).sort();
+}
+
+/** The JSON body of the one PATCH `v1/pages/<id>` request (property/icon write). */
+function patchBody(calls: string[][]): Record<string, any> {
+  const patch = calls.find(
+    (args) =>
+      args[0] === "api" && /^v1\/pages\/[^/]+$/.test(args[1] ?? "") && args[3] === "PATCH"
+  );
+  if (!patch) throw new Error(`expected a PATCH v1/pages/<id> call, saw: ${JSON.stringify(calls)}`);
+  return JSON.parse(patch[5]) as Record<string, any>;
+}
+
+function patchCalls(calls: string[][]): string[][] {
+  return calls.filter(
+    (args) =>
+      args[0] === "api" && /^v1\/pages\/[^/]+$/.test(args[1] ?? "") && args[3] === "PATCH"
+  );
+}
+
+/** The JSON body of the one `/markdown` request (find-replace or append). */
+function markdownBody(calls: string[][]): Record<string, any> {
+  const call = markdownCalls(calls)[0];
+  if (!call) throw new Error(`expected a /markdown call, saw: ${JSON.stringify(calls)}`);
+  const at = Math.max(call.indexOf("-d"), call.indexOf("--data"));
+  if (at < 0) throw new Error(`/markdown call carried no data flag: ${JSON.stringify(call)}`);
+  return JSON.parse(call[at + 1]) as Record<string, any>;
+}
+
+function markdownCalls(calls: string[][]): string[][] {
+  return calls.filter((args) => args[0] === "api" && String(args[1]).endsWith("/markdown"));
+}
+
+function moveCalls(calls: string[][]): string[][] {
+  return calls.filter((args) => args[0] === "api" && String(args[1]).endsWith("/move"));
+}
+
+/** A successful `PATCH v1/pages/<id>/markdown` response carrying the new page markdown. */
+function markdownOk(markdown: string, extra: Record<string, unknown> = {}): RunNtnResult {
+  return ntnOk({
+    object: "page",
+    id: EDIT_PAGE_ID,
+    markdown,
+    request_id: "req-1",
+    truncated: false,
+    unknown_block_ids: [],
+    ...extra,
+  });
 }
 
 function pageCreateResponse(pageId: string): RunNtnResult {
-  return ntnOk({ object: "page", id: pageId, url: `https://app.notion.com/p/${pageId.replace(/-/g, "")}` });
+  return ntnOk({
+    object: "page",
+    id: pageId,
+    url: `https://app.notion.com/p/${pageId.replace(/-/g, "")}`,
+  });
 }
 
 function pageWithParent(parent: Record<string, unknown>): RunNtnResult {
   return ntnOk({ object: "page", id: "ignored", parent });
 }
 
-/** GET v1/pages body with both a parent and current property values (attach checks). */
+/** GET v1/pages body with both a parent and current property values (move checks). */
 function pageWithProps(
   parent: Record<string, unknown>,
   properties: Record<string, unknown>
@@ -50,211 +159,303 @@ function pageWithProps(
   return ntnOk({ object: "page", id: "ignored", parent, properties });
 }
 
-const DS_PARENT = { type: "data_source_id", data_source_id: ACCEPTANCE.dataSourceId };
+/* ------------------------------------------------------------------ *
+ * Registration: the three tools and their parameter schemas
+ * ------------------------------------------------------------------ */
 
-const NEW_PAGE_ID = "11111111-1111-4111-8111-111111111111";
-const EDIT_PAGE_ID = "22222222-2222-4222-8222-222222222222";
-const PARENT_ROW_ID = "33333333-3333-4333-8333-333333333333";
-const OTHER_ROW_ID = "44444444-4444-4444-8444-444444444444";
-
-describe("notion_page registration", () => {
-  it("exposes create/edit/attach/trash, accepts a top-level content alias, no top-level icon", () => {
-    const { tool } = harness();
-    const properties = tool.parameters?.properties ?? {};
-    assert.deepEqual(
-      Object.keys(properties).sort(),
-      ["action", "confirm_shrink", "content", "id", "parent", "props", "recursive", "title", "yes"]
-    );
-    // `content` is accepted as an alias for props.body_content (the intuitive name a
-    // caller reaches for first); `icon` stays props-only.
-    assert.equal("content" in properties, true);
-    // icon is a reserved key inside props, never a top-level parameter.
-    assert.equal("icon" in properties, false);
-    assert.equal(tool.parameters?.additionalProperties, false);
-    assert.deepEqual(tool.parameters?.required, ["action"]);
-    assert.match(tool.description ?? "", /props\.body_content/);
-    assert.match(tool.description ?? "", /props\.icon/);
-    // The replace semantics must be stated up front: it is how the body is lost silently.
-    assert.match(tool.description ?? "", /REPLACES the entire page body/);
+describe("notion_page_* registration", () => {
+  it("exposes three separate tools whose names carry the action", () => {
+    // The split is the point: a caller cannot express "create" and "trash" in one
+    // parameter object, so the name must differ per operation.
+    assert.equal(createHarness().tool.name, "notion_page_create");
+    assert.equal(editHarness().tool.name, "notion_page_edit");
+    assert.equal(trashHarness().tool.name, "notion_page_trash");
   });
-});
 
-describe("notion_page dispatch guards", () => {
-  it("accepts the documented synonyms for each action", async () => {
-    // Synonyms name the same intent; the caller should not have to re-learn spellings.
-    // Each case supplies only what its canonical action requires.
-    const cases: { alias: string; canonical: string; args: Record<string, unknown> }[] = [
-      { alias: "delete", canonical: "trash", args: { id: EDIT_PAGE_ID, yes: true } },
-      { alias: "remove", canonical: "trash", args: { id: EDIT_PAGE_ID, yes: "true" } },
-      { alias: "archive", canonical: "trash", args: { id: EDIT_PAGE_ID, yes: 1 } },
-      { alias: "update", canonical: "edit", args: { id: EDIT_PAGE_ID, title: "t" } },
-      { alias: "modify", canonical: "edit", args: { id: EDIT_PAGE_ID, props: { body_content: "b" } } },
-      { alias: "move", canonical: "attach", args: { id: EDIT_PAGE_ID, parent: `page:${NEW_PAGE_ID}` } },
-      { alias: "reparent", canonical: "attach", args: { id: EDIT_PAGE_ID, parent: `page:${NEW_PAGE_ID}` } },
-      { alias: "new", canonical: "create", args: { parent: `page:${NEW_PAGE_ID}`, title: "t" } },
-      { alias: "add", canonical: "create", args: { parent: `page:${NEW_PAGE_ID}`, props: { body_content: "b" } } },
-    ];
-    for (const { alias, canonical, args } of cases) {
-      const { tool } = harness((argv) => {
-        if (argv[0] === "api" && argv[1] === `v1/pages/${EDIT_PAGE_ID}`) return pageWithParent(DS_PARENT);
-        if (argv[0] === "api" && argv[1]?.startsWith("v1/data_sources/")) return ntnOk(DATA_SOURCE_SCHEMA);
-        if (argv[0] === "pages" && argv[1] === "create") return pageCreateResponse(NEW_PAGE_ID);
-        if (argv[0] === "api" && argv[1]?.includes("/children")) return ntnOk({ results: [], has_more: false });
-        if (argv[0] === "pages" && argv[1] === "trash") return ntnOk("{}");
-        if (argv[0] === "pages" && argv[1] === "edit") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
-        if (argv[2] === "-X") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
-        return ntnFail(`unexpected: ${argv.join(" ")}`);
-      });
-      const result = await tool.execute("call-alias", { action: alias, ...args });
-      assert.equal(result.isError, false, `${alias}: ${result.content[0].text}`);
-      assert.equal(result.details.action, canonical, `${alias} should normalize to ${canonical}`);
+  it("declares exactly the arguments each operation accepts, with no action parameter", () => {
+    assert.deepEqual(paramKeys(createHarness().tool), [
+      "body_content",
+      "icon",
+      "parent",
+      "props",
+      "title",
+    ]);
+    assert.deepEqual(paramKeys(editHarness().tool), [
+      "body_content",
+      "edits",
+      "icon",
+      "id",
+      "parent",
+      "props",
+      "title",
+      "yes",
+    ]);
+    assert.deepEqual(paramKeys(trashHarness().tool), ["id", "recursive", "yes"]);
+    for (const tool of [createHarness().tool, editHarness().tool, trashHarness().tool]) {
+      assert.equal("action" in params(tool).properties, false, `${tool.name} must not take action`);
     }
   });
 
-  it("rejects a word that is neither an action nor a synonym, without calling ntn", async () => {
-    const { tool, calls } = harness();
-    for (const action of ["trsh", "detail", "", 42]) {
-      const result = await tool.execute("call-action", {
-        action,
-        id: EDIT_PAGE_ID,
-        parent: `page:${NEW_PAGE_ID}`,
-      });
-      assert.equal(result.isError, true);
-      assert.match(result.content[0].text, /action (must be a string|".*" is not recognized)/);
+  it("closes every parameter object and declares no confirm_shrink escape hatch", () => {
+    for (const tool of [createHarness().tool, editHarness().tool, trashHarness().tool]) {
+      assert.equal(params(tool).additionalProperties, false, `${tool.name} should be closed`);
+      // Whole-page replace is gone, so the consent parameter for it must be gone too.
+      assert.equal(
+        "confirm_shrink" in params(tool).properties,
+        false,
+        `${tool.name} must not declare confirm_shrink`
+      );
     }
+  });
+
+  it("describes find-replace on the edit tool, not the whole-page replace it replaced", () => {
+    const description = editHarness().tool.description;
+    assert.match(description, /old_str/);
+    assert.match(description, /new_str/);
+    assert.doesNotMatch(description, /REPLACES the entire page body/);
+    assert.doesNotMatch(description, /props\.body_content/);
+    assert.doesNotMatch(description, /props\.icon/);
+  });
+
+  it("rejects the retired confirm_shrink argument instead of silently ignoring it", async () => {
+    // A caller upgrading from the old tool still sends confirm_shrink. Ignoring it
+    // would let them believe a destructive replace was consented to.
+    const { tool, calls } = editHarness();
+    const result = await tool.execute("call-shrink", {
+      id: EDIT_PAGE_ID,
+      body_content: "x",
+      confirm_shrink: true,
+    });
+    assert.equal(result.isError, true);
     assert.equal(calls.length, 0);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+    assert.match(text(result), /confirm_shrink/);
   });
 
-  it("rejects parameters that the action does not own instead of silently dropping them", async () => {
-    // `recursive` is trash-only; the other actions must still reject it.
-    const { tool, calls } = harness();
-    const cases: { params: Record<string, unknown>; expected: RegExp }[] = [
-      {
-        params: { action: "trash", id: EDIT_PAGE_ID, yes: true, props: { body_content: "x" } },
-        expected: /trash 只接受 \{ action, id, yes, recursive \}/,
-      },
-      {
-        params: { action: "create", id: EDIT_PAGE_ID, parent: `page:${ACCEPTANCE.parentPageId}` },
-        expected: /create 只接受/,
-      },
-      {
-        params: {
-          action: "create",
-          parent: `page:${ACCEPTANCE.parentPageId}`,
-          title: "t",
-          yes: true,
+  it("rejects an argument that belongs to a different one of the three tools", async () => {
+    // The split only pays off if the stray argument is refused rather than ignored.
+    const cases: { args: Record<string, unknown>; extra: string; make: () => ReturnType<typeof editHarness> }[] =
+      [
+        {
+          make: trashHarness,
+          args: { id: EDIT_PAGE_ID, yes: true, edits: [{ old_str: "a", new_str: "b" }] },
+          extra: "edits",
         },
-        expected: /create 只接受/,
-      },
-      {
-        params: { action: "edit", id: EDIT_PAGE_ID, title: "t", yes: true },
-        expected: /edit 只接受/,
-      },
-      {
-        params: { action: "edit", id: EDIT_PAGE_ID, parent: `page:${NEW_PAGE_ID}`, props: { Done: true } },
-        expected: /edit 只接受/,
-      },
-    ];
-    for (const { params, expected } of cases) {
-      const result = await tool.execute("call-params", params);
-      assert.equal(result.isError, true);
-      assert.match(result.content[0].text, expected);
-      assert.ok(Array.isArray(result.details.unexpected_params));
+        {
+          make: createHarness,
+          args: {
+            parent: `page:${ACCEPTANCE.parentPageId}`,
+            title: "t",
+            edits: [{ old_str: "a", new_str: "b" }],
+          },
+          extra: "edits",
+        },
+        {
+          make: editHarness,
+          args: { id: EDIT_PAGE_ID, title: "t", recursive: true, parent: `page:${NEW_PAGE_ID}` },
+          extra: "recursive",
+        },
+        {
+          make: trashHarness,
+          args: { id: EDIT_PAGE_ID, yes: true, parent: `page:${NEW_PAGE_ID}` },
+          extra: "parent",
+        },
+      ];
+    for (const { args, extra, make } of cases) {
+      const { tool, calls } = make();
+      const result = await tool.execute("call-extra", args);
+      assert.equal(result.isError, true, `${tool.name} accepted ${extra}`);
+      assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+      assert.match(text(result), new RegExp(extra));
+      assert.equal(calls.length, 0, `${tool.name} called ntn before rejecting ${extra}`);
     }
-    assert.equal(calls.length, 0);
   });
 });
 
-describe("notion_page create", () => {
-  it("creates a page body from props.body_content (no top-level content, no PATCH)", async () => {
-    const { tool, calls } = harness(() => pageCreateResponse(NEW_PAGE_ID));
+/* ------------------------------------------------------------------ *
+ * Top-level icon and body_content
+ * ------------------------------------------------------------------ */
 
-    const result = await tool.execute("call-1", {
-      action: "create",
+describe("notion_page_create: top-level icon and body_content", () => {
+  function createScript(): (args: string[]) => RunNtnResult {
+    return (args) => {
+      if (args[0] === "pages" && args[1] === "create") return pageCreateResponse(NEW_PAGE_ID);
+      if (args[0] === "api" && args[2] === "-X") return ntnOk({ object: "page", id: NEW_PAGE_ID });
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    };
+  }
+
+  it("writes top-level body_content as the create markdown, with no PATCH", async () => {
+    const { tool, calls } = createHarness(() => pageCreateResponse(NEW_PAGE_ID));
+
+    const result = await tool.execute("create-body", {
       parent: `page:${ACCEPTANCE.parentPageId}`,
-      props: { body_content: "# Hello\n\nbody" },
+      body_content: "# Hello\n\nbody",
     });
 
-    assert.equal(result.isError, false);
+    assert.equal(result.isError, false, text(result));
     assert.equal(calls.length, 1);
-
     const args = calls[0];
     assert.deepEqual(args.slice(0, 3), ["pages", "create", "--json"]);
     assert.equal(args[args.indexOf("--parent") + 1], `page:${ACCEPTANCE.parentPageId}`);
-    // Leading H1 becomes the frontmatter title ntn documents; body keeps the rest.
-    const contentArg = args.find((arg) => arg.startsWith("--content="));
-    assert.ok(contentArg, "create must pass --content=<markdown> as one argv element");
-    assert.equal(contentArg, `--content=---\ntitle: "Hello"\n---\n\nbody`);
-    assert.ok(!args.includes("-X"), "body_content must not trigger a property PATCH");
-    assert.ok(!args.join(" ").includes("body_content"), "reserved key must never reach ntn");
-
-    assert.equal(result.details.ok, true);
-    assert.equal(result.details.id, NEW_PAGE_ID);
-    assert.deepEqual(result.details.properties, []);
+    // The leading H1 becomes the frontmatter title ntn documents; the body keeps the rest.
+    assert.ok(
+      args.includes('--content=---\ntitle: "Hello"\n---\n\nbody'),
+      `expected the H1 lifted into frontmatter, got: ${JSON.stringify(args)}`
+    );
+    assert.equal(result.details.created, true);
+    assert.deepEqual(result.details.changed, ["body_content"]);
   });
 
-  it("accepts top-level content as an alias for props.body_content", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) return pageWithParent(DS_PARENT);
-      if (args[0] === "api" && args[1]?.startsWith("v1/data_sources/")) return ntnOk(DATA_SOURCE_SCHEMA);
-      if (args[0] === "api" && args[1] === `v1/blocks/${EDIT_PAGE_ID}/children`) {
-        return ntnOk({ results: [], has_more: false });
-      }
-      if (args[0] === "pages" && args[1] === "create") return pageCreateResponse(NEW_PAGE_ID);
-      if (args[0] === "pages" && args[1] === "edit") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
-      return ntnFail(`unexpected: ${args.join(" ")}`);
+  it("writes top-level icon as an emoji in the follow-up PATCH", async () => {
+    const { tool, calls } = createHarness(createScript());
+
+    const result = await tool.execute("create-icon-emoji", {
+      parent: `page:${ACCEPTANCE.parentPageId}`,
+      title: "Icon page",
+      icon: "🎯",
     });
 
-    const result = await tool.execute("content-alias-1", {
-      action: "edit",
-      id: EDIT_PAGE_ID,
-      content: "# 用 content 传正文",
-    });
     assert.equal(result.isError, false, text(result));
-    const editCall = calls.find((args) => args[0] === "pages" && args[1] === "edit");
-    assert.ok(editCall, "content must reach pages edit as the body");
-    assert.equal(editCall[3], "--content=# 用 content 传正文");
+    assert.equal(calls.find((args) => args[0] === "pages")?.[1], "create");
+    // The explicit title is also written, as the title column of a row-less page.
+    // Both the icon and the title travel in the ONE follow-up PATCH.
+    assert.deepEqual(patchBody(calls).icon, { type: "emoji", emoji: "🎯" });
+    assert.deepEqual(patchBody(calls).properties, {
+      title: { title: [{ type: "text", text: { content: "Icon page" } }] },
+    });
+    assert.equal(result.details.icon, "🎯");
+    assert.deepEqual(result.details.changed, ["body_content", "title", "icon"]);
   });
 
-  it("refuses content and props.body_content together as ambiguous", async () => {
-    const { tool, calls } = harness();
-    const result = await tool.execute("content-alias-2", {
-      action: "edit",
-      id: EDIT_PAGE_ID,
-      content: "# a",
-      props: { body_content: "# b" },
+  it("writes a top-level http(s) icon as a Notion external file icon", async () => {
+    const url = "https://x.test/a.png";
+    const { tool, calls } = createHarness(createScript());
+
+    const result = await tool.execute("create-icon-url", {
+      parent: `page:${ACCEPTANCE.parentPageId}`,
+      title: "Icon page",
+      icon: url,
     });
-    assert.equal(result.isError, true);
-    assert.match(text(result), /不要同时传/);
-    assert.equal(calls.length, 0);
+
+    assert.equal(result.isError, false, text(result));
+    assert.deepEqual(patchBody(calls).icon, { type: "external", external: { url } });
+    assert.equal(result.details.icon, url);
   });
 
-  it("still rejects other unknown top-level parameters", async () => {
-    const { tool, calls } = harness();
-    const result = await tool.execute("content-alias-3", {
-      action: "edit",
-      id: EDIT_PAGE_ID,
-      definitely_not_a_param: 1,
+  it("sends icon: null to clear the icon", async () => {
+    const { tool, calls } = createHarness(createScript());
+
+    const result = await tool.execute("create-icon-clear", {
+      parent: `page:${ACCEPTANCE.parentPageId}`,
+      title: "Icon page",
+      icon: null,
     });
+
+    assert.equal(result.isError, false, text(result));
+    assert.deepEqual(patchBody(calls).icon, null);
+    assert.equal(result.details.icon, null);
+  });
+
+  it("rejects an over-long non-URL icon string as invalid input, before any ntn call", async () => {
+    const { tool, calls } = createHarness(createScript());
+
+    const result = await tool.execute("create-icon-invalid", {
+      parent: `page:${ACCEPTANCE.parentPageId}`,
+      title: "Icon page",
+      icon: "this is definitely not an emoji",
+    });
+
     assert.equal(result.isError, true);
-    assert.match(text(result), /多余的参数/);
+    assert.match(text(result), /既不是 emoji 也不是图片 URL/);
     assert.equal(calls.length, 0);
   });
 
   it("rejects a non-string body_content before calling ntn", async () => {
-    const { tool, calls } = harness();
-    const result = await tool.execute("call-1b", {
-      action: "create",
+    const { tool, calls } = createHarness();
+
+    const result = await tool.execute("create-body-invalid", {
       parent: `page:${ACCEPTANCE.parentPageId}`,
-      props: { body_content: { text: "nope" } },
+      body_content: { text: "nope" },
     });
+
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /body_content.*Markdown 字符串/);
     assert.equal(calls.length, 0);
   });
 
+  it("writes props.icon as the real column when the data source has one", async () => {
+    // `icon` is no longer a reserved props key, so on a data source with an actual
+    // column of that name it is an ordinary column write. Blanket-rejecting it
+    // would make that column unwritable.
+    const { tool, calls } = createHarness((args) => {
+      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
+        return ntnOk(ICON_COLUMN_SCHEMA);
+      }
+      if (args[0] === "pages" && args[1] === "create") return pageCreateResponse(NEW_PAGE_ID);
+      if (args[0] === "api" && args[2] === "-X") return ntnOk({ object: "page", id: NEW_PAGE_ID });
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    });
+
+    const result = await tool.execute("create-icon-column", {
+      parent: `data-source:${ACCEPTANCE.dataSourceId}`,
+      title: "列名测试",
+      props: { icon: "这一列的值" },
+    });
+
+    assert.equal(result.isError, false, text(result));
+    const body = patchBody(calls);
+    // The column is written as a rich_text column value...
+    assert.deepEqual(body.properties.icon, {
+      rich_text: [{ type: "text", text: { content: "这一列的值" } }],
+    });
+    // ...and it must NOT also be emitted as the page-level icon: `props.icon` is a
+    // column here, so putting it in the PATCH's top-level `icon` would set the wrong thing.
+    assert.equal("icon" in body, false);
+    assert.deepEqual(Object.keys(body.properties).sort(), ["Name", "icon"]);
+    assert.deepEqual([...result.details.properties].sort(), ["Name", "icon"]);
+    assert.equal(result.details.icon, undefined);
+  });
+
+  it("writes props.body_content as the real column when the data source has one", async () => {
+    const { tool, calls } = createHarness((args) => {
+      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
+        return ntnOk(BODY_COLUMN_SCHEMA);
+      }
+      if (args[0] === "pages" && args[1] === "create") return pageCreateResponse(NEW_PAGE_ID);
+      if (args[0] === "api" && args[2] === "-X") return ntnOk({ object: "page", id: NEW_PAGE_ID });
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    });
+
+    const result = await tool.execute("create-body-column", {
+      parent: `data-source:${ACCEPTANCE.dataSourceId}`,
+      title: "列名测试",
+      props: { body_content: "这是列的值，不是正文" },
+    });
+
+    assert.equal(result.isError, false, text(result));
+    // The column carries the text as a rich_text value, alongside the title column.
+    const body = patchBody(calls);
+    assert.deepEqual(body.properties.body_content, {
+      rich_text: [{ type: "text", text: { content: "这是列的值，不是正文" } }],
+    });
+    assert.deepEqual(Object.keys(body.properties).sort(), ["Name", "body_content"]);
+    // The page BODY must not have become the column text: no body_content was passed
+    // as the page body, so the create markdown carries only the frontmatter title.
+    const createArgs = calls.find((args) => args[0] === "pages") ?? [];
+    const content = createArgs.find((arg) => arg.startsWith("--content=")) ?? "";
+    assert.doesNotMatch(content, /这是列的值/);
+    assert.deepEqual([...result.details.properties].sort(), ["Name", "body_content"]);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * create: container resolution and schema lookup
+ * ------------------------------------------------------------------ */
+
+describe("notion_page_create: parent resolution", () => {
   it("resolves database:<id> through datasources resolve and never reads v1/databases (C4)", async () => {
-    const { tool, calls } = harness((args) => {
+    const { tool, calls } = createHarness((args) => {
       if (args[0] === "datasources") return ntnOk(resolveResponse(ACCEPTANCE.dataSourceId));
       if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
         return ntnOk(DATA_SOURCE_SCHEMA);
@@ -264,13 +465,12 @@ describe("notion_page create", () => {
       return ntnFail(`unexpected call: ${args.join(" ")}`);
     });
 
-    const result = await tool.execute("call-2", {
-      action: "create",
+    const result = await tool.execute("create-db", {
       parent: `database:${ACCEPTANCE_DATABASE_ID}`,
       props: { Name: "新行", Status: "待办" },
     });
 
-    assert.equal(result.isError, false);
+    assert.equal(result.isError, false, text(result));
     assert.deepEqual(calls[0], ["datasources", "resolve", ACCEPTANCE_DATABASE_ID, "--json"]);
     assert.deepEqual(calls[1], ["api", `v1/data_sources/${ACCEPTANCE.dataSourceId}`]);
     assert.deepEqual(calls[2].slice(0, 3), ["pages", "create", "--json"]);
@@ -299,12 +499,11 @@ describe("notion_page create", () => {
 
   it("errors with the data source ids when a database has several (no guessing)", async () => {
     const other = "55555555-5555-4555-8555-555555555555";
-    const { tool, calls } = harness((args) =>
+    const { tool, calls } = createHarness((args) =>
       args[0] === "datasources" ? ntnOk(resolveResponse(ACCEPTANCE.dataSourceId, other)) : ntnOk({})
     );
 
-    const result = await tool.execute("call-3", {
-      action: "create",
+    const result = await tool.execute("create-multi-ds", {
       parent: `database:${ACCEPTANCE_DATABASE_ID}`,
       props: { Name: "x" },
     });
@@ -318,21 +517,20 @@ describe("notion_page create", () => {
   });
 
   it("errors with hint_properties when a database page has no resolvable title", async () => {
-    const { tool, calls } = harness((args) => {
+    const { tool, calls } = createHarness((args) => {
       if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
         return ntnOk(DATA_SOURCE_SCHEMA);
       }
       return pageCreateResponse(NEW_PAGE_ID);
     });
 
-    const result = await tool.execute("call-4", {
-      action: "create",
+    const result = await tool.execute("create-no-title", {
       parent: `data-source:${ACCEPTANCE.dataSourceId}`,
       props: { Status: "待办" },
     });
 
     assert.equal(result.isError, true);
-    // Only the schema lookup ran: no page was created without a title.
+    // Only the schema lookup ran: no page may be created without a title.
     assert.equal(calls.length, 1);
     const hints = result.details.hint_properties;
     assert.ok(Array.isArray(hints));
@@ -345,34 +543,32 @@ describe("notion_page create", () => {
   });
 
   it("rejects a bare page parent with no body/title and never calls ntn", async () => {
-    const { tool, calls } = harness();
+    const { tool, calls } = createHarness();
 
-    const result = await tool.execute("call-5", {
-      action: "create",
+    const result = await tool.execute("create-bare", {
       parent: `page:${ACCEPTANCE.parentPageId}`,
     });
 
     assert.equal(result.isError, true);
     assert.equal(calls.length, 0);
-    assert.match(result.content[0].text, /props\.body_content 或 title/);
+    assert.match(result.content[0].text, /body_content 或 title/);
   });
 
   it("passes markdown starting with '-' as a single --content= argument", async () => {
-    const { tool, calls } = harness(() => pageCreateResponse(NEW_PAGE_ID));
+    const { tool, calls } = createHarness(() => pageCreateResponse(NEW_PAGE_ID));
 
-    const result = await tool.execute("call-6", {
-      action: "create",
+    const result = await tool.execute("create-dash", {
       parent: `page:${ACCEPTANCE.parentPageId}`,
-      props: { body_content: "- one\n- two" },
+      body_content: "- one\n- two",
     });
 
-    assert.equal(result.isError, false);
+    assert.equal(result.isError, false, text(result));
     assert.equal(calls.length, 1);
     assert.ok(calls[0].includes("--content=- one\n- two"));
   });
 
   it("lets the title argument win over the title property in props", async () => {
-    const { tool, calls } = harness((args) => {
+    const { tool, calls } = createHarness((args) => {
       if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
         return ntnOk(DATA_SOURCE_SCHEMA);
       }
@@ -381,46 +577,30 @@ describe("notion_page create", () => {
       return ntnFail(`unexpected call: ${args.join(" ")}`);
     });
 
-    const result = await tool.execute("call-7", {
-      action: "create",
+    const result = await tool.execute("create-title-wins", {
       parent: `data-source:${ACCEPTANCE.dataSourceId}`,
       title: "A",
-      props: { Name: "B", body_content: "body" },
+      props: { Name: "B" },
+      body_content: "body",
     });
 
-    assert.equal(result.isError, false);
+    assert.equal(result.isError, false, text(result));
     assert.match(calls[1].find((arg) => arg.startsWith("--content=")) ?? "", /title: "A"/);
     assert.deepEqual(JSON.parse(calls[2][5]), {
       properties: { Name: { title: [{ type: "text", text: { content: "A" } }] } },
     });
     assert.equal(result.details.title, "A");
   });
+});
 
-  it("refuses to write a body when the data source has a real body_content column", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(BODY_COLUMN_SCHEMA);
-      }
-      return pageCreateResponse(NEW_PAGE_ID);
-    });
+/* ------------------------------------------------------------------ *
+ * create: child rows and the Parent-item relation
+ * ------------------------------------------------------------------ */
 
-    const result = await tool.execute("call-8", {
-      action: "create",
-      parent: `data-source:${ACCEPTANCE.dataSourceId}`,
-      props: { Name: "冲突", body_content: "正文" },
-    });
-
-    assert.equal(result.isError, true);
-    assert.equal(calls.length, 1, "no page may be created while the reserved key conflicts");
-    assert.match(result.content[0].text, /保留键/);
-    assert.equal(result.details.conflict, true);
-  });
-
+describe("notion_page_create: child rows", () => {
   it("creates a child row from a bare parent row id and links Parent-item", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${PARENT_ROW_ID}`) {
-        return pageWithParent(DS_PARENT);
-      }
+    const { tool, calls } = createHarness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${PARENT_ROW_ID}`) return pageWithParent(DS_PARENT);
       if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
         return ntnOk(SELF_RELATION_SCHEMA);
       }
@@ -429,13 +609,12 @@ describe("notion_page create", () => {
       return ntnFail(`unexpected call: ${args.join(" ")}`);
     });
 
-    const result = await tool.execute("call-9", {
-      action: "create",
+    const result = await tool.execute("create-child", {
       parent: PARENT_ROW_ID,
       props: { Name: "子任务", Status: "待办" },
     });
 
-    assert.equal(result.isError, false);
+    assert.equal(result.isError, false, text(result));
     const createArgs = calls.find((args) => args[0] === "pages") ?? [];
     assert.equal(
       createArgs[createArgs.indexOf("--parent") + 1],
@@ -455,18 +634,15 @@ describe("notion_page create", () => {
   });
 
   it("explains a missing Parent-item relation instead of creating an orphan row", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${PARENT_ROW_ID}`) {
-        return pageWithParent(DS_PARENT);
-      }
+    const { tool, calls } = createHarness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${PARENT_ROW_ID}`) return pageWithParent(DS_PARENT);
       if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
         return ntnOk(DATA_SOURCE_SCHEMA);
       }
       return pageCreateResponse(NEW_PAGE_ID);
     });
 
-    const result = await tool.execute("call-10", {
-      action: "create",
+    const result = await tool.execute("create-orphan", {
       parent: PARENT_ROW_ID,
       props: { Name: "子任务" },
     });
@@ -476,793 +652,43 @@ describe("notion_page create", () => {
     assert.match(result.content[0].text, /Parent-item/);
     assert.match(result.content[0].text, /没有任何 relation 列/);
     assert.ok(
-      (result.details.hint_properties ?? []).some(
-        (hint: { name: string }) => hint.name === "Name"
-      )
+      (result.details.hint_properties ?? []).some((hint: { name: string }) => hint.name === "Name")
     );
   });
 
-  it("passes an ntn failure through with its own code, without nesting a second prefix", async () => {
-    const { tool, calls } = harness(() => ntnFail("404 object_not_found"));
-    const result = await tool.execute("call-11", {
-      action: "create",
-      parent: ACCEPTANCE.dataSourceId,
-      props: { Name: "x" },
-    });
-    assert.equal(result.isError, true);
-    assert.equal(calls.length, 1);
-    // A 404 from ntn is [NTN_FAILED]; wrapping it as INVALID_INPUT would blame the
-    // arguments and put two [CODE] markers in one message.
-    assert.match(result.content[0].text, /^Error: \[NTN_FAILED\] /);
-    assert.equal((result.content[0].text.match(/\[[A-Z_]+\]/g) ?? []).length, 1);
-  });
-
-  it("still guides the caller when a bare id is genuinely not a page", async () => {
-    // A readable page with no parent: the id shape is the caller's problem here.
-    const { tool } = harness((args) => {
-      if (args[0] === "api" && args[1]?.startsWith("v1/pages/")) return ntnOk({ object: "page" });
-      return ntnFail(`unexpected: ${args.join(" ")}`);
-    });
-    const result = await tool.execute("call-11b", {
-      action: "create",
-      parent: ACCEPTANCE.dataSourceId,
-      props: { Name: "x" },
-    });
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
-    assert.match(result.content[0].text, /database:<id> \/ data-source:<id>/);
-  });
-});
-
-describe("notion_page error codes", () => {
-  // DSH forwards only `message` to the model, so every code must be visible in it.
-  it("prefixes a rejected argument with [INVALID_INPUT]", async () => {
-    const { tool, calls } = harness();
-    const result = await tool.execute("call-code-1", { action: "create" });
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
-    assert.equal(calls.length, 0);
-  });
-
-  it("prefixes a failed ntn call with [NTN_FAILED]", async () => {
-    const { tool } = harness(() => ntnFail("boom: not logged in"));
-    const result = await tool.execute("call-code-2", {
-      action: "trash",
-      id: EDIT_PAGE_ID,
-      yes: true,
-    });
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /^Error: \[NTN_FAILED\] /);
-    assert.match(result.content[0].text, /boom: not logged in/);
-  });
-
-  it("reports a cleanup that left a page behind as [PARTIAL_WRITE]", async () => {
-    const { tool } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${PARENT_ROW_ID}`) return pageWithParent(DS_PARENT);
+  it("writes the named Parent item column, never the Sub-item dual", async () => {
+    const { tool, calls } = createHarness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${PARENT_ROW_ID}`) {
+        return pageWithProps(DS_PARENT, {});
+      }
       if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(SELF_RELATION_SCHEMA);
+        return ntnOk(DUAL_RELATION_SCHEMA);
       }
       if (args[0] === "pages" && args[1] === "create") return pageCreateResponse(NEW_PAGE_ID);
-      if (args[0] === "api" && args[2] === "-X") return ntnFail("relation write rejected");
-      if (args[0] === "pages" && args[1] === "trash") return ntnFail("trash rejected");
-      return ntnFail(`unexpected call: ${args.join(" ")}`);
-    });
-    const result = await tool.execute("call-code-3", {
-      action: "create",
-      parent: PARENT_ROW_ID,
-      props: { body_content: "# Child" },
-    });
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /^Error: \[PARTIAL_WRITE\] /);
-    assert.match(result.content[0].text, /partial: true/);
-    assert.match(result.content[0].text, /回滚失败/);
-    assert.equal(result.details.partial, true);
-  });
-
-  it("reports a successful rollback under the original code, not PARTIAL_WRITE", async () => {
-    const { tool } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${PARENT_ROW_ID}`) return pageWithParent(DS_PARENT);
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(SELF_RELATION_SCHEMA);
-      }
-      if (args[0] === "pages" && args[1] === "create") return pageCreateResponse(NEW_PAGE_ID);
-      if (args[0] === "api" && args[2] === "-X") return ntnFail("relation write rejected");
-      if (args[0] === "pages" && args[1] === "trash") return ntnOk("trashed");
-      return ntnFail(`unexpected call: ${args.join(" ")}`);
-    });
-    const result = await tool.execute("call-code-4", {
-      action: "create",
-      parent: PARENT_ROW_ID,
-      props: { body_content: "# Child" },
-    });
-    assert.equal(result.isError, true);
-    // The page was trashed, so this is an ordinary ntn failure, not a partial write.
-    assert.match(result.content[0].text, /^Error: \[NTN_FAILED\] /);
-    assert.match(result.content[0].text, /partial: false/);
-    assert.doesNotMatch(result.content[0].text, /PARTIAL_WRITE/);
-    assert.equal(result.details.partial, false);
-  });
-});
-
-describe("notion_page icon", () => {
-  function createScript(): (args: string[]) => RunNtnResult {
-    return (args) => {
-      if (args[0] === "pages") return pageCreateResponse(NEW_PAGE_ID);
       if (args[0] === "api" && args[2] === "-X") return ntnOk({ object: "page", id: NEW_PAGE_ID });
       return ntnFail(`unexpected call: ${args.join(" ")}`);
-    };
-  }
-
-  function patchBody(calls: string[][]): Record<string, unknown> {
-    const patch = calls.find((args) => args[2] === "-X");
-    if (!patch) throw new Error("expected a PATCH call");
-    return JSON.parse(patch[5]) as Record<string, unknown>;
-  }
-
-  it("writes props.icon as an emoji in the follow-up PATCH, with no properties key", async () => {
-    const { tool, calls } = harness(createScript());
-
-    const result = await tool.execute("icon-create-emoji", {
-      action: "create",
-      parent: `page:${ACCEPTANCE.parentPageId}`,
-      title: "Icon page",
-      props: { icon: "🎯" },
     });
 
-    assert.equal(result.isError, false, text(result));
-    const create = calls.find((args) => args[0] === "pages") ?? [];
-    assert.equal(create[1], "create");
-    assert.deepEqual(patchBody(calls), { icon: { type: "emoji", emoji: "🎯" } });
-    assert.equal("properties" in patchBody(calls), false);
-    assert.deepEqual(result.details.properties, []);
-    assert.equal(result.details.icon, "🎯");
-    assert.deepEqual(result.details.changed, ["icon"]);
-  });
-
-  it("writes an http(s) props.icon as a Notion external file icon", async () => {
-    const url = "https://x.test/a.png";
-    const { tool, calls } = harness(createScript());
-
-    const result = await tool.execute("icon-create-url", {
-      action: "create",
-      parent: `page:${ACCEPTANCE.parentPageId}`,
-      title: "Icon page",
-      props: { icon: url },
+    const created = await tool.execute("create-dual", {
+      parent: PARENT_ROW_ID,
+      body_content: "# Child",
     });
-
-    assert.equal(result.isError, false, text(result));
-    assert.deepEqual(patchBody(calls), { icon: { type: "external", external: { url } } });
-    assert.equal("properties" in patchBody(calls), false);
-    assert.equal(result.details.icon, url);
-  });
-
-  it("sends icon: null to clear the icon, still without a properties key", async () => {
-    const { tool, calls } = harness(createScript());
-
-    const result = await tool.execute("icon-create-clear", {
-      action: "create",
-      parent: `page:${ACCEPTANCE.parentPageId}`,
-      title: "Icon page",
-      props: { icon: null },
-    });
-
-    assert.equal(result.isError, false, text(result));
-    assert.deepEqual(patchBody(calls), { icon: null });
-    assert.equal("properties" in patchBody(calls), false);
-    assert.equal(result.details.icon, null);
-  });
-
-  it("edits an icon-only page with exactly one PATCH and no property map", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
-        return pageWithParent({ type: "page_id", page_id: ACCEPTANCE.parentPageId });
-      }
-      if (args[0] === "api" && args[2] === "-X") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
-      return ntnFail(`unexpected call: ${args.join(" ")}`);
-    });
-
-    const result = await tool.execute("icon-edit-only", {
-      action: "edit",
-      id: EDIT_PAGE_ID,
-      props: { icon: "🎯" },
-    });
-
-    assert.equal(result.isError, false, text(result));
-    const patches = calls.filter((args) => args[2] === "-X");
-    assert.equal(patches.length, 1, "an icon-only edit is exactly one PATCH");
-    assert.equal("properties" in patchBody(calls), false);
-    assert.deepEqual(patchBody(calls), { icon: { type: "emoji", emoji: "🎯" } });
-    assert.deepEqual(result.details.changed, ["icon"]);
-    assert.deepEqual(result.details.properties, []);
-  });
-
-  it("refuses props.icon when the data source has a real column named icon", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(ICON_COLUMN_SCHEMA);
-      }
-      return pageCreateResponse(NEW_PAGE_ID);
-    });
-
-    const result = await tool.execute("icon-conflict", {
-      action: "create",
-      parent: `data-source:${ACCEPTANCE.dataSourceId}`,
-      title: "冲突",
-      props: { icon: "🎯" },
-    });
-
-    assert.equal(result.isError, true);
-    assert.match(text(result), /保留键/);
-    assert.match(text(result), /icon/);
-    assert.deepEqual(result.details.reserved_keys, ["icon"]);
-    assert.equal(result.details.conflict, true);
-    // Only the schema read ran: the reserved-key conflict must never create a page.
-    assert.equal(calls.length, 1);
-    assert.equal(calls.some((args) => args[0] === "pages"), false);
-  });
-
-  it("rejects an over-long non-URL icon string as invalid input, before any ntn call", async () => {
-    const { tool, calls } = harness(createScript());
-
-    const result = await tool.execute("icon-invalid", {
-      action: "create",
-      parent: `page:${ACCEPTANCE.parentPageId}`,
-      title: "Icon page",
-      props: { icon: "this is definitely not an emoji" },
-    });
-
-    assert.equal(result.isError, true);
-    assert.match(text(result), /既不是 emoji 也不是图片 URL/);
-    assert.equal(result.details.property, "icon");
-    assert.equal(calls.length, 0);
+    assert.equal(created.isError, false, created.content[0].text);
+    const patch = calls.filter((args) => args[2] === "-X").at(-1) ?? [];
+    const body = JSON.parse(patch[5]).properties;
+    // A dual relation exposes both sides; writing the wrong one silently detaches the row.
+    assert.deepEqual(body[ACCEPTANCE.parentItemColumn], { relation: [{ id: PARENT_ROW_ID }] });
+    assert.equal("Sub-item" in body, false);
   });
 });
 
-describe("notion_page: body replacement cannot lose content silently", () => {
-  /**
-   * `ntn pages edit --content` REPLACES the whole body. A model that means "fix one
-   * paragraph" and sends only that paragraph used to destroy the rest while the tool
-   * reported success, so these tests pin the two things that make that visible:
-   * the returned size transition, and the refusal when the body shrinks drastically.
-   */
-  const LONG_BODY = Array.from({ length: 30 }, (_, i) => `第 ${i} 段：${"内容".repeat(20)}`).join("\n\n");
+/* ------------------------------------------------------------------ *
+ * create: atomicity (the page must not be left half-made)
+ * ------------------------------------------------------------------ */
 
-  /** A page whose blocks hold `chars` characters of text. */
-  function harnessWithExisting(chars: number): ReturnType<typeof harness> {
-    const text = "字".repeat(chars);
-    return harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) return pageWithParent(DS_PARENT);
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(DATA_SOURCE_SCHEMA);
-      }
-      if (args[0] === "api" && args[1] === `v1/blocks/${EDIT_PAGE_ID}/children`) {
-        return ntnOk({
-          results: [{ id: "b1", type: "paragraph", has_children: false, paragraph: {
-            rich_text: [{ plain_text: text }],
-          } }],
-          has_more: false,
-        });
-      }
-      if (args[0] === "pages" && args[1] === "edit") {
-        return ntnOk({ object: "page", id: EDIT_PAGE_ID });
-      }
-      if (args[2] === "-X") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
-      return ntnFail(`unexpected: ${args.join(" ")}`);
-    });
-  }
-
-  it("refuses a replacement that keeps under half the body, naming both sizes", async () => {
-    const { tool, calls } = harnessWithExisting(1200);
-    const result = await tool.execute("call-shrink-1", {
-      action: "edit",
-      id: EDIT_PAGE_ID,
-      props: { body_content: "只改第二段" },
-    });
-
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /整页替换/);
-    assert.match(result.content[0].text, /1200/);
-    assert.match(result.content[0].text, /confirm_shrink/);
-    assert.equal(result.details.body_chars_before, 1200);
-    // Nothing may be written when the guard refuses.
-    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "edit"), false);
-  });
-
-  it("proceeds when confirm_shrink:true is given, and reports the transition", async () => {
-    const { tool, calls } = harnessWithExisting(1200);
-    const result = await tool.execute("call-shrink-2", {
-      action: "edit",
-      id: EDIT_PAGE_ID,
-      props: { body_content: "整页重写后的新内容" },
-      confirm_shrink: true,
-    });
-
-    assert.equal(result.isError, false, result.content[0].text);
-    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "edit"), true);
-    assert.equal(result.details.body_chars_before, 1200);
-    assert.equal(result.details.body_chars_after, "整页重写后的新内容".length);
-    // The model must be told what it did, not just "updated".
-    assert.match(result.content[0].text, /1200 字 → 9 字/);
-  });
-
-  it("reports the size transition even when the edit is allowed", async () => {
-    const { tool } = harnessWithExisting(500);
-    const grown = `${LONG_BODY}`;
-    const result = await tool.execute("call-shrink-3", {
-      action: "edit",
-      id: EDIT_PAGE_ID,
-      props: { body_content: grown },
-    });
-    assert.equal(result.isError, false, result.content[0].text);
-    assert.equal(result.details.body_chars_before, 500);
-    assert.match(result.content[0].text, /正文已整页替换/);
-  });
-
-  it("does not guard pages with little text (nothing meaningful to protect)", async () => {
-    // Under the threshold, a short replacement is a normal rewrite, not a wrecking ball.
-    const { tool } = harnessWithExisting(20);
-    const result = await tool.execute("call-shrink-4", {
-      action: "edit",
-      id: EDIT_PAGE_ID,
-      props: { body_content: "短" },
-    });
-    assert.equal(result.isError, false, result.content[0].text);
-  });
-
-  it("still edits when the current size cannot be read", async () => {
-    // A failed measurement must degrade to "size unknown", never block the edit.
-    const { tool } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) return pageWithParent(DS_PARENT);
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(DATA_SOURCE_SCHEMA);
-      }
-      if (args[0] === "api" && args[1]?.includes("/children")) return ntnFail("500 boom");
-      if (args[0] === "pages" && args[1] === "edit") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
-      if (args[2] === "-X") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
-      return ntnFail(`unexpected: ${args.join(" ")}`);
-    });
-    const result = await tool.execute("call-shrink-5", {
-      action: "edit",
-      id: EDIT_PAGE_ID,
-      props: { body_content: "x" },
-    });
-    assert.equal(result.isError, false, result.content[0].text);
-    assert.equal(result.details.body_chars_before, undefined);
-  });
-
-  it("never applies the shrink guard to edits that leave the body alone", async () => {
-    const { tool } = harnessWithExisting(5000);
-    const result = await tool.execute("call-shrink-6", {
-      action: "edit",
-      id: EDIT_PAGE_ID,
-      props: { icon: "🎯" },
-    });
-    assert.equal(result.isError, false, result.content[0].text);
-  });
-});
-
-describe("notion_page edit", () => {
-  it("refuses edit with neither props nor title, without calling ntn", async () => {
-    const { tool, calls } = harness();
-
-    const result = await tool.execute("call-12", { action: "edit", id: EDIT_PAGE_ID });
-
-    assert.equal(result.isError, true);
-    assert.equal(calls.length, 0);
-    assert.match(result.content[0].text, /edit 需要 props.*至少一项/);
-  });
-
-  it("edits the body via props.body_content using pages edit", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
-        return pageWithParent({ type: "page_id", page_id: ACCEPTANCE.parentPageId });
-      }
-      if (args[0] === "pages") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
-      return ntnFail(`unexpected call: ${args.join(" ")}`);
-    });
-
-    const result = await tool.execute("call-13", {
-      action: "edit",
-      id: EDIT_PAGE_ID,
-      props: { body_content: "# New body" },
-    });
-
-    assert.equal(result.isError, false);
-    // A body edit now measures the page first so the returned value can report the
-    // size transition; the blocks read is unscripted here, so it degrades to
-    // "size unknown" and the edit proceeds.
-    const editCall = calls.find((args) => args[0] === "pages" && args[1] === "edit");
-    assert.ok(editCall);
-    assert.equal(editCall[3], "--content=# New body");
-    assert.equal(editCall[4], "--json");
-    assert.deepEqual(result.details.changed, ["body_content"]);
-  });
-
-  it("maps multiple props keys to one Notion property PATCH", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) return pageWithParent(DS_PARENT);
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(DATA_SOURCE_SCHEMA);
-      }
-      if (args[0] === "api" && args[2] === "-X") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
-      return ntnFail(`unexpected call: ${args.join(" ")}`);
-    });
-
-    const result = await tool.execute("call-14", {
-      action: "edit",
-      id: EDIT_PAGE_ID,
-      props: {
-        Status: "待办",
-        标签: ["键盘", "客制化"],
-        截止日期: "2025-12-31",
-        Done: true,
-      },
-    });
-
-    assert.equal(result.isError, false);
-    assert.equal(calls.length, 3);
-    const patch = calls[2];
-    assert.deepEqual(patch.slice(0, 5), ["api", `v1/pages/${EDIT_PAGE_ID}`, "-X", "PATCH", "--data"]);
-    assert.deepEqual(JSON.parse(patch[5]), {
-      properties: {
-        Status: { status: { name: "待办" } },
-        标签: { multi_select: [{ name: "键盘" }, { name: "客制化" }] },
-        截止日期: { date: { start: "2025-12-31" } },
-        Done: { checkbox: true },
-      },
-    });
-    assert.deepEqual(result.details.properties, ["Status", "标签", "截止日期", "Done"]);
-    assert.deepEqual(result.details.changed, ["properties"]);
-  });
-
-  it("runs pages edit and then PATCH when body_content and props are both given", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) return pageWithParent(DS_PARENT);
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(DATA_SOURCE_SCHEMA);
-      }
-      if (args[0] === "pages") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
-      if (args[0] === "api" && args[2] === "-X") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
-      return ntnFail(`unexpected call: ${args.join(" ")}`);
-    });
-
-    const result = await tool.execute("call-15", {
-      action: "edit",
-      id: EDIT_PAGE_ID,
-      props: { body_content: "更新后的正文", Done: true },
-    });
-
-    assert.equal(result.isError, false);
-    // Schema read, page measurement, pages edit, then the property PATCH.
-    const editIdx = calls.findIndex((args) => args[0] === "pages" && args[1] === "edit");
-    const patchIdx = calls.findIndex((args) => args[3] === "PATCH");
-    assert.ok(editIdx >= 0 && patchIdx >= 0);
-    assert.ok(editIdx < patchIdx, "body edit must run before the property PATCH");
-    assert.deepEqual(result.details.changed, ["body_content", "properties"]);
-  });
-
-  it("rejects unknown property names and lists writable columns", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) return pageWithParent(DS_PARENT);
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(DATA_SOURCE_SCHEMA);
-      }
-      return ntnOk({ object: "page", id: EDIT_PAGE_ID });
-    });
-
-    const result = await tool.execute("call-16", {
-      action: "edit",
-      id: EDIT_PAGE_ID,
-      props: { 不存在的列: "x" },
-    });
-
-    assert.equal(result.isError, true);
-    assert.equal(calls.length, 2, "no PATCH may run for an unknown property");
-    assert.match(result.content[0].text, /未知属性/);
-    assert.ok(
-      (result.details.hint_properties ?? []).some(
-        (hint: { name: string }) => hint.name === "Name"
-      )
-    );
-  });
-
-  it("updates the title property when only title is given", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) return pageWithParent(DS_PARENT);
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(DATA_SOURCE_SCHEMA);
-      }
-      return ntnOk({ object: "page", id: EDIT_PAGE_ID });
-    });
-
-    const result = await tool.execute("call-17", {
-      action: "edit",
-      id: EDIT_PAGE_ID,
-      title: "改名",
-    });
-
-    assert.equal(result.isError, false);
-    assert.equal(calls.length, 3);
-    assert.deepEqual(JSON.parse(calls[2][5]), {
-      properties: {
-        Name: { title: [{ type: "text", text: { content: "改名" } }] },
-      },
-    });
-  });
-
-  it("refuses a body edit when the data source has a real body_content column", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) return pageWithParent(DS_PARENT);
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(BODY_COLUMN_SCHEMA);
-      }
-      return ntnOk({ object: "page", id: EDIT_PAGE_ID });
-    });
-
-    const result = await tool.execute("call-18", {
-      action: "edit",
-      id: EDIT_PAGE_ID,
-      props: { body_content: "正文" },
-    });
-
-    assert.equal(result.isError, true);
-    assert.equal(calls.some((args) => args[0] === "pages"), false);
-    assert.match(result.content[0].text, /body_content/);
-  });
-
-  it("resolves a legacy database_id parent via datasources resolve (no v1/databases read)", async () => {
-    const legacyRow = "77777777-7777-4777-8777-777777777777";
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${legacyRow}`) {
-        return pageWithParent({ type: "database_id", database_id: ACCEPTANCE_DATABASE_ID });
-      }
-      if (args[0] === "datasources") return ntnOk(resolveResponse(ACCEPTANCE.dataSourceId));
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(DATA_SOURCE_SCHEMA);
-      }
-      if (args[0] === "api" && args[2] === "-X") return ntnOk({ object: "page", id: legacyRow });
-      return ntnFail(`unexpected call: ${args.join(" ")}`);
-    });
-
-    const result = await tool.execute("call-19b", {
-      action: "edit",
-      id: legacyRow,
-      props: { Done: true },
-    });
-
-    assert.equal(result.isError, false, result.content[0].text);
-    assert.deepEqual(calls[1], ["datasources", "resolve", ACCEPTANCE_DATABASE_ID, "--json"]);
-    assert.equal(
-      calls.some((args) => args[1]?.startsWith("v1/databases/")),
-      false,
-      "legacy database_id must still resolve through data sources"
-    );
-  });
-
-  it("treats a whitespace-only body as no body and refuses the empty edit", async () => {
-    const { tool, calls } = harness();
-    const result = await tool.execute("call-19", {
-      action: "edit",
-      id: EDIT_PAGE_ID,
-      props: { body_content: "   " },
-    });
-    assert.equal(result.isError, true);
-    assert.equal(calls.length, 0);
-    assert.match(result.content[0].text, /edit 需要 props.*至少一项/);
-  });
-});
-
-describe("notion_page attach", () => {
-  it("moves a page under another page with POST /v1/pages/{id}/move", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
-        return pageWithParent({ type: "page_id", page_id: ACCEPTANCE.parentPageId });
-      }
-      if (args[0] === "api" && args[1] === `v1/pages/${NEW_PAGE_ID}`) {
-        return pageWithParent({ type: "page_id", page_id: ACCEPTANCE.parentPageId });
-      }
-      if (args[0] === "api" && args[1] === `v1/pages/${ACCEPTANCE.parentPageId}`) {
-        return pageWithParent({ type: "workspace", workspace: true });
-      }
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}/move`) {
-        return ntnOk({ object: "page", id: EDIT_PAGE_ID, parent: { type: "page_id", page_id: NEW_PAGE_ID } });
-      }
-      return ntnFail(`unexpected call: ${args.join(" ")}`);
-    });
-
-    const result = await tool.execute("call-20", {
-      action: "attach",
-      id: EDIT_PAGE_ID,
-      parent: `page:${NEW_PAGE_ID}`,
-    });
-
-    assert.equal(result.isError, false, result.content[0].text);
-    assert.deepEqual(calls, [
-      ["api", `v1/pages/${EDIT_PAGE_ID}`],
-      ["api", `v1/pages/${NEW_PAGE_ID}`],
-      ["api", `v1/pages/${ACCEPTANCE.parentPageId}`],
-      ["api", `v1/pages/${EDIT_PAGE_ID}/move`, "-X", "POST", "--data", JSON.stringify({ parent: { page_id: NEW_PAGE_ID } })],
-    ]);
-    assert.deepEqual(result.details.changed, ["parent"]);
-    assert.equal(result.details.parent, `page:${NEW_PAGE_ID}`);
-    assert.equal(result.details.cycle_check, "walked");
-  });
-
-  it("accepts a bare page id parent by classifying it with GET v1/pages", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${NEW_PAGE_ID}`) {
-        return pageWithParent({ type: "page_id", page_id: ACCEPTANCE.parentPageId });
-      }
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
-        return pageWithParent({ type: "page_id", page_id: ACCEPTANCE.parentPageId });
-      }
-      if (args[0] === "api" && args[1] === `v1/pages/${ACCEPTANCE.parentPageId}`) {
-        return pageWithParent({ type: "workspace", workspace: true });
-      }
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}/move`) {
-        return ntnOk({ object: "page", id: EDIT_PAGE_ID });
-      }
-      return ntnFail(`unexpected call: ${args.join(" ")}`);
-    });
-
-    const result = await tool.execute("call-20b", {
-      action: "attach",
-      id: EDIT_PAGE_ID,
-      parent: NEW_PAGE_ID,
-    });
-
-    assert.equal(result.isError, false, result.content[0].text);
-    assert.equal(result.details.parent, `page:${NEW_PAGE_ID}`);
-    // classify the bare id once, read the child once, walk the page ancestors, then move.
-    assert.equal(calls.length, 4);
-    assert.deepEqual(calls[0], ["api", `v1/pages/${NEW_PAGE_ID}`]);
-  });
-
-  it("rejects props/title on attach (it is not a write, not a file upload)", async () => {
-    const { tool, calls } = harness();
-    for (const extra of [{ props: { body_content: "x" } }, { title: "x" }]) {
-      const result = await tool.execute("call-21", {
-        action: "attach",
-        id: EDIT_PAGE_ID,
-        parent: `page:${NEW_PAGE_ID}`,
-        ...extra,
-      });
-      assert.equal(result.isError, true);
-      assert.match(result.content[0].text, /只接受 \{ action, id, parent, yes \}/);
-    }
-    assert.equal(calls.length, 0);
-  });
-
-  it("rejects database/data-source parents for attach before calling ntn", async () => {
-    const { tool, calls } = harness();
-    const result = await tool.execute("call-22", {
-      action: "attach",
-      id: EDIT_PAGE_ID,
-      parent: `data-source:${ACCEPTANCE.dataSourceId}`,
-    });
-    assert.equal(result.isError, true);
-    assert.equal(calls.length, 0);
-    assert.match(result.content[0].text, /attach 的 parent 只支持 page:<id>/);
-  });
-
-  it("links a row under a parent row through the Parent-item self-relation", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${PARENT_ROW_ID}`) return pageWithParent(DS_PARENT);
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(SELF_RELATION_SCHEMA);
-      }
-      if (args[0] === "api" && args[1] === `v1/pages/${OTHER_ROW_ID}`) return pageWithParent(DS_PARENT);
-      if (args[0] === "api" && args[2] === "-X") return ntnOk({ object: "page", id: OTHER_ROW_ID });
-      return ntnFail(`unexpected call: ${args.join(" ")}`);
-    });
-
-    const result = await tool.execute("call-23", {
-      action: "attach",
-      id: OTHER_ROW_ID,
-      parent: PARENT_ROW_ID,
-    });
-
-    assert.equal(result.isError, false);
-    const patch = calls.find((args) => args[2] === "-X") ?? [];
-    assert.deepEqual(JSON.parse(patch[5]), {
-      properties: { "Parent-item": { relation: [{ id: PARENT_ROW_ID }] } },
-    });
-    assert.equal(result.details.parent_item_property, "Parent-item");
-    assert.deepEqual(result.details.changed, ["parent_item_relation"]);
-  });
-
-  it("explains when the data source has no Parent-item relation", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${PARENT_ROW_ID}`) return pageWithParent(DS_PARENT);
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(DATA_SOURCE_SCHEMA);
-      }
-      if (args[0] === "api" && args[1] === `v1/pages/${OTHER_ROW_ID}`) return pageWithParent(DS_PARENT);
-      return ntnOk({ object: "page", id: OTHER_ROW_ID });
-    });
-
-    const result = await tool.execute("call-24", {
-      action: "attach",
-      id: OTHER_ROW_ID,
-      parent: PARENT_ROW_ID,
-    });
-
-    assert.equal(result.isError, true);
-    assert.equal(calls.some((args) => args[2] === "-X"), false);
-    assert.match(result.content[0].text, /Parent-item/);
-    assert.match(result.content[0].text, /没有任何 relation 列/);
-  });
-
-  it("refuses to link a page under a row", async () => {
-    const { tool } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${PARENT_ROW_ID}`) return pageWithParent(DS_PARENT);
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(SELF_RELATION_SCHEMA);
-      }
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
-        return pageWithParent({ type: "page_id", page_id: ACCEPTANCE.parentPageId });
-      }
-      return ntnOk({});
-    });
-
-    const result = await tool.execute("call-25", {
-      action: "attach",
-      id: EDIT_PAGE_ID,
-      parent: PARENT_ROW_ID,
-    });
-
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /不在数据库里/);
-  });
-
-  it("refuses to link rows from different data sources", async () => {
-    const otherDs = "66666666-6666-4666-8666-666666666666";
-    const { tool } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${PARENT_ROW_ID}`) return pageWithParent(DS_PARENT);
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(SELF_RELATION_SCHEMA);
-      }
-      if (args[0] === "api" && args[1] === `v1/pages/${OTHER_ROW_ID}`) {
-        return pageWithParent({ type: "data_source_id", data_source_id: otherDs });
-      }
-      return ntnOk({});
-    });
-
-    const result = await tool.execute("call-26", {
-      action: "attach",
-      id: OTHER_ROW_ID,
-      parent: PARENT_ROW_ID,
-    });
-
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /同一 data source/);
-  });
-
-  it("rejects attaching a page that is already a child of the target", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
-        return pageWithParent({ type: "page_id", page_id: NEW_PAGE_ID });
-      }
-      return ntnFail(`unexpected call: ${args.join(" ")}`);
-    });
-
-    const result = await tool.execute("call-27", {
-      action: "attach",
-      id: EDIT_PAGE_ID,
-      parent: `page:${NEW_PAGE_ID}`,
-    });
-
-    assert.equal(result.isError, true);
-    assert.equal(calls.length, 1);
-    assert.match(result.content[0].text, /已经是/);
-  });
-});
-
-describe("notion_page create atomicity", () => {
-  const THIRD_ROW_ID = "55555555-5555-4555-8555-555555555555";
-
+describe("notion_page_create: atomicity", () => {
   it("trashes the new page when the follow-up props PATCH fails", async () => {
-    const { tool, calls } = harness((args) => {
+    const { tool, calls } = createHarness((args) => {
       if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
         return ntnOk(DATA_SOURCE_SCHEMA);
       }
@@ -1272,10 +698,10 @@ describe("notion_page create atomicity", () => {
       return ntnFail(`unexpected call: ${args.join(" ")}`);
     });
 
-    const result = await tool.execute("call-40", {
-      action: "create",
+    const result = await tool.execute("create-rollback", {
       parent: `data-source:${ACCEPTANCE.dataSourceId}`,
-      props: { body_content: "# Rollback me", Status: "待办" },
+      body_content: "# Rollback me",
+      props: { Status: "待办" },
     });
 
     assert.equal(result.isError, true);
@@ -1297,7 +723,7 @@ describe("notion_page create atomicity", () => {
   });
 
   it("reports partial:true + created_id when the rollback trash also fails", async () => {
-    const { tool, calls } = harness((args) => {
+    const { tool, calls } = createHarness((args) => {
       if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
         return ntnOk(DATA_SOURCE_SCHEMA);
       }
@@ -1307,10 +733,10 @@ describe("notion_page create atomicity", () => {
       return ntnFail(`unexpected call: ${args.join(" ")}`);
     });
 
-    const result = await tool.execute("call-41", {
-      action: "create",
+    const result = await tool.execute("create-rollback-fail", {
       parent: `data-source:${ACCEPTANCE.dataSourceId}`,
-      props: { body_content: "# Orphan", Status: "待办" },
+      body_content: "# Orphan",
+      props: { Status: "待办" },
     });
 
     assert.equal(result.isError, true);
@@ -1323,7 +749,7 @@ describe("notion_page create atomicity", () => {
   });
 
   it("rolls back a child row when the Parent-item relation PATCH fails", async () => {
-    const { tool, calls } = harness((args) => {
+    const { tool, calls } = createHarness((args) => {
       if (args[0] === "api" && args[1] === `v1/pages/${PARENT_ROW_ID}`) return pageWithParent(DS_PARENT);
       if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
         return ntnOk(SELF_RELATION_SCHEMA);
@@ -1334,10 +760,9 @@ describe("notion_page create atomicity", () => {
       return ntnFail(`unexpected call: ${args.join(" ")}`);
     });
 
-    const result = await tool.execute("call-42", {
-      action: "create",
+    const result = await tool.execute("create-child-rollback", {
       parent: PARENT_ROW_ID,
-      props: { body_content: "# Child" },
+      body_content: "# Child",
     });
 
     assert.equal(result.isError, true);
@@ -1353,7 +778,7 @@ describe("notion_page create atomicity", () => {
   });
 
   it("reports an unrollable create when ntn returns no page id", async () => {
-    const { tool, calls } = harness((args) => {
+    const { tool, calls } = createHarness((args) => {
       if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
         return ntnOk(DATA_SOURCE_SCHEMA);
       }
@@ -1361,10 +786,10 @@ describe("notion_page create atomicity", () => {
       return ntnFail(`unexpected call: ${args.join(" ")}`);
     });
 
-    const result = await tool.execute("call-43", {
-      action: "create",
+    const result = await tool.execute("create-no-id", {
       parent: `data-source:${ACCEPTANCE.dataSourceId}`,
-      props: { body_content: "# No id", Status: "待办" },
+      body_content: "# No id",
+      props: { Status: "待办" },
     });
 
     assert.equal(result.isError, true);
@@ -1374,7 +799,7 @@ describe("notion_page create atomicity", () => {
   });
 
   it("does not trash on a create that never reached ntn successfully", async () => {
-    const { tool, calls } = harness((args) => {
+    const { tool, calls } = createHarness((args) => {
       if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
         return ntnOk(DATA_SOURCE_SCHEMA);
       }
@@ -1382,10 +807,10 @@ describe("notion_page create atomicity", () => {
       return ntnFail(`unexpected call: ${args.join(" ")}`);
     });
 
-    const result = await tool.execute("call-44", {
-      action: "create",
+    const result = await tool.execute("create-never", {
       parent: `data-source:${ACCEPTANCE.dataSourceId}`,
-      props: { body_content: "# Nope", Status: "待办" },
+      body_content: "# Nope",
+      props: { Status: "待办" },
     });
 
     assert.equal(result.isError, true);
@@ -1394,581 +819,750 @@ describe("notion_page create atomicity", () => {
   });
 });
 
-describe("notion_page attach guards", () => {
-  const OTHER_PARENT_ID = "55555555-5555-4555-8555-555555555555";
+/* ------------------------------------------------------------------ *
+ * create: failure codes
+ * ------------------------------------------------------------------ */
 
-  function rowHarness(options: {
-    parentProps?: Record<string, unknown>;
-    childProps?: Record<string, unknown>;
-    patch?: () => RunNtnResult;
-  } = {}) {
-    return harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${PARENT_ROW_ID}`) {
-        return pageWithProps(DS_PARENT, options.parentProps ?? {});
+describe("notion_page_create: error codes", () => {
+  it("passes an ntn failure through with its own code, without nesting a second prefix", async () => {
+    const { tool, calls } = createHarness(() => ntnFail("404 object_not_found"));
+    const result = await tool.execute("create-ntn-fail", {
+      parent: ACCEPTANCE.dataSourceId,
+      props: { Name: "x" },
+    });
+    assert.equal(result.isError, true);
+    assert.equal(calls.length, 1);
+    // A 404 from ntn is [NTN_FAILED]; wrapping it as INVALID_INPUT would blame the
+    // arguments and put two [CODE] markers in one message.
+    assert.match(result.content[0].text, /^Error: \[NTN_FAILED\] /);
+    assert.equal((result.content[0].text.match(/\[[A-Z_]+\]/g) ?? []).length, 1);
+  });
+
+  it("prefixes a rejected argument with [INVALID_INPUT]", async () => {
+    const { tool, calls } = createHarness();
+    const result = await tool.execute("create-bad-args", {});
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+    assert.equal(calls.length, 0);
+  });
+
+  it("still guides the caller when a bare id is genuinely not a page", async () => {
+    const { tool } = createHarness((args) => {
+      if (args[0] === "api" && args[1]?.startsWith("v1/pages/")) return ntnOk({ object: "page" });
+      return ntnFail(`unexpected: ${args.join(" ")}`);
+    });
+    const result = await tool.execute("create-bad-bare", {
+      parent: ACCEPTANCE.dataSourceId,
+      props: { Name: "x" },
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+    assert.match(result.content[0].text, /database:<id> \/ data-source:<id>/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * edit: find-and-replace (the core new behavior)
+ * ------------------------------------------------------------------ */
+
+describe("notion_page_edit: find-and-replace", () => {
+  /** A page whose only interesting state is that it exists under a page parent. */
+  function editScript(
+    markdown: RunNtnResult = markdownOk("# 标题\n\n新的正文")
+  ): (args: string[]) => RunNtnResult {
+    return (args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}` && args[3] !== "PATCH") {
+        return pageWithParent(PAGE_PARENT);
       }
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(SELF_RELATION_SCHEMA);
+      if (args[0] === "api" && String(args[1]).endsWith("/markdown")) return markdown;
+      if (args[0] === "api" && args[2] === "-X") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    };
+  }
+
+  it("sends one update_content request carrying every edit, and reports how many applied", async () => {
+    const { tool, calls } = editHarness(editScript());
+
+    const result = await tool.execute("edit-replace", {
+      id: EDIT_PAGE_ID,
+      edits: [
+        { old_str: "旧的", new_str: "新的" },
+        { old_str: "第二处", new_str: "改好了" },
+      ],
+    });
+
+    assert.equal(result.isError, false, text(result));
+    // N edits are ONE request, not N: the API applies them sequentially server-side.
+    const markdown = markdownCalls(calls);
+    assert.equal(markdown.length, 1, "all edits must go in one /markdown request");
+    assert.deepEqual(markdown[0].slice(0, 4), [
+      "api",
+      `v1/pages/${EDIT_PAGE_ID}/markdown`,
+      "-X",
+      "PATCH",
+    ]);
+    assert.deepEqual(markdownBody(calls), {
+      markdown_version: "v2",
+      type: "update_content",
+      update_content: {
+        content_updates: [
+          { old_str: "旧的", new_str: "新的" },
+          { old_str: "第二处", new_str: "改好了" },
+        ],
+      },
+    });
+    assert.equal(result.details.edits_applied, 2);
+    assert.equal(result.details.edits_missed, 0);
+    assert.deepEqual(result.details.changed, ["body_content"]);
+  });
+
+  it("sends markdown_version v2 and never allow_deleting_content", async () => {
+    // v2 is what makes find-replace predictable; allow_deleting_content is the
+    // escape hatch for deletions that swallow child pages, which must stay off.
+    const { tool, calls } = editHarness(editScript());
+
+    await tool.execute("edit-version", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "a", new_str: "b" }],
+    });
+
+    const body = markdownBody(calls);
+    assert.equal(body.markdown_version, "v2");
+    assert.equal("allow_deleting_content" in body, false);
+    assert.equal("allow_deleting_content" in (body.update_content ?? {}), false);
+  });
+
+  it("passes replace_all_matches through only when the caller set it", async () => {
+    const { tool, calls } = editHarness(editScript());
+
+    await tool.execute("edit-replace-all", {
+      id: EDIT_PAGE_ID,
+      edits: [
+        { old_str: "a", new_str: "b", replace_all_matches: true },
+        { old_str: "c", new_str: "d" },
+      ],
+    });
+
+    const updates = markdownBody(calls).update_content.content_updates;
+    assert.equal(updates[0].replace_all_matches, true);
+    // Omitted rather than sent as false: the field is optional in the API.
+    assert.equal("replace_all_matches" in updates[1], false);
+  });
+
+  it("treats new_str: \"\" as a deletion instead of rejecting it", async () => {
+    // Deleting the matched text is a legitimate edit; an empty new_str is NOT
+    // "missing new_str". Confusing the two would make deletion impossible.
+    const { tool, calls } = editHarness(editScript(markdownOk("# 标题\n\n")));
+
+    const result = await tool.execute("edit-delete", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "删掉我", new_str: "" }],
+    });
+
+    assert.equal(result.isError, false, text(result));
+    assert.deepEqual(markdownBody(calls).update_content.content_updates, [
+      { old_str: "删掉我", new_str: "" },
+    ]);
+    assert.equal(result.details.edits_applied, 1);
+  });
+
+  it("rejects an edit with no new_str at all, before calling ntn", async () => {
+    // Omitting new_str is a caller mistake (did they mean to delete? to replace?);
+    // silently defaulting to "" would delete text they meant to keep.
+    const { tool, calls } = editHarness();
+
+    const result = await tool.execute("edit-missing-new", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "只有 old" }],
+    });
+
+    assert.equal(result.isError, true);
+    assert.equal(calls.length, 0);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+    assert.match(text(result), /new_str/);
+  });
+
+  it("surfaces a refusal to delete child pages instead of overriding allow_deleting_content", async () => {
+    // THE guard that replaces the old shrink guard. `allow_deleting_content` stays
+    // false, so an old_str broad enough to swallow a child-page block is refused by
+    // Notion. The tool must NOT re-send with the flag: that would trade the guard for
+    // a silent subtree deletion. It says what happened and how to narrow old_str.
+    const { tool, calls } = editHarness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}` && args[3] !== "PATCH") {
+        return pageWithParent(PAGE_PARENT);
       }
-      if (args[0] === "api" && args[1] === `v1/pages/${OTHER_ROW_ID}`) {
-        return pageWithProps(DS_PARENT, options.childProps ?? {});
-      }
-      if (args[0] === "api" && args[1] === `v1/pages/${OTHER_PARENT_ID}`) {
-        return pageWithProps(DS_PARENT, {});
-      }
-      if (args[0] === "api" && args[2] === "-X") {
-        return options.patch ? options.patch() : ntnOk({ object: "page", id: OTHER_ROW_ID });
+      if (args[0] === "api" && String(args[1]).endsWith("/markdown")) {
+        return ntnFail(
+          "400 validation_error: Cannot delete child pages or databases. Set allow_deleting_content to true to proceed."
+        );
       }
       return ntnFail(`unexpected call: ${args.join(" ")}`);
     });
+
+    const result = await tool.execute("edit-delete-children", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: '段落一\n\n<page url="https://x/p/abc">子页面</page>', new_str: "" }],
+    });
+
+    assert.equal(result.isError, true);
+    // Exactly one request: no retry with the flag flipped.
+    assert.equal(markdownCalls(calls).length, 1);
+    assert.equal(
+      markdownCalls(calls).some((args) => args.join(" ").includes('"allow_deleting_content":true')),
+      false,
+      "the tool must never escalate allow_deleting_content on its own"
+    );
+    assert.match(text(result), /子页面或子数据库/);
+    assert.match(text(result), /old_str/);
+    assert.equal(result.details.refused, "deleting_child_content");
+  });
+
+  it("rejects an empty old_str, which can never match", async () => {
+    const { tool, calls } = editHarness();
+    const result = await tool.execute("edit-empty-old", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "", new_str: "x" }],
+    });
+    assert.equal(result.isError, true);
+    assert.equal(calls.length, 0);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+  });
+
+  it("surfaces Notion's ambiguous-match validation_error and writes nothing else", async () => {
+    // An old_str matching several places is refused by the API with 400 and nothing
+    // is written. The tool must not swallow that into a success, and must not try a
+    // second request afterwards.
+    const { tool, calls } = editHarness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}` && args[3] !== "PATCH") {
+        return pageWithParent(PAGE_PARENT);
+      }
+      if (args[0] === "api" && String(args[1]).endsWith("/markdown")) {
+        return ntnFail("400 validation_error: Multiple matches found for '目标'. Found 3 matches.");
+      }
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    });
+
+    const result = await tool.execute("edit-ambiguous", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "目标", new_str: "新" }],
+    });
+
+    assert.equal(result.isError, true);
+    assert.match(text(result), /Multiple matches/);
+    // Exactly one write attempt: refusing must not be followed by a fallback write.
+    assert.equal(markdownCalls(calls).length, 1);
+    assert.equal(patchCalls(calls).length, 0);
+    assert.equal(moveCalls(calls).length, 0);
+  });
+
+  it("returns ok:true plus every warning when only some edits matched", async () => {
+    // The API answers 200 with a warnings array when some edits miss. This is the
+    // partial-success path: the call DID change the page, so it cannot be an error,
+    // but the model has to be told which edits missed.
+    const warnings = [
+      { code: "no_match", message: "No matches found for '不存在的文字'" },
+      { code: "no_match", message: "No matches found for '另一段也没找到'" },
+    ];
+    const { tool, calls } = editHarness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}` && args[3] !== "PATCH") {
+        return pageWithParent(PAGE_PARENT);
+      }
+      if (args[0] === "api" && String(args[1]).endsWith("/markdown")) {
+        return markdownOk("# 标题\n\n改好了", { warnings });
+      }
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    });
+
+    const result = await tool.execute("edit-partial", {
+      id: EDIT_PAGE_ID,
+      edits: [
+        { old_str: "原文", new_str: "改好了" },
+        { old_str: "不存在的文字", new_str: "x" },
+        { old_str: "另一段也没找到", new_str: "y" },
+      ],
+    });
+
+    assert.equal(result.isError, false, text(result));
+    // Echoed verbatim: the model needs Notion's own wording to fix the old_str.
+    assert.deepEqual(result.details.warnings, warnings);
+    assert.equal(result.details.edits_sent, 3);
+    assert.equal(result.details.edits_applied, 1);
+    assert.equal(result.details.edits_missed, 2);
+    // The tally is derived, not guessed: applied = sent − no_match warnings.
+    assert.equal(
+      result.details.edits_applied,
+      result.details.edits_sent - result.details.edits_missed
+    );
+    // The rendered text is what the model actually reads, so the misses must be in it.
+    const rendered = text(result);
+    assert.match(rendered, /不存在的文字/);
+    assert.match(rendered, /另一段也没找到/);
+    assert.equal(markdownCalls(calls).length, 1);
+  });
+
+  it("derives applied = sent − no_match warnings from a 3-edit call with one miss", async () => {
+    // The exact derivation the contract pins. A mock where "everything matched" would
+    // pass even if the tally were hardcoded, so one edit has to miss.
+    const { tool } = editHarness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}` && args[3] !== "PATCH") {
+        return pageWithParent(PAGE_PARENT);
+      }
+      if (args[0] === "api" && String(args[1]).endsWith("/markdown")) {
+        return markdownOk("# 标题", {
+          warnings: [{ code: "no_match", message: "No matches found for '根本没出现'" }],
+        });
+      }
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    });
+
+    const result = await tool.execute("edit-tally", {
+      id: EDIT_PAGE_ID,
+      edits: [
+        { old_str: "一", new_str: "1" },
+        { old_str: "二", new_str: "2" },
+        { old_str: "根本没出现", new_str: "3" },
+      ],
+    });
+
+    assert.equal(result.isError, false, text(result));
+    assert.equal(result.details.edits_sent, 3);
+    assert.equal(result.details.edits_missed, 1);
+    assert.equal(result.details.edits_applied, 2);
+  });
+
+  it("counts only no_match warnings in the tally, not every warning", async () => {
+    // `warnings` also carries categories like "unsupported_tag"; folding those into
+    // the edit tally would report an applied edit as missed.
+    const { tool } = editHarness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}` && args[3] !== "PATCH") {
+        return pageWithParent(PAGE_PARENT);
+      }
+      if (args[0] === "api" && String(args[1]).endsWith("/markdown")) {
+        return markdownOk("# 标题", {
+          warnings: [
+            { code: "no_match", message: "No matches found for '没出现'" },
+            { code: "unsupported_tag", message: "Unsupported tag <foo> was dropped" },
+          ],
+        });
+      }
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    });
+
+    const result = await tool.execute("edit-other-warning", {
+      id: EDIT_PAGE_ID,
+      edits: [
+        { old_str: "出现", new_str: "ok" },
+        { old_str: "没出现", new_str: "x" },
+      ],
+    });
+
+    assert.equal(result.isError, false, text(result));
+    assert.equal(result.details.edits_sent, 2);
+    assert.equal(result.details.edits_missed, 1);
+    assert.equal(result.details.edits_applied, 1);
+    // Both warnings are still surfaced verbatim: only the TALLY ignores non-no_match.
+    assert.equal(result.details.warnings.length, 2);
+    assert.match(text(result), /unsupported_tag/);
+  });
+
+  it("omits warnings entirely when the API returned none", async () => {
+    // Absence is the clean signal; an always-present empty array trains the model
+    // to ignore the field.
+    const { tool } = editHarness(editScript(markdownOk("# ok", { warnings: [] })));
+    const result = await tool.execute("edit-no-warnings", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "a", new_str: "b" }],
+    });
+    assert.equal(result.isError, false, text(result));
+    assert.equal("warnings" in result.details, false);
+  });
+
+  it("surfaces truncated:true so the model knows the markdown is not the full page", async () => {
+    // `truncated` is the only signal that the returned markdown cannot be trusted as
+    // the whole body; silently dropping it would make the model reason about a page
+    // it has only partly seen.
+    const { tool } = editHarness(editScript(markdownOk("# 部分内容", { truncated: true })));
+
+    const result = await tool.execute("edit-truncated", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "a", new_str: "b" }],
+    });
+
+    assert.equal(result.isError, false, text(result));
+    assert.equal(result.details.truncated, true);
+    assert.match(text(result), /truncat|截断|不完整/i);
+  });
+
+  it("folds props.block_update into edits as a compat alias", async () => {
+    const { tool, calls } = editHarness(editScript());
+
+    const result = await tool.execute("edit-block-update", {
+      id: EDIT_PAGE_ID,
+      props: { block_update: [{ old_str: "旧", new_str: "新" }] },
+    });
+
+    assert.equal(result.isError, false, text(result));
+    assert.deepEqual(markdownBody(calls).update_content.content_updates, [
+      { old_str: "旧", new_str: "新" },
+    ]);
+  });
+
+  it("rejects edits and props.block_update together as ambiguous", async () => {
+    // Two spellings of one intent with different content is a caller mistake:
+    // picking one silently writes something they did not ask for.
+    const { tool, calls } = editHarness();
+
+    const result = await tool.execute("edit-both-spellings", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "a", new_str: "b" }],
+      props: { block_update: [{ old_str: "c", new_str: "d" }] },
+    });
+
+    assert.equal(result.isError, true);
+    assert.equal(calls.length, 0);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+    assert.match(text(result), /edits/);
+    assert.match(text(result), /block_update/);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * edit: append (edits empty + body_content)
+ * ------------------------------------------------------------------ */
+
+describe("notion_page_edit: append", () => {
+  function appendScript(): (args: string[]) => RunNtnResult {
+    return (args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}` && args[3] !== "PATCH") {
+        return pageWithParent(PAGE_PARENT);
+      }
+      if (args[0] === "api" && String(args[1]).endsWith("/markdown")) {
+        return markdownOk("# 标题\n\n原文\n\n追加的段落");
+      }
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    };
   }
 
-  it("refuses to attach a page under itself without calling ntn beyond the lookup", async () => {
-    const { tool, calls } = harness(() =>
-      pageWithParent({ type: "page_id", page_id: ACCEPTANCE.parentPageId })
-    );
+  it("appends body_content at the end when edits are absent", async () => {
+    const { tool, calls } = editHarness(appendScript());
 
-    const result = await tool.execute("call-50", {
-      action: "attach",
-      id: NEW_PAGE_ID,
+    const result = await tool.execute("edit-append", {
+      id: EDIT_PAGE_ID,
+      body_content: "追加的段落",
+    });
+
+    assert.equal(result.isError, false, text(result));
+    assert.equal(markdownCalls(calls).length, 1);
+    assert.deepEqual(markdownBody(calls), {
+      markdown_version: "v2",
+      type: "insert_content",
+      insert_content: {
+        content: "追加的段落",
+        position: { type: "end" },
+      },
+    });
+    assert.deepEqual(result.details.changed, ["body_content"]);
+    // `appended` is how the rendered value distinguishes "added to the end" from
+    // "replaced text" now that there is no `action` field.
+    assert.equal(result.details.appended, true);
+    // An append is not a find-replace, so there is no edit tally to report.
+    assert.equal(result.details.edits_sent, undefined);
+    assert.match(text(result), /追加/);
+  });
+
+  it("appends when edits is an empty array and body_content is set", async () => {
+    // An empty edits array means "no find-replace", which leaves append as the only
+    // reading of body_content.
+    const { tool, calls } = editHarness(appendScript());
+
+    const result = await tool.execute("edit-append-empty", {
+      id: EDIT_PAGE_ID,
+      edits: [],
+      body_content: "追加的段落",
+    });
+
+    assert.equal(result.isError, false, text(result));
+    assert.equal(markdownBody(calls).type, "insert_content");
+  });
+
+  it("rejects body_content alongside a non-empty edits array", async () => {
+    // Both together is genuinely ambiguous: append the text, or replace each match
+    // with it? Refusing is the only reading that cannot silently do the wrong thing.
+    const { tool, calls } = editHarness();
+
+    const result = await tool.execute("edit-append-conflict", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "a", new_str: "b" }],
+      body_content: "追加的段落",
+    });
+
+    assert.equal(result.isError, true);
+    assert.equal(calls.length, 0);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+  });
+
+  it("refuses an edit with no content change and no property change", async () => {
+    const { tool, calls } = editHarness();
+    const result = await tool.execute("edit-empty", { id: EDIT_PAGE_ID });
+    assert.equal(result.isError, true);
+    assert.equal(calls.length, 0);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * edit: properties, title, icon (still the PATCH v1/pages/<id> path)
+ * ------------------------------------------------------------------ */
+
+describe("notion_page_edit: property, title and icon writes", () => {
+  function propsScript(schema: unknown = DATA_SOURCE_SCHEMA): (args: string[]) => RunNtnResult {
+    return (args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}` && args[3] !== "PATCH") {
+        return pageWithParent(DS_PARENT);
+      }
+      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
+        return ntnOk(schema);
+      }
+      if (args[0] === "api" && args[2] === "-X") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    };
+  }
+
+  it("maps multiple props keys to one Notion property PATCH", async () => {
+    const { tool, calls } = editHarness(propsScript());
+
+    const result = await tool.execute("edit-props", {
+      id: EDIT_PAGE_ID,
+      props: {
+        Status: "待办",
+        标签: ["键盘", "客制化"],
+        截止日期: "2025-12-31",
+        Done: true,
+      },
+    });
+
+    assert.equal(result.isError, false, text(result));
+    const patches = patchCalls(calls);
+    assert.equal(patches.length, 1);
+    assert.deepEqual(JSON.parse(patches[0][5]), {
+      properties: {
+        Status: { status: { name: "待办" } },
+        标签: { multi_select: [{ name: "键盘" }, { name: "客制化" }] },
+        截止日期: { date: { start: "2025-12-31" } },
+        Done: { checkbox: true },
+      },
+    });
+    assert.deepEqual(result.details.properties, ["Status", "标签", "截止日期", "Done"]);
+    assert.deepEqual(result.details.changed, ["properties"]);
+  });
+
+  it("edits an icon-only page with exactly one PATCH and no property map", async () => {
+    const { tool, calls } = editHarness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}` && args[3] !== "PATCH") {
+        return pageWithParent(PAGE_PARENT);
+      }
+      if (args[0] === "api" && args[2] === "-X") return ntnOk({ object: "page", id: EDIT_PAGE_ID });
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    });
+
+    const result = await tool.execute("edit-icon-only", {
+      id: EDIT_PAGE_ID,
+      icon: "🎯",
+    });
+
+    assert.equal(result.isError, false, text(result));
+    const patches = patchCalls(calls);
+    assert.equal(patches.length, 1, "an icon-only edit is exactly one PATCH");
+    assert.equal("properties" in patchBody(calls), false);
+    assert.deepEqual(patchBody(calls), { icon: { type: "emoji", emoji: "🎯" } });
+    assert.deepEqual(result.details.changed, ["icon"]);
+    assert.deepEqual(result.details.properties, []);
+  });
+
+  it("updates the title property when only title is given", async () => {
+    const { tool, calls } = editHarness(propsScript());
+
+    const result = await tool.execute("edit-title", { id: EDIT_PAGE_ID, title: "改名" });
+
+    assert.equal(result.isError, false, text(result));
+    assert.deepEqual(JSON.parse(patchCalls(calls)[0][5]), {
+      properties: { Name: { title: [{ type: "text", text: { content: "改名" } }] } },
+    });
+    assert.deepEqual(result.details.changed, ["title"]);
+  });
+
+  it("rejects unknown property names and lists writable columns", async () => {
+    const { tool, calls } = editHarness(propsScript());
+
+    const result = await tool.execute("edit-unknown-prop", {
+      id: EDIT_PAGE_ID,
+      props: { 不存在的列: "x" },
+    });
+
+    assert.equal(result.isError, true);
+    assert.equal(patchCalls(calls).length, 0, "no property write may run for an unknown property");
+    assert.match(result.content[0].text, /未知属性/);
+    assert.ok(
+      (result.details.hint_properties ?? []).some((hint: { name: string }) => hint.name === "Name")
+    );
+  });
+
+  it("writes props.icon as the real column when the data source has one", async () => {
+    const { tool, calls } = editHarness(propsScript(ICON_COLUMN_SCHEMA));
+    const result = await tool.execute("edit-icon-column", {
+      id: EDIT_PAGE_ID,
+      props: { icon: "列值" },
+    });
+    assert.equal(result.isError, false, text(result));
+    assert.deepEqual(patchBody(calls), {
+      properties: { icon: { rich_text: [{ type: "text", text: { content: "列值" } }] } },
+    });
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * edit: combined content + properties + move, and failure debt
+ * ------------------------------------------------------------------ */
+
+describe("notion_page_edit: combined operations and failure debt", () => {
+  /**
+   * A page with a data-source parent and one target parent page.
+   * `failPatch` / `failMove` let a test make the LATER step fail after content
+   * has already landed.
+   */
+  function combinedScript(options: {
+    failPatch?: boolean;
+    failMove?: boolean;
+  } = {}): (args: string[]) => RunNtnResult {
+    return (args) => {
+      const path = String(args[1] ?? "");
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}` && args[3] !== "PATCH") {
+        return pageWithParent(DS_PARENT);
+      }
+      if (args[0] === "api" && args[1] === `v1/pages/${NEW_PAGE_ID}` && args[3] !== "PATCH") {
+        return pageWithParent(PAGE_PARENT);
+      }
+      if (args[0] === "api" && args[1] === `v1/pages/${ACCEPTANCE.parentPageId}` && args[3] !== "PATCH") {
+        return pageWithParent({ type: "workspace", workspace: true });
+      }
+      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
+        return ntnOk(DATA_SOURCE_SCHEMA);
+      }
+      if (args[0] === "api" && path.endsWith("/markdown")) {
+        return markdownOk("# 标题\n\n新的正文");
+      }
+      if (args[0] === "api" && path.endsWith("/move")) {
+        if (options.failMove) return ntnFail("move rejected");
+        return ntnOk({ object: "page", id: EDIT_PAGE_ID, parent: PAGE_PARENT });
+      }
+      if (args[0] === "api" && args[2] === "-X") {
+        if (options.failPatch) return ntnFail("property write rejected");
+        return ntnOk({ object: "page", id: EDIT_PAGE_ID });
+      }
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    };
+  }
+
+  /** Index of a call the script would make, found by predicate. */
+  function indexOfCall(calls: string[][], predicate: (args: string[]) => boolean): number {
+    return calls.findIndex(predicate);
+  }
+
+  it("applies content, then properties, then the move, in that fixed order", async () => {
+    const { tool, calls } = editHarness(combinedScript());
+
+    const result = await tool.execute("edit-combined", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "旧的", new_str: "新的" }],
+      props: { Done: true },
+      parent: `page:${NEW_PAGE_ID}`,
+    });
+
+    assert.equal(result.isError, false, text(result));
+    const contentAt = indexOfCall(calls, (args) => String(args[1]).endsWith("/markdown"));
+    const propsAt = indexOfCall(calls, (args) => args[3] === "PATCH" && !String(args[1]).endsWith("/markdown"));
+    const moveAt = indexOfCall(calls, (args) => String(args[1]).endsWith("/move"));
+    assert.ok(contentAt >= 0, "content edit must run");
+    assert.ok(propsAt >= 0, "property PATCH must run");
+    assert.ok(moveAt >= 0, "move must run");
+    // Content first is the user's explicit choice: a move can change the parent,
+    // which can change which data source the property schema comes from.
+    assert.ok(contentAt < propsAt, `content (${contentAt}) must precede properties (${propsAt})`);
+    assert.ok(propsAt < moveAt, `properties (${propsAt}) must precede the move (${moveAt})`);
+    assert.deepEqual(result.details.changed, ["body_content", "properties", "parent"]);
+  });
+
+  it("discloses that content already landed when the property PATCH fails", async () => {
+    // THE most important new test. The old design's sin was reporting a plain
+    // failure when a write had already happened: the model retried or gave up
+    // believing the page was untouched. A failure after content landed must say so.
+    const { tool, calls } = editHarness(combinedScript({ failPatch: true }));
+
+    const result = await tool.execute("edit-debt-patch", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "旧的", new_str: "新的" }],
+      props: { Done: true },
+    });
+
+    assert.equal(result.isError, true);
+    // The content request DID happen and is not rolled back (find-replace cannot be).
+    assert.equal(markdownCalls(calls).length, 1);
+    assert.match(result.content[0].text, /property write rejected/);
+    // The message must state what already landed, and which step failed.
+    assert.match(text(result), /已经生效的部分：内容/);
+    // The count is the actual value the model needs to judge a retry: 1 of 1 edits.
+    assert.match(text(result), /内容（1\/1 条 edits）/);
+    assert.match(text(result), /失败的是：属性/);
+    assert.match(text(result), /不会回滚/);
+    // Structured: `partial` + the applied steps, mirroring the create-rollback details.
+    assert.equal(result.details.partial, true);
+    assert.deepEqual(result.details.applied, ["内容（1/1 条 edits）"]);
+    assert.match(String(result.details.failed_step), /属性/);
+  });
+
+  it("discloses that content and properties already landed when the move fails", async () => {
+    // Same rule one step later: after a content edit succeeds and a property PATCH
+    // succeeds, a failed move must report BOTH as already applied.
+    const { tool, calls } = editHarness(combinedScript({ failMove: true }));
+
+    const result = await tool.execute("edit-debt-move", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "旧的", new_str: "新的" }],
+      props: { Done: true },
       parent: `page:${NEW_PAGE_ID}`,
     });
 
     assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /不能挂到自己下面/);
-    assert.equal(calls.some((args) => args.includes("/move")), false);
-    assert.equal(calls.length, 1);
+    assert.equal(markdownCalls(calls).length, 1);
+    assert.equal(patchCalls(calls).length, 1);
+    assert.match(result.content[0].text, /move rejected/);
+    // Both earlier writes are named, in the order they were applied.
+    assert.match(text(result), /已经生效的部分：内容（1\/1 条 edits）、属性（Done）/);
+    assert.match(text(result), /失败的是：移动页面/);
+    assert.equal(result.details.partial, true);
+    assert.deepEqual(result.details.applied, ["内容（1/1 条 edits）", "属性（Done）"]);
+    assert.match(String(result.details.failed_step), /移动页面/);
   });
 
-  it("refuses a deep page cycle (A→B→A) before moving", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${NEW_PAGE_ID}`) {
-        return pageWithParent({ type: "page_id", page_id: ACCEPTANCE.parentPageId });
+  it("reports a clean failure with no debt when the content request itself fails", async () => {
+    // The mirror case: nothing landed, so nothing may be claimed as applied.
+    const { tool } = editHarness((args) => {
+      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}` && args[3] !== "PATCH") {
+        return pageWithParent(PAGE_PARENT);
       }
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
-        return pageWithParent({ type: "page_id", page_id: NEW_PAGE_ID });
+      if (args[0] === "api" && String(args[1]).endsWith("/markdown")) {
+        return ntnFail("500 boom");
       }
       return ntnFail(`unexpected call: ${args.join(" ")}`);
     });
 
-    const result = await tool.execute("call-51", {
-      action: "attach",
-      id: NEW_PAGE_ID,
-      parent: `page:${EDIT_PAGE_ID}`,
+    const result = await tool.execute("edit-debt-none", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "a", new_str: "b" }],
     });
 
     assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /会形成环/);
-    assert.equal(calls.some((args) => args.includes("/move")), false);
-    assert.equal(result.details.cycle, true);
-    assert.deepEqual(result.details.cycle_path, [EDIT_PAGE_ID, NEW_PAGE_ID]);
-  });
-
-  it("refuses a row cycle (A→B→A) before writing the relation", async () => {
-    const { tool, calls } = rowHarness({
-      childProps: { "Parent-item": { relation: [{ id: PARENT_ROW_ID }] } },
-    });
-
-    // Attaching PARENT_ROW_ID under OTHER_ROW_ID would close the existing A→B chain.
-    const result = await tool.execute("call-52", {
-      action: "attach",
-      id: PARENT_ROW_ID,
-      parent: OTHER_ROW_ID,
-    });
-
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /会形成 Parent-item 环/);
-    assert.equal(calls.some((args) => args[2] === "-X"), false);
-  });
-
-  it("refuses to overwrite a different Parent-item parent without yes:true", async () => {
-    const { tool, calls } = rowHarness({
-      childProps: { "Parent-item": { relation: [{ id: OTHER_PARENT_ID }] } },
-    });
-
-    const result = await tool.execute("call-53", {
-      action: "attach",
-      id: OTHER_ROW_ID,
-      parent: PARENT_ROW_ID,
-    });
-
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /yes: true/);
-    assert.deepEqual(result.details.current_parent_ids, [OTHER_PARENT_ID]);
-    assert.equal(result.details.overwrite, true);
-    assert.equal(calls.some((args) => args[2] === "-X"), false);
-  });
-
-  it("overwrites the Parent-item parent with yes:true (replacing, not merging)", async () => {
-    const { tool, calls } = rowHarness({
-      childProps: { "Parent-item": { relation: [{ id: OTHER_PARENT_ID }] } },
-    });
-
-    const result = await tool.execute("call-54", {
-      action: "attach",
-      id: OTHER_ROW_ID,
-      parent: PARENT_ROW_ID,
-      yes: true,
-    });
-
-    assert.equal(result.isError, false, result.content[0].text);
-    const patch = calls.find((args) => args[2] === "-X") ?? [];
-    assert.deepEqual(JSON.parse(patch[5]), {
-      properties: { "Parent-item": { relation: [{ id: PARENT_ROW_ID }] } },
-    });
-    assert.deepEqual(result.details.replaced_parent_ids, [OTHER_PARENT_ID]);
-    assert.deepEqual(result.details.changed, ["parent_item_relation"]);
-  });
-
-  it("treats attaching to the same parent as an idempotent no-op", async () => {
-    const { tool, calls } = rowHarness({
-      childProps: { "Parent-item": { relation: [{ id: PARENT_ROW_ID }] } },
-    });
-
-    const result = await tool.execute("call-55", {
-      action: "attach",
-      id: OTHER_ROW_ID,
-      parent: PARENT_ROW_ID,
-    });
-
-    assert.equal(result.isError, false, result.content[0].text);
-    assert.equal(result.details.already_linked, true);
-    assert.deepEqual(result.details.changed, []);
-    assert.equal(calls.some((args) => args[2] === "-X"), false);
-  });
-
-  it("treats a multi-parent relation containing the target as an overwrite, not a no-op", async () => {
-    const { tool, calls } = rowHarness({
-      childProps: {
-        "Parent-item": { relation: [{ id: PARENT_ROW_ID }, { id: OTHER_PARENT_ID }] },
-      },
-    });
-
-    const refused = await tool.execute("call-55b", {
-      action: "attach",
-      id: OTHER_ROW_ID,
-      parent: PARENT_ROW_ID,
-    });
-    assert.equal(refused.isError, true);
-    assert.deepEqual(refused.details.current_parent_ids, [PARENT_ROW_ID, OTHER_PARENT_ID]);
-
-    const replaced = await tool.execute("call-55c", {
-      action: "attach",
-      id: OTHER_ROW_ID,
-      parent: PARENT_ROW_ID,
-      yes: true,
-    });
-    assert.equal(replaced.isError, false, replaced.content[0].text);
-    const patch = calls.find((args) => args[2] === "-X") ?? [];
-    assert.deepEqual(JSON.parse(patch[5]), {
-      properties: { "Parent-item": { relation: [{ id: PARENT_ROW_ID }] } },
-    });
-    assert.deepEqual(replaced.details.replaced_parent_ids, [PARENT_ROW_ID, OTHER_PARENT_ID]);
-  });
-
-  it("writes the named Parent item column, never the Sub-item dual", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${PARENT_ROW_ID}`) return pageWithProps(DS_PARENT, {});
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(DUAL_RELATION_SCHEMA);
-      }
-      if (args[0] === "api" && args[1] === `v1/pages/${OTHER_ROW_ID}`) return pageWithProps(DS_PARENT, {});
-      if (args[0] === "pages" && args[1] === "create") return pageCreateResponse(NEW_PAGE_ID);
-      if (args[0] === "api" && args[2] === "-X") return ntnOk({ object: "page", id: OTHER_ROW_ID });
-      return ntnFail(`unexpected call: ${args.join(" ")}`);
-    });
-
-    const attach = await tool.execute("call-55d", {
-      action: "attach",
-      id: OTHER_ROW_ID,
-      parent: PARENT_ROW_ID,
-    });
-    assert.equal(attach.isError, false, attach.content[0].text);
-    assert.equal(attach.details.parent_item_property, ACCEPTANCE.parentItemColumn);
-    const patch = calls.find((args) => args[2] === "-X") ?? [];
-    const body = JSON.parse(patch[5]).properties;
-    assert.deepEqual(Object.keys(body), [ACCEPTANCE.parentItemColumn]);
-    assert.equal("Sub-item" in body, false);
-
-    const created = await tool.execute("call-55e", {
-      action: "create",
-      parent: PARENT_ROW_ID,
-      props: { body_content: "# Child" },
-    });
-    assert.equal(created.isError, false, created.content[0].text);
-    const createPatch = calls.filter((args) => args[2] === "-X").at(-1) ?? [];
-    const createdBody = JSON.parse(createPatch[5]).properties;
-    assert.deepEqual(createdBody[ACCEPTANCE.parentItemColumn], {
-      relation: [{ id: PARENT_ROW_ID }],
-    });
-    assert.equal("Sub-item" in createdBody, false);
-  });
-
-  it("refuses when an ancestor row cannot be read (cannot prove there is no cycle)", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${PARENT_ROW_ID}`) {
-        // The parent row's own ancestor exists but cannot be read.
-        return pageWithProps(DS_PARENT, { "Parent-item": { relation: [{ id: OTHER_PARENT_ID }] } });
-      }
-      if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
-        return ntnOk(SELF_RELATION_SCHEMA);
-      }
-      if (args[0] === "api" && args[1] === `v1/pages/${OTHER_ROW_ID}`) {
-        return pageWithProps(DS_PARENT, {});
-      }
-      if (args[0] === "api" && args[1] === `v1/pages/${OTHER_PARENT_ID}`) {
-        return ntnFail("insufficient permissions");
-      }
-      return ntnOk({});
-    });
-
-    const result = await tool.execute("call-56", {
-      action: "attach",
-      id: OTHER_ROW_ID,
-      parent: PARENT_ROW_ID,
-      yes: true,
-    });
-
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /无法读取祖先行/);
-    assert.equal(result.details.cycle_check, "unreadable");
-    assert.equal(calls.some((args) => args[2] === "-X"), false);
-  });
-});
-
-describe("notion_page child enumeration must be complete or refuse", () => {
-  /** A page whose children endpoint answers with the given body. */
-  function harnessWithChildren(body: string) {
-    return harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
-        return ntnOk({ object: "page", id: EDIT_PAGE_ID, archived: false, parent: DS_PARENT });
-      }
-      if (args[0] === "api" && args[1] === `v1/blocks/${EDIT_PAGE_ID}/children`) {
-        return ntnOk(body);
-      }
-      if (args[0] === "pages" && args[1] === "trash") return ntnOk("trashed");
-      return ntnFail(`unexpected: ${args.join(" ")}`);
-    });
-  }
-
-  it("refuses when the children response is not JSON, instead of assuming no children", async () => {
-    const { tool, calls } = harnessWithChildren('warning: retried\n{"results":[]}');
-    const result = await tool.execute("call-enum-1", {
-      action: "trash",
-      id: EDIT_PAGE_ID,
-      yes: true,
-    });
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /无法解析|拒绝删除/);
-    // Fail closed: the delete must not happen on a read we could not parse.
-    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
-  });
-
-  it("refuses when has_more is true but no cursor is offered", async () => {
-    const { tool, calls } = harnessWithChildren(
-      JSON.stringify({ results: [{ id: "x", type: "paragraph" }], has_more: true })
-    );
-    const result = await tool.execute("call-enum-2", {
-      action: "trash",
-      id: EDIT_PAGE_ID,
-      yes: true,
-    });
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /next_cursor|拒绝删除/);
-    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
-  });
-
-  it("counts an inline child database as subtree content", async () => {
-    const { tool, calls } = harnessWithChildren(
-      JSON.stringify({
-        results: [{ id: "db1", type: "child_database", child_database: { title: "Inline DB" } }],
-        has_more: false,
-      })
-    );
-    const result = await tool.execute("call-enum-3", {
-      action: "trash",
-      id: EDIT_PAGE_ID,
-      yes: true,
-    });
-    assert.equal(result.isError, true);
-    assert.deepEqual(result.details.children, ["db1"]);
-    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
-  });
-
-  it("reports a nesting container, but not a table (which every row also marks)", async () => {
-    const { tool } = harnessWithChildren(
-      JSON.stringify({
-        results: [
-          { id: "tbl", type: "table", has_children: true, table: {} },
-          { id: "tgl", type: "toggle", has_children: true, toggle: {} },
-        ],
-        has_more: false,
-      })
-    );
-    const result = await tool.execute("call-enum-4", {
-      action: "trash",
-      id: EDIT_PAGE_ID,
-      yes: true,
-    });
-    assert.equal(result.isError, true);
-    // A table would refuse every ordinary page, so only the toggle is subtree content.
-    assert.deepEqual(result.details.children, ["tgl"]);
-  });
-});
-
-describe("notion_page trash target classification", () => {
-  it("refuses a target that no probe can read, instead of trashing it", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1]?.startsWith("v1/pages/")) return ntnFail("404 not found");
-      if (args[0] === "api" && args[1]?.startsWith("v1/databases/")) return ntnFail("404 not found");
-      if (args[0] === "api" && args[1]?.startsWith("v1/data_sources/")) return ntnFail("404 not found");
-      return ntnFail(`unexpected: ${args.join(" ")}`);
-    });
-
-    const result = await tool.execute("call-miss-1", {
-      action: "trash",
-      id: EDIT_PAGE_ID,
-      yes: true,
-    });
-
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /不存在|没有被当前/);
-    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
-  });
-
-  it("stops when a probe fails for a non-404 reason, rather than guessing the type", async () => {
-    // An auth/timeout failure says nothing about the object kind: continuing would
-    // risk deleting something we could not even read.
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1]?.startsWith("v1/pages/")) {
-        return ntnFail("401 Unauthorized: invalid API token");
-      }
-      return ntnFail(`unexpected: ${args.join(" ")}`);
-    });
-
-    const result = await tool.execute("call-auth-1", {
-      action: "trash",
-      id: EDIT_PAGE_ID,
-      yes: true,
-    });
-
-    assert.equal(result.isError, true);
-    // This path rethrows the ntn failure, so the code is NTN_FAILED and the message
-    // carries exactly one prefix (a nested [INVALID_INPUT] would mean the auth failure
-    // was rewritten as the caller's mistake).
-    assert.match(result.content[0].text, /^Error: \[NTN_FAILED\] /);
-    assert.equal((result.content[0].text.match(/\[[A-Z_]+\]/g) ?? []).length, 1);
-    assert.match(result.content[0].text, /invalid API token/);
-    // Only the first probe ran; no fallthrough to database/data-source, no trash.
-    assert.equal(calls.filter((args) => args[0] === "api").length, 1);
-    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
-  });
-
-  it("treats Notion's wrong-kind 400 as 'try the next probe', so a database is still refused", async () => {
-    const { tool } = harness((args) => {
-      if (args[0] === "api" && args[1]?.startsWith("v1/pages/")) {
-        return ntnFail("400 validation_error: Provided ID abc is a database, not a page.");
-      }
-      if (args[0] === "api" && args[1]?.startsWith("v1/databases/")) return ntnOk({ object: "database" });
-      return ntnFail(`unexpected: ${args.join(" ")}`);
-    });
-
-    const result = await tool.execute("call-wrongkind-1", {
-      action: "trash",
-      id: EDIT_PAGE_ID,
-      yes: true,
-    });
-
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /cannot delete a database/);
-  });
-});
-
-describe("notion_page trash guards", () => {
-  it("refuses to trash a database even with yes:true", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) return ntnFail("404 page not found");
-      if (args[0] === "api" && args[1] === `v1/databases/${EDIT_PAGE_ID}`) return ntnOk({ object: "database" });
-      return ntnFail(`unexpected: ${args.join(" ")}`);
-    });
-
-    const result = await tool.execute("call-db-1", {
-      action: "trash",
-      id: EDIT_PAGE_ID,
-      yes: true,
-    });
-
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /cannot delete a database/);
-    assert.match(result.content[0].text, /delete it in Notion/);
-    // The refusal must happen before any trash call.
-    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
-  });
-
-  it("refuses to trash a data source, which is also a database-level object", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1]?.startsWith("v1/pages/")) return ntnFail("404");
-      if (args[0] === "api" && args[1]?.startsWith("v1/databases/")) return ntnFail("404");
-      if (args[0] === "api" && args[1]?.startsWith("v1/data_sources/")) return ntnOk({ object: "data_source" });
-      return ntnFail(`unexpected: ${args.join(" ")}`);
-    });
-
-    const result = await tool.execute("call-ds-1", {
-      action: "trash",
-      id: EDIT_PAGE_ID,
-      yes: true,
-    });
-
-    assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /cannot delete a database/);
-    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
-  });
-
-  it("treats an already-archived page as success instead of a 400", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
-        return ntnOk({ object: "page", id: EDIT_PAGE_ID, archived: true, parent: DS_PARENT });
-      }
-      return ntnFail(`unexpected: ${args.join(" ")}`);
-    });
-
-    const result = await tool.execute("call-arch-1", {
-      action: "trash",
-      id: EDIT_PAGE_ID,
-      yes: true,
-    });
-
-    assert.equal(result.isError, false, result.content[0].text);
-    // Nothing was written, so nothing is claimed as changed.
-    assert.deepEqual(result.details.changed, []);
-    assert.equal(result.details.already_archived, true);
-    assert.match(result.content[0].text, /本来就在回收站/);
-    // Idempotent: no trash call was needed.
-    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
-  });
-
-  it("refuses a page with child pages and lists them, unless recursive:true", async () => {
-    const childA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const childB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-    let trashed = false;
-    const { tool } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
-        return ntnOk({ object: "page", id: EDIT_PAGE_ID, archived: false, parent: DS_PARENT });
-      }
-      if (args[0] === "api" && args[1] === `v1/blocks/${EDIT_PAGE_ID}/children`) {
-        return ntnOk({
-          results: [
-            { id: childA, type: "child_page", child_page: { title: "Child A" } },
-            { id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", type: "paragraph" },
-            { id: childB, type: "child_page", child_page: { title: "Child B" } },
-          ],
-          has_more: false,
-        });
-      }
-      if (args[0] === "pages" && args[1] === "trash") {
-        trashed = true;
-        return ntnOk("trashed");
-      }
-      return ntnFail(`unexpected: ${args.join(" ")}`);
-    });
-
-    const refused = await tool.execute("call-child-1", {
-      action: "trash",
-      id: EDIT_PAGE_ID,
-      yes: true,
-    });
-    assert.equal(refused.isError, true);
-    assert.match(refused.content[0].text, /子页面/);
-    assert.match(refused.content[0].text, /recursive/);
-    assert.deepEqual(refused.details.children, [childA, childB]);
-    assert.equal(trashed, false);
-
-    // `recursive` widens what may be deleted; it is not consent to delete. Without
-    // `yes:true` the call must still be refused before touching ntn.
-    const recursiveOnly = await tool.execute("call-child-0", {
-      action: "trash",
-      id: EDIT_PAGE_ID,
-      recursive: true,
-    });
-    assert.equal(recursiveOnly.isError, true);
-    assert.match(recursiveOnly.content[0].text, /yes/);
-    assert.equal(trashed, false);
-
-    const withRecursive = await tool.execute("call-child-2", {
-      action: "trash",
-      id: EDIT_PAGE_ID,
-      yes: true,
-      recursive: true,
-    });
-    assert.equal(withRecursive.isError, false, withRecursive.content[0].text);
-    assert.equal(trashed, true);
-  });
-
-  it("does not require recursive when the page has no child pages", async () => {
-    const { tool } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
-        return ntnOk({ object: "page", id: EDIT_PAGE_ID, archived: false, parent: DS_PARENT });
-      }
-      if (args[0] === "api" && args[1] === `v1/blocks/${EDIT_PAGE_ID}/children`) {
-        return ntnOk({ results: [{ id: "x", type: "paragraph" }], has_more: false });
-      }
-      if (args[0] === "pages" && args[1] === "trash") return ntnOk("trashed");
-      return ntnFail(`unexpected: ${args.join(" ")}`);
-    });
-
-    const result = await tool.execute("call-child-3", {
-      action: "trash",
-      id: EDIT_PAGE_ID,
-      yes: true,
-    });
-    assert.equal(result.isError, false, result.content[0].text);
-  });
-});
-
-describe("notion_page trash", () => {
-  it("rejects a malformed id without building an API path", async () => {
-    const { tool, calls } = harness();
-
-    const result = await tool.execute("call-28", {
-      action: "trash",
-      id: "abc/../blocks?x=1",
-      yes: true,
-    });
-
-    assert.equal(result.isError, true);
-    assert.equal(calls.length, 0);
-    assert.match(result.content[0].text, /id 无效/);
-  });
-
-  it("refuses trash without yes:true and never calls ntn", async () => {
-    const { tool, calls } = harness();
-
-    const result = await tool.execute("call-29", { action: "trash", id: EDIT_PAGE_ID });
-
-    assert.equal(result.isError, true);
-    assert.equal(calls.length, 0);
-    assert.match(result.content[0].text, /yes: true/);
-  });
-
-  it("trashes a page with no children: classifies, then trashes", async () => {
-    const { tool, calls } = harness((args) => {
-      if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}`) {
-        return pageWithParent(DS_PARENT);
-      }
-      if (args[0] === "api" && args[1] === `v1/blocks/${EDIT_PAGE_ID}/children`) {
-        return ntnOk({ results: [], has_more: false });
-      }
-      if (args[0] === "pages" && args[1] === "trash") return ntnOk("trashed");
-      return ntnFail(`unexpected: ${args.join(" ")}`);
-    });
-
-    const result = await tool.execute("call-30", {
-      action: "trash",
-      id: EDIT_PAGE_ID,
-      yes: true,
-    });
-
-    assert.equal(result.isError, false, result.content[0].text);
-    assert.deepEqual(calls.at(-1), ["pages", "trash", EDIT_PAGE_ID, "--yes"]);
-    assert.deepEqual(result.details.changed, ["trashed"]);
+    assert.match(result.content[0].text, /500 boom/);
+    assert.notEqual(result.details.content_applied, true);
   });
 });

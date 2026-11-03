@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Notion Tools",
-    "description": "Four consolidated Notion tools (search, get, page, query) over the official ntn CLI."
+    "description": "Six consolidated Notion tools (search, get, query, page_create, page_edit, page_trash) over the official ntn CLI."
   }
 }

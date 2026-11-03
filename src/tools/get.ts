@@ -53,7 +53,7 @@ export type PropertyInfo = {
   relation_data_source_id?: string;
   /** True when the relation points at the data source that owns it. */
   self_relation?: boolean;
-  /** Heuristic: the column notion_page attach/child-row create would write. */
+  /** Heuristic: the column notion_page_edit's parent / child-row create would write. */
   parent_item_candidate?: boolean;
 };
 
@@ -512,7 +512,7 @@ function readProperties(parsed: Record<string, unknown>, dataSourceId?: string):
     });
   }
 
-  // Same selector notion_page uses for attach / child-row create, so the advertised
+  // Same selector notion_page_edit uses for parent / child-row create, so the advertised
   // Parent-item column and the written column can never diverge.
   const selected = dataSourceId
     ? selectParentItemProperty(entries, dataSourceId)
@@ -629,7 +629,7 @@ function renderDatabaseText(result: NotionDatabaseResult): string {
 
   if (result.parent_item_candidates && result.parent_item_candidates.length > 0) {
     lines.push(
-      "Parent-item candidates (use one with notion_page attach / a child-row create): " +
+      "Parent-item candidates (use one with notion_page_edit parent / a child-row create): " +
         result.parent_item_candidates
           .map((candidate) => `${candidate.property} (data source ${candidate.data_source_id})`)
           .join(", ")

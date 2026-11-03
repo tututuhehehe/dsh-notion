@@ -109,7 +109,7 @@ export const DUAL_RELATION_SCHEMA = {
   },
 } as const;
 
-/** Acceptance schema with a real column literally named body_content (reserved-key conflict). */
+/** Acceptance schema with a real column literally named body_content. */
 export const BODY_COLUMN_SCHEMA = {
   object: "data_source",
   id: ACCEPTANCE.dataSourceId,
@@ -119,7 +119,7 @@ export const BODY_COLUMN_SCHEMA = {
   },
 } as const;
 
-/** Acceptance schema with a real column literally named icon (reserved-key conflict). */
+/** Acceptance schema with a real column literally named icon. */
 export const ICON_COLUMN_SCHEMA = {
   object: "data_source",
   id: ACCEPTANCE.dataSourceId,

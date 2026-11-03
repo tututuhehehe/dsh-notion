@@ -15,7 +15,11 @@ import {
   validateJsonSchemaValue,
 } from "./fixtures/dsh-json-schema.ts";
 import { createNotionGetTool } from "../src/tools/get.ts";
-import { createNotionPageTool } from "../src/tools/page.ts";
+import {
+  createNotionPageCreateTool,
+  createNotionPageEditTool,
+  createNotionPageTrashTool,
+} from "../src/tools/page.ts";
 import { createNotionQueryTool } from "../src/tools/query.ts";
 import { createNotionSearchTool } from "../src/tools/search.ts";
 
@@ -24,7 +28,9 @@ const inertRun = async () => ({ ok: true, stdout: "{}", stderr: "", code: 0 });
 const DEFINITIONS = [
   createNotionSearchTool({ run: inertRun }),
   createNotionGetTool(inertRun),
-  createNotionPageTool({ runNtn: inertRun }),
+  createNotionPageCreateTool({ runNtn: inertRun }),
+  createNotionPageEditTool({ runNtn: inertRun }),
+  createNotionPageTrashTool({ runNtn: inertRun }),
   createNotionQueryTool({ runNtn: inertRun }),
 ];
 
@@ -62,6 +68,97 @@ describe("DSH schema compliance", () => {
   });
 });
 
+/* ------------------------------------------------------------------ *
+ * The three-tool split, pinned at the schema level
+ * ------------------------------------------------------------------ */
+
+type ParamSchema = {
+  properties: Record<string, any>;
+  required?: string[];
+  additionalProperties?: boolean;
+};
+
+function paramSchema(tool: { parameters: unknown }): ParamSchema {
+  return tool.parameters as ParamSchema;
+}
+
+describe("the page split is expressible to the model", () => {
+  const create = createNotionPageCreateTool({ runNtn: inertRun });
+  const edit = createNotionPageEditTool({ runNtn: inertRun });
+  const trash = createNotionPageTrashTool({ runNtn: inertRun });
+
+  it("registers three distinct tool names and no combined notion_page", () => {
+    const names = DEFINITIONS.map((tool) => tool.name).sort();
+    assert.deepEqual(names, [
+      "notion_get",
+      "notion_page_create",
+      "notion_page_edit",
+      "notion_page_trash",
+      "notion_query",
+      "notion_search",
+    ]);
+    assert.equal(
+      names.includes("notion_page"),
+      false,
+      "the combined tool must be gone, not merely deprecated"
+    );
+  });
+
+  it("exposes icon and body_content as TOP-LEVEL parameters on create and edit", () => {
+    for (const tool of [create, edit]) {
+      const properties = paramSchema(tool).properties;
+      assert.equal(properties.icon !== undefined, true, `${tool.name} needs a top-level icon`);
+      assert.equal(
+        properties.body_content !== undefined,
+        true,
+        `${tool.name} needs a top-level body_content`
+      );
+      // Both are siblings of title, not props keys.
+      assert.equal(properties.title !== undefined, true);
+    }
+    // The props description says "COLUMNS ONLY" so the model does not put the body in props.
+    assert.match(String(paramSchema(create).properties.props.description), /COLUMNS ONLY/);
+  });
+
+  it("exposes `edits` on edit as an array of {old_str, new_str, replace_all_matches?}", () => {
+    const edits = paramSchema(edit).properties.edits;
+    assert.equal(edits.type, "array");
+    assert.deepEqual(edits.items.required, ["old_str", "new_str"]);
+    assert.deepEqual(Object.keys(edits.items.properties).sort(), [
+      "new_str",
+      "old_str",
+      "replace_all_matches",
+    ]);
+    assert.equal(edits.items.additionalProperties, false);
+  });
+
+  it("never advertises `action` or `confirm_shrink` on any of the three tools", () => {
+    for (const tool of [create, edit, trash]) {
+      const properties = paramSchema(tool).properties;
+      assert.equal("action" in properties, false, `${tool.name} must not take action`);
+      assert.equal(
+        "confirm_shrink" in properties,
+        false,
+        `${tool.name} must not take confirm_shrink`
+      );
+    }
+  });
+
+  it("keeps the runtime-only compat alias props.block_update out of the schema", () => {
+    // `props.block_update` is accepted at runtime (folded into `edits`) but is
+    // deliberately NOT advertised: it is a compat alias, not something to teach.
+    const props = String(paramSchema(edit).properties.props.description);
+    assert.doesNotMatch(props, /block_update/);
+    assert.equal(paramSchema(edit).properties.block_update, undefined);
+  });
+
+  it("requires `yes` on trash, `parent` on create and `id` on edit/trash", () => {
+    assert.deepEqual(paramSchema(trash).required, ["id", "yes"]);
+    assert.deepEqual(paramSchema(create).required, ["parent"]);
+    assert.deepEqual(paramSchema(edit).required, ["id"]);
+  });
+});
+
 describe("output values satisfy their declared schema", () => {
   it("a search result validates", async () => {
     const tool = createNotionSearchTool({
@@ -83,8 +180,8 @@ describe("output values satisfy their declared schema", () => {
     assert.deepEqual(validateJsonSchemaValue(tool.output.schema, result.value, "value"), []);
   });
 
-  it("a page create value validates, including the icon field", async () => {
-    const tool = createNotionPageTool({
+  it("a page create value validates, including created and the icon field", async () => {
+    const tool = createNotionPageCreateTool({
       runNtn: async () => ({
         ok: true,
         stdout: JSON.stringify({ object: "page", id: "11111111-1111-4111-8111-111111111111" }),
@@ -94,7 +191,7 @@ describe("output values satisfy their declared schema", () => {
     });
     const value = {
       ok: true,
-      action: "create",
+      created: true,
       id: "11111111-1111-4111-8111-111111111111",
       properties: [],
       changed: ["icon"],
@@ -102,14 +199,54 @@ describe("output values satisfy their declared schema", () => {
     };
     assert.doesNotThrow(() => assertOutput(tool, value));
   });
+
+  it("an edit value with warnings, the tally and truncated validates", async () => {
+    const tool = createNotionPageEditTool({ runNtn: inertRun });
+    const value = {
+      ok: true,
+      id: "11111111-1111-4111-8111-111111111111",
+      properties: [],
+      changed: ["body_content"],
+      edits_sent: 3,
+      edits_applied: 2,
+      edits_missed: 1,
+      warnings: [{ code: "no_match", message: "No matches found for 'x'" }],
+      truncated: true,
+    };
+    assert.doesNotThrow(() => assertOutput(tool, value));
+  });
+
+  it("rejects a warning entry that is not {code, message}", () => {
+    // The warnings schema is closed; a shape drift there would ship to the model.
+    const tool = createNotionPageEditTool({ runNtn: inertRun });
+    const bad = {
+      ok: true,
+      properties: [],
+      changed: [],
+      warnings: [{ code: "no_match" }],
+    };
+    assert.throws(() => assertOutput(tool, bad));
+  });
+
+  it("rejects an output value that still carries the removed `action` field", () => {
+    // `action` was dropped from the value on purpose; the closed output schema must
+    // refuse to let it back in silently.
+    const tool = createNotionPageCreateTool({ runNtn: inertRun });
+    assert.throws(() =>
+      assertOutput(tool, {
+        ok: true,
+        action: "create",
+        properties: [],
+        changed: [],
+      })
+    );
+  });
 });
 
 describe("argument guards: no internal TypeError may reach the model", () => {
   // The DSH registry does not validate arguments against `parameters`, so a missing or
   // mistyped value would otherwise surface as "Cannot read properties of undefined" —
   // an implementation detail with nothing the caller can act on.
-  const cases: { tool: string; factory: () => ReturnType<typeof createNotionGetTool>; args: Record<string, unknown> }[] = [];
-
   it("notion_get without id_or_url", async () => {
     const result = await mount(createNotionGetTool(inertRun)).execute("c1", {});
     assert.equal(result.isError, true);
@@ -149,15 +286,41 @@ describe("argument guards: no internal TypeError may reach the model", () => {
     assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
   });
 
-  it("notion_page without an action", async () => {
-    const result = await mount(createNotionPageTool({ runNtn: inertRun })).execute("c6", {});
+  it("notion_page_create without parent", async () => {
+    const result = await mount(createNotionPageCreateTool({ runNtn: inertRun })).execute("c6", {});
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+    assert.doesNotMatch(result.content[0].text, /Cannot read|is not a function/);
+  });
+
+  it("notion_page_edit without id", async () => {
+    const result = await mount(createNotionPageEditTool({ runNtn: inertRun })).execute("c7", {});
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+    assert.doesNotMatch(result.content[0].text, /Cannot read|is not a function/);
+  });
+
+  it("notion_page_edit with a non-array edits", async () => {
+    const result = await mount(createNotionPageEditTool({ runNtn: inertRun })).execute("c8", {
+      id: "11111111-1111-4111-8111-111111111111",
+      edits: "old -> new",
+    });
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
   });
 
-  it("notion_page with a non-boolean yes", async () => {
-    const result = await mount(createNotionPageTool({ runNtn: inertRun })).execute("c7", {
-      action: "trash",
+  it("notion_page_edit with an edit entry that is not an object", async () => {
+    const result = await mount(createNotionPageEditTool({ runNtn: inertRun })).execute("c9", {
+      id: "11111111-1111-4111-8111-111111111111",
+      edits: ["plain string"],
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
+    assert.doesNotMatch(result.content[0].text, /Cannot read|is not a function/);
+  });
+
+  it("notion_page_trash with a non-boolean yes", async () => {
+    const result = await mount(createNotionPageTrashTool({ runNtn: inertRun })).execute("c10", {
       id: "11111111-1111-4111-8111-111111111111",
       yes: "maybe",
     });
@@ -168,27 +331,27 @@ describe("argument guards: no internal TypeError may reach the model", () => {
   it("accepts the documented boolean spellings for yes", async () => {
     // "true"/"yes"/1 must all count as consent; only a genuinely false value stops.
     for (const yes of [true, "true", "yes", 1, "1", "YES"]) {
-      const seen: string[][] = [];
-      const tool = createNotionPageTool({
-        runNtn: async (options) => {
-          seen.push(options.args);
+      const tool = createNotionPageTrashTool({
+        runNtn: async (options: { args: string[] }) => {
           if (options.args[0] === "api" && options.args[1]?.startsWith("v1/pages/")) {
             return { ok: true, stdout: JSON.stringify({ archived: false }), stderr: "", code: 0 };
           }
           if (options.args[0] === "api" && options.args[1]?.includes("/children")) {
-            return { ok: true, stdout: JSON.stringify({ results: [], has_more: false }), stderr: "", code: 0 };
+            return {
+              ok: true,
+              stdout: JSON.stringify({ results: [], has_more: false }),
+              stderr: "",
+              code: 0,
+            };
           }
           return { ok: true, stdout: "{}", stderr: "", code: 0 };
         },
       });
-      const result = await mount(tool).execute("c8", {
-        action: "trash",
+      const result = await mount(tool).execute("c11", {
         id: "11111111-1111-4111-8111-111111111111",
         yes,
       });
       assert.equal(result.isError, false, `yes=${JSON.stringify(yes)}: ${result.content[0].text}`);
     }
   });
-
-  void cases;
 });

@@ -1,4 +1,5 @@
-# dsh-notion bundle: registers the four notion_* tools on the DeepSeek Harness Host.
+# dsh-notion bundle: registers the six notion_* tools on the DeepSeek Harness Host
+# (search, get, query, page_create, page_edit, page_trash).
 #
 # Token (never stored here):
 #   - NOTION_API_TOKEN environment variable, or

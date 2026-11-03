@@ -543,7 +543,12 @@ describe("notion_get: databases", () => {
     const body = text(result);
     assert.match(body, /Total: rollup — read-only/);
     assert.match(body, /Parent-item: relation — .*self.*Parent-item candidate/);
-    assert.match(body, /Parent-item candidates \(use one with notion_page attach/);
+    // `attach` no longer exists: re-parenting is now notion_page_edit's `parent`, so the
+    // hint must name a tool the model can actually call.
+    assert.match(
+      body,
+      /Parent-item candidates \(use one with notion_page_edit parent \/ a child-row create/
+    );
   });
 
   it("accepts a database URL", async () => {

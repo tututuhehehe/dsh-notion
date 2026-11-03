@@ -648,7 +648,7 @@ function renderDatabaseText(result) {
   }
   if (result.parent_item_candidates && result.parent_item_candidates.length > 0) {
     lines.push(
-      "Parent-item candidates (use one with notion_page attach / a child-row create): " + result.parent_item_candidates.map((candidate) => `${candidate.property} (data source ${candidate.data_source_id})`).join(", ")
+      "Parent-item candidates (use one with notion_page_edit parent / a child-row create): " + result.parent_item_candidates.map((candidate) => `${candidate.property} (data source ${candidate.data_source_id})`).join(", ")
     );
   }
   if (result.data_sources.length > 1) {
@@ -792,12 +792,6 @@ function reportedDataSourceId(raw, fallback) {
 }
 
 // src/tools/page.ts
-var BODY_CONTENT_KEY = "body_content";
-var ICON_KEY = "icon";
-var PAGE_SCHEMA = {
-  source: "page",
-  properties: /* @__PURE__ */ new Map([["title", { name: "title", type: "title" }]])
-};
 var FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
 var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 var HEX32_RE = /^[0-9a-f]{32}$/i;
@@ -827,6 +821,20 @@ function truncate(text2, max = 1200) {
 function formatParent(parent) {
   return `${parent.kind === "data_source" ? "data-source" : parent.kind}:${parent.id}`;
 }
+function rejectUnexpectedParams(params, allowed, usage) {
+  const unexpected = Object.keys(params).filter(
+    (key) => params[key] !== void 0 && !allowed.includes(key)
+  );
+  if (unexpected.length > 0) {
+    throw new InputError(`${usage} \u591A\u4F59\u7684\u53C2\u6570\uFF1A${unexpected.join(", ")}\u3002`, {
+      unexpected_params: unexpected
+    });
+  }
+}
+var PAGE_SCHEMA = {
+  source: "page",
+  properties: /* @__PURE__ */ new Map([["title", { name: "title", type: "title" }]])
+};
 function writableProperties(schema) {
   return [...schema.properties.values()].filter((prop) => isWritablePropertyType(prop.type)).map((prop) => ({ name: prop.name, type: prop.type }));
 }
@@ -854,8 +862,8 @@ function normalizeIcon(raw) {
     const value = raw.trim();
     if (!value) {
       throw new InputError(
-        `props.${ICON_KEY} \u4E0D\u80FD\u662F\u7A7A\u5B57\u7B26\u4E32\uFF1A\u4E0D\u8BBE\u7F6E icon \u5C31\u7701\u7565\u8FD9\u4E2A\u952E\uFF0C\u6E05\u9664\u5DF2\u6709 icon \u8BF7\u4F20 null\u3002`,
-        { property: ICON_KEY }
+        "icon \u4E0D\u80FD\u662F\u7A7A\u5B57\u7B26\u4E32\uFF1A\u4E0D\u8BBE\u7F6E icon \u5C31\u7701\u7565\u8FD9\u4E2A\u53C2\u6570\uFF0C\u6E05\u9664\u5DF2\u6709 icon \u8BF7\u4F20 null\u3002",
+        { field: "icon" }
       );
     }
     if (HTTP_URL_RE.test(value)) {
@@ -863,8 +871,8 @@ function normalizeIcon(raw) {
     }
     if ([...value].length > MAX_EMOJI_LENGTH) {
       throw new InputError(
-        `props.${ICON_KEY} \u770B\u8D77\u6765\u65E2\u4E0D\u662F emoji \u4E5F\u4E0D\u662F\u56FE\u7247 URL\uFF08\u957F\u5EA6 ${[...value].length}\uFF09\uFF1A${describeValue(value)}\u3002\u8BF7\u4F20\u5355\u4E2A emoji\uFF08\u5982 "\u{1F3AF}"\uFF09\u3001http(s) \u56FE\u7247 URL\uFF0C\u6216 null \u6E05\u9664\u3002`,
-        { property: ICON_KEY, value }
+        `icon \u770B\u8D77\u6765\u65E2\u4E0D\u662F emoji \u4E5F\u4E0D\u662F\u56FE\u7247 URL\uFF08\u957F\u5EA6 ${[...value].length}\uFF09\uFF1A${describeValue(value)}\u3002\u8BF7\u4F20\u5355\u4E2A emoji\uFF08\u5982 "\u{1F3AF}"\uFF09\u3001http(s) \u56FE\u7247 URL\uFF0C\u6216 null \u6E05\u9664\u3002`,
+        { field: "icon", value }
       );
     }
     return { payload: { type: "emoji", emoji: value }, display: value };
@@ -875,8 +883,8 @@ function normalizeIcon(raw) {
       const emoji = typeof raw.emoji === "string" ? raw.emoji.trim() : "";
       if (!emoji) {
         throw new InputError(
-          `props.${ICON_KEY} \u7684 emoji \u5BF9\u8C61\u7F3A\u5C11 emoji \u6587\u672C\uFF1A\u9700\u8981 { "type": "emoji", "emoji": "\u{1F3AF}" }\u3002`,
-          { property: ICON_KEY }
+          'icon \u7684 emoji \u5BF9\u8C61\u7F3A\u5C11 emoji \u6587\u672C\uFF1A\u9700\u8981 { "type": "emoji", "emoji": "\u{1F3AF}" }\u3002',
+          { field: "icon" }
         );
       }
       return { payload: { type: "emoji", emoji }, display: emoji };
@@ -885,8 +893,8 @@ function normalizeIcon(raw) {
       const url = isPlainObject(raw.external) ? raw.external.url : void 0;
       if (typeof url !== "string" || !HTTP_URL_RE.test(url.trim())) {
         throw new InputError(
-          `props.${ICON_KEY} \u7684 external \u5BF9\u8C61\u9700\u8981\u4E00\u4E2A http(s) url\uFF1A{ "type": "external", "external": { "url": "https://\u2026/a.png" } }\u3002`,
-          { property: ICON_KEY }
+          'icon \u7684 external \u5BF9\u8C61\u9700\u8981\u4E00\u4E2A http(s) url\uFF1A{ "type": "external", "external": { "url": "https://\u2026/a.png" } }\u3002',
+          { field: "icon" }
         );
       }
       return { payload: { type: "external", external: { url: url.trim() } }, display: url.trim() };
@@ -895,17 +903,33 @@ function normalizeIcon(raw) {
       return { payload: raw, display: `${String(type)} icon` };
     }
     throw new InputError(
-      `props.${ICON_KEY} \u7684\u5BF9\u8C61\u5F62\u5F0F\u5FC5\u987B\u5E26 type\uFF1A\u63A5\u53D7 "emoji" / "external" / "custom_emoji" / "file"\uFF0C\u6216\u76F4\u63A5\u4F20 emoji \u5B57\u7B26\u4E32\u3001\u56FE\u7247 URL\u3001null\u3002\u6536\u5230 ${describeValue(raw)}\u3002`,
-      { property: ICON_KEY, value: raw }
+      `icon \u7684\u5BF9\u8C61\u5F62\u5F0F\u5FC5\u987B\u5E26 type\uFF1A\u63A5\u53D7 "emoji" / "external" / "custom_emoji" / "file"\uFF0C\u6216\u76F4\u63A5\u4F20 emoji \u5B57\u7B26\u4E32\u3001\u56FE\u7247 URL\u3001null\u3002\u6536\u5230 ${describeValue(raw)}\u3002`,
+      { field: "icon", value: raw }
     );
   }
   throw new InputError(
-    `props.${ICON_KEY} \u5FC5\u987B\u662F emoji \u5B57\u7B26\u4E32\u3001http(s) \u56FE\u7247 URL\u3001\u5DF2\u6784\u597D\u7684 Notion icon \u5BF9\u8C61\uFF0C\u6216 null\uFF08\u6E05\u9664\uFF09\uFF1B\u6536\u5230 ${describeValue(raw)}\u3002`,
-    { property: ICON_KEY, value: raw }
+    `icon \u5FC5\u987B\u662F emoji \u5B57\u7B26\u4E32\u3001http(s) \u56FE\u7247 URL\u3001\u5DF2\u6784\u597D\u7684 Notion icon \u5BF9\u8C61\uFF0C\u6216 null\uFF08\u6E05\u9664\uFF09\uFF1B\u6536\u5230 ${describeValue(raw)}\u3002`,
+    { field: "icon", value: raw }
   );
 }
+function normalizeBody(raw, required) {
+  if (raw === void 0 || raw === null) {
+    if (required) {
+      throw new InputError("body_content \u5FC5\u987B\u662F Markdown \u5B57\u7B26\u4E32\uFF0C\u4E0D\u80FD\u662F null\u3002", {
+        field: "body_content"
+      });
+    }
+    return void 0;
+  }
+  if (typeof raw !== "string") {
+    throw new InputError(`body_content \u5FC5\u987B\u662F Markdown \u5B57\u7B26\u4E32\uFF08\u9875\u9762\u6B63\u6587\uFF09\uFF0C\u6536\u5230 ${describeValue(raw)}\u3002`, {
+      field: "body_content"
+    });
+  }
+  return raw;
+}
 function normalizeProps(raw) {
-  if (raw === void 0 || raw === null) return { hasBody: false };
+  if (raw === void 0 || raw === null) return void 0;
   if (Array.isArray(raw)) {
     throw new InputError(
       'props \u5FC5\u987B\u662F\u5BF9\u8C61 map\uFF08{\u5C5E\u6027\u540D: \u503C}\uFF09\uFF0C\u4E0D\u662F\u6570\u7EC4\u3002\u4F8B\u5982 {"Status":"\u8FDB\u884C\u4E2D","\u6807\u7B7E":["a","b"]}\u3002'
@@ -914,55 +938,8 @@ function normalizeProps(raw) {
   if (!isPlainObject(raw)) {
     throw new InputError(`props \u5FC5\u987B\u662F\u5BF9\u8C61 map\uFF08{\u5C5E\u6027\u540D: \u503C}\uFF09\uFF0C\u6536\u5230 ${describeValue(raw)}\u3002`);
   }
-  const rest = {};
-  let body;
-  let hasBody = false;
-  let icon;
-  for (const [name2, value] of Object.entries(raw)) {
-    if (name2 === BODY_CONTENT_KEY) {
-      hasBody = true;
-      if (value === void 0) continue;
-      if (typeof value !== "string") {
-        throw new InputError(
-          `props.${BODY_CONTENT_KEY} \u5FC5\u987B\u662F Markdown \u5B57\u7B26\u4E32\uFF08\u9875\u9762\u6B63\u6587\uFF09\uFF0C\u6536\u5230 ${describeValue(value)}\u3002`,
-          { property: BODY_CONTENT_KEY }
-        );
-      }
-      body = value;
-      continue;
-    }
-    if (name2 === ICON_KEY) {
-      icon = normalizeIcon(value);
-      continue;
-    }
-    if (value === void 0) continue;
-    rest[name2] = value;
-  }
-  const entries = Object.entries(rest);
-  return {
-    ...entries.length ? { props: Object.fromEntries(entries) } : {},
-    ...body !== void 0 ? { body } : {},
-    hasBody,
-    ...icon ? { icon } : {}
-  };
-}
-function assertReservedKeysAvailable(schema, hasBody, icon) {
-  const conflicts = [
-    ...hasBody && schema.properties.has(BODY_CONTENT_KEY) ? [BODY_CONTENT_KEY] : [],
-    ...icon && schema.properties.has(ICON_KEY) ? [ICON_KEY] : []
-  ];
-  if (conflicts.length === 0) return;
-  const described = conflicts.map(
-    (name2) => name2 === BODY_CONTENT_KEY ? `"${name2}"\uFF08\u4FDD\u7559\u952E\uFF1A\u9875\u9762\u6B63\u6587\uFF09` : `"${name2}"\uFF08\u4FDD\u7559\u952E\uFF1A\u9875\u9762 icon\uFF09`
-  ).join("\u3001");
-  throw new InputError(
-    `data source \u91CC\u5B58\u5728\u540D\u4E3A ${described} \u7684\u771F\u5B9E\u5217\uFF0C\u4E0E\u4FDD\u7559\u952E\u540C\u540D\u3002\u4E0D\u80FD\u540C\u65F6\u5F53\u4F5C\u5217\u540D\u5199\u5165\uFF0C\u8BF7\u5148\u91CD\u547D\u540D\u8BE5\u5217\uFF0C\u6216\u4E0D\u4F7F\u7528\u8BE5\u4FDD\u7559\u952E\uFF1B\u672C\u6B21\u6CA1\u6709\u5199\u5165\u4EFB\u4F55\u5185\u5BB9\u3002`,
-    {
-      conflict: true,
-      reserved_keys: conflicts,
-      ...schema.dataSourceId ? { dataSourceId: schema.dataSourceId } : {}
-    }
-  );
+  const entries = Object.entries(raw).filter(([, value]) => value !== void 0);
+  return entries.length ? Object.fromEntries(entries) : void 0;
 }
 function normalizeTitle(raw) {
   if (raw === void 0 || raw === null) return void 0;
@@ -971,10 +948,10 @@ function normalizeTitle(raw) {
   const title = raw.trim();
   return title || void 0;
 }
-function parseParentSpec(raw, action) {
-  const usage = action === "attach" ? "page:<id>\uFF08\u628A\u9875\u9762\u6302\u5230\u8BE5\u9875\u9762\u4E0B\uFF09\u6216\u7236\u884C id\uFF08\u628A\u884C\u6302\u5230\u7236\u884C\u4E0B\uFF09" : "page:<id>\u3001database:<id>\u3001data-source:<id>\uFF0C\u6216\u6570\u636E\u5E93\u884C id\uFF08\u4F5C\u4E3A\u5B50\u884C\u7236\u7EA7\uFF09";
+function parseParentSpec(raw, op) {
+  const usage = op === "move" ? "page:<id>\uFF08\u628A\u9875\u9762\u6302\u5230\u8BE5\u9875\u9762\u4E0B\uFF09\u6216\u7236\u884C id\uFF08\u628A\u884C\u6302\u5230\u7236\u884C\u4E0B\uFF09" : "page:<id>\u3001database:<id>\u3001data-source:<id>\uFF0C\u6216\u6570\u636E\u5E93\u884C id\uFF08\u4F5C\u4E3A\u5B50\u884C\u7236\u7EA7\uFF09";
   if (typeof raw !== "string" || !raw.trim()) {
-    throw new InputError(`${action} \u9700\u8981 parent\uFF1A${usage}\u3002`);
+    throw new InputError(`${op === "move" ? "\u79FB\u52A8\u9875\u9762\uFF08parent\uFF09" : "create"} \u9700\u8981 parent\uFF1A${usage}\u3002`);
   }
   const value = raw.trim();
   const match = /^(page|database|data[_-]?source)\s*:\s*(.+)$/i.exec(value);
@@ -996,10 +973,10 @@ function parseParentSpec(raw, action) {
   }
   return { bare: false, kind, id };
 }
-function requireId(raw, action) {
+function requireId(raw, op) {
   if (typeof raw !== "string" || !raw.trim()) {
     throw new InputError(
-      `${action} \u9700\u8981 id\uFF1A\u9875\u9762 id\uFF0832 \u4F4D hex \u6216\u5E26\u8FDE\u5B57\u7B26\u7684 UUID\uFF09\u6216\u8BE5\u9875\u9762\u7684 Notion URL\u3002`
+      `${op} \u9700\u8981 id\uFF1A\u9875\u9762 id\uFF0832 \u4F4D hex \u6216\u5E26\u8FDE\u5B57\u7B26\u7684 UUID\uFF09\u6216\u8BE5\u9875\u9762\u7684 Notion URL\u3002`
     );
   }
   const text2 = raw.trim();
@@ -1009,66 +986,6 @@ function requireId(raw, action) {
   throw new InputError(
     `id \u65E0\u6548\uFF1A${describeValue(raw)}\u3002\u53EA\u63A5\u53D7 Notion \u9875\u9762 id\uFF0832 \u4F4D hex / UUID\uFF09\u6216\u8BE5\u9875\u9762\u7684 Notion URL\u3002`
   );
-}
-function withBodyAlias(raw) {
-  const props = raw.props;
-  if (raw.content === void 0) return props === void 0 ? void 0 : props;
-  if (!isPlainObject(props)) {
-    if (props !== void 0) return props;
-    return { body_content: raw.content };
-  }
-  if (props.body_content !== void 0) {
-    throw inputError(
-      "content \u548C props.body_content \u662F\u540C\u4E00\u4E2A\u4E1C\u897F\uFF0C\u4E0D\u8981\u540C\u65F6\u4F20\uFF08\u628A\u6B63\u6587\u5199\u5728\u5176\u4E2D\u4E00\u4E2A\u91CC\u5373\u53EF\uFF09\u3002",
-      { content: raw.content }
-    );
-  }
-  return { ...props, body_content: raw.content };
-}
-function normalizePageArgs(raw, action) {
-  const yes = raw.yes === void 0 ? void 0 : readBoolean(raw.yes, "yes");
-  const props = withBodyAlias(raw);
-  if (action === "trash" && yes !== true) {
-    throw inputError(
-      'trash \u4F1A\u5220\u9664\uFF08\u79FB\u5165\u56DE\u6536\u7AD9\uFF09\u9875\u9762\uFF0C\u5FC5\u987B\u663E\u5F0F\u4F20 yes: true\uFF08\u6216 "true" / "yes" / 1\uFF09\u624D\u4F1A\u8C03\u7528 ntn\uFF1B\u672C\u6B21\u6CA1\u6709\u8C03\u7528 ntn\u3002',
-      { action, yes: raw.yes }
-    );
-  }
-  return {
-    action,
-    ...raw.id === void 0 ? {} : { id: raw.id },
-    ...raw.parent === void 0 ? {} : { parent: raw.parent },
-    ...raw.title === void 0 ? {} : { title: raw.title },
-    ...props === void 0 ? {} : { props },
-    ...yes === void 0 ? {} : { yes },
-    ...raw.recursive === void 0 ? {} : { recursive: readBoolean(raw.recursive, "recursive") },
-    ...raw.confirm_shrink === void 0 ? {} : { confirm_shrink: readBoolean(raw.confirm_shrink, "confirm_shrink") }
-  };
-}
-var ALLOWED_PARAMS = {
-  create: ["action", "parent", "title", "props"],
-  edit: ["action", "id", "title", "props", "confirm_shrink"],
-  attach: ["action", "id", "parent", "yes"],
-  trash: ["action", "id", "yes", "recursive"]
-};
-var UNEXPECTED_PARAMS_MESSAGE = {
-  create: "create \u53EA\u63A5\u53D7 { action, parent, title, props }\uFF08\u6B63\u6587\u5199\u5728 props.body_content\uFF09\u3002",
-  edit: "edit \u53EA\u63A5\u53D7 { action, id, title, props, confirm_shrink }\uFF08\u6B63\u6587\u5199\u5728 props.body_content\uFF09\u3002",
-  attach: "attach \u53EA\u63A5\u53D7 { action, id, parent, yes }\uFF0C\u4E0D\u63A5\u53D7 props/title\uFF08\u4E5F\u5C31\u6CA1\u6709 body_content\uFF09\uFF1B\u6539\u5185\u5BB9\u6216\u6807\u9898\u8BF7\u7528 edit\u3002yes \u53EA\u7528\u4E8E\u540C\u610F\u8986\u76D6\u5DF2\u6709\u7684 Parent-item \u94FE\u63A5\u3002",
-  trash: "trash \u53EA\u63A5\u53D7 { action, id, yes, recursive }\u3002"
-};
-var TOP_LEVEL_BODY_ALIAS = "content";
-function rejectUnexpectedParams(params, action) {
-  const allowed = [...ALLOWED_PARAMS[action], TOP_LEVEL_BODY_ALIAS];
-  const unexpected = Object.keys(params).filter(
-    (key) => params[key] !== void 0 && !allowed.includes(key)
-  );
-  if (unexpected.length > 0) {
-    throw new InputError(
-      `${UNEXPECTED_PARAMS_MESSAGE[action]} \u591A\u4F59\u7684\u53C2\u6570\uFF1A${unexpected.join(", ")}\u3002`,
-      { unexpected_params: unexpected }
-    );
-  }
 }
 function parseJsonMaybe(stdout) {
   try {
@@ -1295,7 +1212,7 @@ async function schemaForPage(runner, pageId) {
   const dataSourceId = await dataSourceIdForParent(runner, parent);
   return fetchDataSourceSchema(runner, dataSourceId);
 }
-async function classifyBareParent(runner, id, action, readPage) {
+async function classifyBareParent(runner, id, op, readPage) {
   let page;
   try {
     page = readPage ? await readPage(id) : await fetchPageObject(runner, id);
@@ -1303,24 +1220,24 @@ async function classifyBareParent(runner, id, action, readPage) {
     if (error instanceof NotionToolError) throw error;
     const detail = error instanceof Error ? error.message : String(error);
     throw new InputError(
-      `\u65E0\u6CD5\u628A ${id} \u5F53\u4F5C parent\uFF1A\u8BFB\u53D6\u5B83\u4F5C\u4E3A\u9875\u9762\u5931\u8D25${detail ? `\uFF08${truncate(detail, 300)}\uFF09` : ""}\u3002${action} \u7684\u88F8 id \u5FC5\u987B\u662F\u9875\u9762\u6216\u6570\u636E\u5E93\u884C\uFF1B\u5982\u679C\u5B83\u662F database \u6216 data source\uFF0C\u8BF7\u5199\u6210 database:<id> / data-source:<id>\u3002`,
+      `\u65E0\u6CD5\u628A ${id} \u5F53\u4F5C parent\uFF1A\u8BFB\u53D6\u5B83\u4F5C\u4E3A\u9875\u9762\u5931\u8D25${detail ? `\uFF08${truncate(detail, 300)}\uFF09` : ""}\u3002${op === "create" ? "create" : "\u79FB\u52A8\u9875\u9762"} \u7684\u88F8 id \u5FC5\u987B\u662F\u9875\u9762\u6216\u6570\u636E\u5E93\u884C\uFF1B\u5982\u679C\u5B83\u662F database \u6216 data source\uFF0C\u8BF7\u5199\u6210 database:<id> / data-source:<id>\u3002`,
       { parent: id }
     );
   }
   const parent = page.parent;
   if (!parent) {
     throw new InputError(
-      `\u65E0\u6CD5\u628A ${id} \u5F53\u4F5C parent\uFF1AGET v1/pages \u6CA1\u6709\u8FD4\u56DE parent\u3002${action} \u7684\u88F8 id \u5FC5\u987B\u662F\u9875\u9762\u6216\u6570\u636E\u5E93\u884C\uFF1B\u5982\u679C\u5B83\u662F database \u6216 data source\uFF0C\u8BF7\u5199\u6210 database:<id> / data-source:<id>\u3002`,
+      `\u65E0\u6CD5\u628A ${id} \u5F53\u4F5C parent\uFF1AGET v1/pages \u6CA1\u6709\u8FD4\u56DE parent\u3002${op === "create" ? "create" : "\u79FB\u52A8\u9875\u9762"} \u7684\u88F8 id \u5FC5\u987B\u662F\u9875\u9762\u6216\u6570\u636E\u5E93\u884C\uFF1B\u5982\u679C\u5B83\u662F database \u6216 data source\uFF0C\u8BF7\u5199\u6210 database:<id> / data-source:<id>\u3002`,
       { parent: id }
     );
   }
   if (parent.kind === "page") return { kind: "page" };
   return { kind: "row", schemaParent: parent };
 }
-async function resolveContainer(runner, raw, action, readPage) {
-  const spec = parseParentSpec(raw, action);
+async function resolveContainer(runner, raw, op, readPage) {
+  const spec = parseParentSpec(raw, op);
   if (spec.bare) {
-    const target = await classifyBareParent(runner, spec.id, action, readPage);
+    const target = await classifyBareParent(runner, spec.id, op, readPage);
     if (target.kind === "page") {
       return { kind: "page", createParent: { kind: "page", id: spec.id }, schema: PAGE_SCHEMA };
     }
@@ -1618,9 +1535,239 @@ function findPageIdInText(text2) {
   const match = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32})/i.exec(text2);
   return match?.[1];
 }
+function pageHasUrl(raw) {
+  return isPlainObject(raw) && typeof raw.url === "string" && raw.url.startsWith("http");
+}
 function pageUrlFromRaw(raw, pageId) {
-  if (isPlainObject(raw) && typeof raw.url === "string" && raw.url.startsWith("http")) return raw.url;
+  if (pageHasUrl(raw)) return raw.url;
   return pageUrl(pageId);
+}
+function describePageValue(value) {
+  const lines = [];
+  if (value.changed.includes("trashed")) {
+    lines.push(`\u5DF2\u628A\u9875\u9762 ${value.id} \u79FB\u5165\u56DE\u6536\u7AD9`);
+    if (value.url) lines.push(`URL: ${value.url}`);
+    return lines.join("\n");
+  }
+  if (value.already_archived) {
+    lines.push(`\u9875\u9762 ${value.id} \u672C\u6765\u5C31\u5728\u56DE\u6536\u7AD9\u91CC\uFF0C\u672C\u6B21\u6CA1\u6709\u6267\u884C\u5220\u9664`);
+    if (value.url) lines.push(`URL: ${value.url}`);
+    lines.push("changed: (none)");
+    return lines.join("\n");
+  }
+  if (value.already_linked) {
+    lines.push(
+      value.parent_item_property ? `\u884C ${value.id} \u5DF2\u7ECF\u5728\u7236\u884C ${value.parent_item_row_id} \u4E0B\uFF08Parent-item \u5217\uFF1A${value.parent_item_property}\uFF09\uFF0C\u65E0\u9700\u6539\u52A8` : `\u9875\u9762 ${value.id} \u5DF2\u7ECF\u6302\u5728 ${value.parent} \u4E0B\uFF0C\u65E0\u9700\u6539\u52A8`
+    );
+    if (value.url) lines.push(`URL: ${value.url}`);
+    lines.push("changed: (none)");
+    return lines.join("\n");
+  }
+  if (value.created) {
+    lines.push(`\u5DF2\u521B\u5EFA\u9875\u9762${value.title ? ` "${value.title}"` : ""}\uFF1A${value.id ?? "(id \u672A\u8FD4\u56DE)"}`);
+  } else if (value.changed.length === 0) {
+    lines.push(`\u9875\u9762 ${value.id} \u6CA1\u6709\u6539\u52A8\uFF08changed: none\uFF09`);
+  } else {
+    const what = describeChanges(value.changed);
+    lines.push(`\u5DF2\u66F4\u65B0\u9875\u9762 ${value.id} \u7684${what}`);
+  }
+  if (value.url) lines.push(`URL: ${value.url}`);
+  if (value.parent) lines.push(`parent: ${value.parent}`);
+  if (value.parent_item_row_id) lines.push(`Parent-item \u2192 ${value.parent_item_row_id}`);
+  if (value.parent_item_property) lines.push(`Parent-item \u5217\uFF1A${value.parent_item_property}`);
+  if (value.replaced_parent_ids?.length) {
+    lines.push(`\u66FF\u6362\u4E86\u539F\u6765\u7684\u7236\u7EA7\uFF1A${value.replaced_parent_ids.join(", ")}`);
+  }
+  if (value.cycle_check === "partial") {
+    lines.push("\u6CE8\u610F\uFF1A\u9875\u9762\u7956\u5148\u94FE\u672A\u80FD\u5B8C\u6574\u8BFB\u53D6\uFF0C\u6DF1\u5C42\u73AF\u68C0\u67E5\u4E3A best-effort\uFF08cycle_check: partial\uFF09");
+  }
+  if (value.properties.length) lines.push(`\u5DF2\u5199\u5165\u5217\uFF1A${value.properties.join(", ")}`);
+  if (value.icon !== void 0) lines.push(`icon: ${value.icon ?? "\uFF08\u5DF2\u6E05\u9664\uFF09"}`);
+  if (value.edits_sent !== void 0) {
+    lines.push(
+      `edits: ${value.edits_applied ?? 0}/${value.edits_sent} \u6761\u5DF2\u5E94\u7528` + ((value.edits_missed ?? 0) > 0 ? `\uFF0C${value.edits_missed} \u6761 old_str \u6CA1\u6709\u5339\u914D\uFF08\u9875\u9762\u5176\u4F59\u90E8\u5206\u672A\u6539\u52A8\uFF0C\u89C1 warnings\uFF09` : "\uFF0C\u5168\u90E8\u5339\u914D")
+    );
+  } else if (value.appended) {
+    lines.push("\u6B63\u6587\u5DF2\u8FFD\u52A0\u5230\u9875\u9762\u672B\u5C3E\uFF08edits \u4E3A\u7A7A + body_content\uFF09");
+  }
+  if (value.warnings) {
+    for (const warning of value.warnings) lines.push(`warning [${warning.code}]: ${warning.message}`);
+  }
+  if (value.truncated) {
+    lines.push(
+      "\u6CE8\u610F\uFF1ANotion \u8FD4\u56DE\u7684 markdown \u88AB\u622A\u65AD\uFF08truncated: true\uFF09\uFF0C\u5B83\u4E0D\u662F\u5B8C\u6574\u9875\u9762\uFF1B\u4E0B\u4E00\u6B21 old_str \u4E0D\u8981\u4EE5\u5B83\u4E3A\u51C6\u3002"
+    );
+  }
+  return lines.join("\n");
+}
+function describeChanges(changed) {
+  const words = {
+    body_content: "\u5185\u5BB9",
+    title: "\u6807\u9898",
+    properties: "\u5C5E\u6027",
+    icon: "icon",
+    parent: "\u7236\u7EA7",
+    parent_item_relation: "Parent-item \u94FE\u63A5"
+  };
+  const ordered = ["body_content", "title", "properties", "icon", "parent", "parent_item_relation"];
+  const described = ordered.filter((key) => changed.includes(key)).map((key) => words[key]);
+  return described.length ? described.join("\u3001") : changed.join("\u3001");
+}
+function pageValue(fields) {
+  return { ok: true, properties: [], ...fields };
+}
+var MAX_CONTENT_UPDATES = 100;
+var MARKDOWN_REQUEST_DEFAULTS = {
+  markdown_version: "v2"
+};
+function readContentEdit(raw, index) {
+  const path = `edits[${index}]`;
+  if (!isPlainObject(raw)) {
+    throw new InputError(
+      `${path} \u5FC5\u987B\u662F { old_str, new_str, replace_all_matches? }\uFF0C\u6536\u5230 ${describeValue(raw)}\u3002`,
+      { field: path, value: raw }
+    );
+  }
+  const unexpected = Object.keys(raw).filter(
+    (key) => raw[key] !== void 0 && !["old_str", "new_str", "replace_all_matches"].includes(key)
+  );
+  if (unexpected.length > 0) {
+    throw new InputError(
+      `${path} \u53EA\u63A5\u53D7 old_str / new_str / replace_all_matches\uFF0C\u591A\u4F59\u5B57\u6BB5\uFF1A${unexpected.join(", ")}\u3002`,
+      { field: path, unexpected_params: unexpected }
+    );
+  }
+  if (typeof raw.old_str !== "string") {
+    throw new InputError(
+      `${path}.old_str \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\uFF08\u8981\u67E5\u627E\u7684\u539F\u6587\uFF09\uFF0C\u6536\u5230 ${describeValue(raw.old_str)}\u3002`,
+      { field: `${path}.old_str`, value: raw.old_str }
+    );
+  }
+  if (raw.old_str === "") {
+    throw new InputError(
+      `${path}.old_str \u4E0D\u80FD\u662F\u7A7A\u5B57\u7B26\u4E32\uFF1ANotion \u4F1A\u62D2\u7EDD\u7A7A old_str\u3002\u8981\u8FFD\u52A0\u5185\u5BB9\u8BF7\u7528 body_content \u4E14\u4E0D\u4F20 edits\u3002`,
+      { field: `${path}.old_str` }
+    );
+  }
+  if (raw.new_str === void 0) {
+    throw new InputError(
+      `${path}.new_str \u662F\u5FC5\u586B\u7684\uFF1A\u66FF\u6362\u6210\u4EC0\u4E48\u5C31\u5199\u4EC0\u4E48\uFF0C\u60F3\u5220\u9664\u8FD9\u6BB5\u6587\u5B57\u8BF7\u4F20 ""\uFF08\u7A7A\u5B57\u7B26\u4E32\uFF09\u3002`,
+      { field: `${path}.new_str`, value: raw.new_str }
+    );
+  }
+  if (typeof raw.new_str !== "string") {
+    throw new InputError(
+      `${path}.new_str \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\uFF0C\u6536\u5230 ${describeValue(raw.new_str)}\u3002`,
+      { field: `${path}.new_str`, value: raw.new_str }
+    );
+  }
+  return {
+    old_str: raw.old_str,
+    new_str: raw.new_str,
+    ...raw.replace_all_matches === void 0 ? {} : { replace_all_matches: readBoolean(raw.replace_all_matches, `${path}.replace_all_matches`) }
+  };
+}
+function readContentEdits(raw) {
+  if (raw === void 0 || raw === null) return [];
+  if (!Array.isArray(raw)) {
+    throw new InputError(
+      `edits \u5FC5\u987B\u662F\u6570\u7EC4\uFF1A[{ old_str, new_str, replace_all_matches? }, ...]\uFF0C\u6536\u5230 ${describeValue(raw)}\u3002\u8981\u8FFD\u52A0\u5185\u5BB9\u8BF7\u6539\u7528 body_content\uFF08\u4E0D\u4F20 edits\uFF09\u3002`,
+      { field: "edits", value: raw }
+    );
+  }
+  if (raw.length > MAX_CONTENT_UPDATES) {
+    throw new InputError(
+      `edits \u6700\u591A ${MAX_CONTENT_UPDATES} \u6761\uFF08Notion \u9650\u5236\uFF09\uFF0C\u6536\u5230 ${raw.length} \u6761\u3002\u8BF7\u62C6\u6210\u591A\u6B21 notion_page_edit \u8C03\u7528\u3002`,
+      { field: "edits", count: raw.length, max: MAX_CONTENT_UPDATES }
+    );
+  }
+  return raw.map((entry, index) => readContentEdit(entry, index));
+}
+function withEditAlias(edits, props) {
+  if (!props || !("block_update" in props)) return { edits, props };
+  if (edits.length > 0) {
+    throw new InputError(
+      "edits \u548C props.block_update \u662F\u540C\u4E00\u4E2A\u4E1C\u897F\uFF08\u67E5\u627E\u66FF\u6362\u5217\u8868\uFF09\uFF0C\u4E0D\u8981\u540C\u65F6\u4F20\uFF1B\u8BF7\u7EDF\u4E00\u7528 edits\u3002\u672C\u6B21\u6CA1\u6709\u5199\u5165\u4EFB\u4F55\u5185\u5BB9\u3002",
+      { conflict: true, fields: ["edits", "props.block_update"] }
+    );
+  }
+  const used = { ...props };
+  const rawAlias = used.block_update;
+  delete used.block_update;
+  const aliasEdits = readContentEdits(rawAlias);
+  const rest = Object.keys(used).length ? used : void 0;
+  return { edits: aliasEdits, props: rest };
+}
+function readMarkdownWarnings(raw) {
+  if (!isPlainObject(raw)) return void 0;
+  if (!Array.isArray(raw.warnings)) return void 0;
+  const warnings = raw.warnings.flatMap((entry) => {
+    if (!isPlainObject(entry)) return [];
+    const code = typeof entry.code === "string" ? entry.code : "unknown";
+    const message = typeof entry.message === "string" ? entry.message : describeValue(entry);
+    return [{ code, message }];
+  });
+  return warnings.length ? warnings : void 0;
+}
+function readMarkdownTruncated(raw) {
+  return isPlainObject(raw) && raw.truncated === true ? true : void 0;
+}
+function countNoMatchWarnings(warnings) {
+  if (!warnings) return 0;
+  return warnings.filter((warning) => warning.code === "no_match").length;
+}
+var DELETION_REFUSAL_RE = /allow_deleting_content|delete (?:a )?child|child pages? or databases|archived? child/i;
+function markdownFailure(pageId, result) {
+  const detail = (result.stderr || result.stdout || "").trim();
+  if (DELETION_REFUSAL_RE.test(detail)) {
+    return new NotionToolError(
+      `\u8FD9\u6B21\u7F16\u8F91\u4F1A\u5220\u9664\u9875\u9762 ${pageId} \u91CC\u7684\u5B50\u9875\u9762\u6216\u5B50\u6570\u636E\u5E93\uFF0CNotion \u56E0\u6B64\u62D2\u7EDD\u6267\u884C\uFF08\u672C\u6B21\u6CA1\u6709\u5199\u5165\u4EFB\u4F55\u5185\u5BB9\uFF09\u3002old_str \u5339\u914D\u7684\u662F\u6574\u6BB5\u6587\u672C\uFF0C\u5F88\u5BB9\u6613\u8FDE\u5E26\u8986\u76D6 \`<page url="...">\u2026</page>\` \u6216 \`<database ...>\` \u8FD9\u7C7B\u5757\u3002\u8BF7\u628A old_str \u7F29\u5C0F\u5230\u90A3\u6BB5\u6587\u5B57\u672C\u8EAB\uFF08\u4E0D\u8981\u5305\u542B\u5B50\u9875\u9762/\u5B50\u6570\u636E\u5E93\u5757\uFF09\uFF0C\u6216\u5148\u5728 Notion \u91CC\u628A\u5B50\u9875\u9762\u79FB\u8D70\u518D\u6539\u3002ntn \u8F93\u51FA\uFF1A${truncate(detail, 600)}`,
+      {
+        code: NOTION_ERROR_CODES.ntnFailed,
+        details: {
+          id: pageId,
+          refused: "deleting_child_content",
+          stderr: result.stderr.trim(),
+          stdout: truncate(result.stdout.trim()),
+          code: result.code
+        }
+      }
+    );
+  }
+  return ntnFailure(`\u66F4\u65B0\u9875\u9762 ${pageId} \u7684 Markdown \u5185\u5BB9`, result);
+}
+async function patchPageMarkdown(runner, pageId, body) {
+  const path = `v1/pages/${pageId}/markdown`;
+  const result = await runner({
+    args: ["api", path, "-X", "PATCH", "--data", JSON.stringify({ ...MARKDOWN_REQUEST_DEFAULTS, ...body })]
+  });
+  if (!result.ok) throw markdownFailure(pageId, result);
+  const parsed = parseJsonMaybe(result.stdout);
+  const warnings = readMarkdownWarnings(parsed);
+  const truncated = readMarkdownTruncated(parsed);
+  return {
+    ...warnings ? { warnings } : {},
+    ...truncated ? { truncated } : {}
+  };
+}
+async function applyContentEdits(runner, pageId, edits) {
+  const outcome = await patchPageMarkdown(runner, pageId, {
+    type: "update_content",
+    update_content: { content_updates: edits }
+  });
+  const missed = countNoMatchWarnings(outcome.warnings);
+  return {
+    ...outcome,
+    edits_sent: edits.length,
+    edits_applied: Math.max(edits.length - missed, 0),
+    edits_missed: missed
+  };
+}
+async function appendPageContent(runner, pageId, content) {
+  return patchPageMarkdown(runner, pageId, {
+    type: "insert_content",
+    insert_content: { content, position: { type: "end" } }
+  });
 }
 function patchArgs(pageId, properties, icon) {
   const body = {};
@@ -1628,63 +1775,37 @@ function patchArgs(pageId, properties, icon) {
   if (icon) body.icon = icon.payload;
   return ["api", `v1/pages/${pageId}`, "-X", "PATCH", "--data", JSON.stringify(body)];
 }
-function describePageValue(value) {
-  const props = value.properties.join(", ");
-  if (value.action === "create") {
-    return [
-      `\u5DF2\u521B\u5EFA\u9875\u9762${value.title ? ` "${value.title}"` : ""}${value.id ? `\uFF1A${value.id}` : ""}`,
-      value.url ? `URL: ${value.url}` : "",
-      value.parent ? `parent: ${value.parent}` : "",
-      value.parent_item_row_id ? `Parent-item \u2192 ${value.parent_item_row_id}` : "",
-      value.properties.length ? `\u5DF2\u5199\u5165\u5C5E\u6027\uFF1A${props}` : "\u672A\u5199\u5165\u5C5E\u6027\uFF08props \u4E3A\u7A7A\uFF09",
-      value.icon !== void 0 ? `icon: ${value.icon ?? "\uFF08\u5DF2\u6E05\u9664\uFF09"}` : ""
-    ].filter(Boolean).join("\n");
+function buildPropertyWrite(schema, props, title, context) {
+  const properties = {};
+  const names = [];
+  let titleFromProps;
+  if (props) {
+    const built = buildProperties(schema, props);
+    Object.assign(properties, built.properties);
+    names.push(...built.names);
+    titleFromProps = built.title;
   }
-  if (value.action === "edit") {
-    const what = value.changed.includes("body_content") ? "\u5185\u5BB9" : "\u5C5E\u6027";
-    const size = value.body_chars_before !== void 0 && value.body_chars_after !== void 0 ? `\u6B63\u6587\u5DF2\u6574\u9875\u66FF\u6362\uFF1A${value.body_chars_before} \u5B57 \u2192 ${value.body_chars_after} \u5B57` : "";
-    return [
-      `\u5DF2\u66F4\u65B0\u9875\u9762 ${value.id} \u7684${what}`,
-      size,
-      value.url ? `URL: ${value.url}` : "",
-      value.changed.includes("body_content") && value.changed.includes("properties") ? `\u5DF2\u5199\u5165\u5C5E\u6027\uFF1A${props}` : value.properties.length ? `\u5C5E\u6027\uFF1A${props}` : "",
-      value.icon !== void 0 ? `icon: ${value.icon ?? "\uFF08\u5DF2\u6E05\u9664\uFF09"}` : ""
-    ].filter(Boolean).join("\n");
-  }
-  if (value.action === "attach") {
-    if (value.already_linked) {
-      return [
-        `\u884C ${value.id} \u5DF2\u7ECF\u5728\u7236\u884C ${value.parent_item_row_id} \u4E0B\uFF08Parent-item \u5217\uFF1A${value.parent_item_property}\uFF09\uFF0C\u65E0\u9700\u6539\u52A8`,
-        value.url ? `URL: ${value.url}` : "",
-        "changed: (none)"
-      ].filter(Boolean).join("\n");
+  let titleWritten = false;
+  if (title) {
+    const titleName = titlePropertyName(schema);
+    if (!titleName) {
+      throw new InputError(
+        context.pageId ? `\u65E0\u6CD5\u786E\u5B9A\u9875\u9762 ${context.pageId} \u7684\u6807\u9898\u5C5E\u6027\uFF0C\u4E0D\u80FD\u7528 title \u6539\u6807\u9898\uFF1B\u8BF7\u6539\u7528 props \u5E76\u6307\u5B9A\u6807\u9898\u5C5E\u6027\u540D\u3002` : `\u65E0\u6CD5\u786E\u5B9A ${context.source} \u7684\u6807\u9898\u5C5E\u6027\uFF0C\u4E0D\u80FD\u7528 title \u6307\u5B9A\u6807\u9898\uFF1B\u8BF7\u6539\u7528 props \u5E76\u6307\u5B9A\u6807\u9898\u5C5E\u6027\u540D\u3002`
+      );
     }
-    if (value.parent_item_property) {
-      return [
-        `\u5DF2\u628A\u884C ${value.id} \u6302\u5230\u7236\u884C ${value.parent_item_row_id} \u4E0B`,
-        `Parent-item \u5217\uFF1A${value.parent_item_property}`,
-        value.replaced_parent_ids?.length ? `\u66FF\u6362\u4E86\u539F\u6765\u7684\u7236\u7EA7\uFF1A${value.replaced_parent_ids.join(", ")}` : "",
-        value.url ? `URL: ${value.url}` : ""
-      ].filter(Boolean).join("\n");
-    }
-    return [
-      `\u5DF2\u628A\u9875\u9762 ${value.id} \u6302\u5230 ${value.parent} \u4E0B`,
-      value.url ? `URL: ${value.url}` : "",
-      value.cycle_check === "partial" ? "\u6CE8\u610F\uFF1A\u9875\u9762\u7956\u5148\u94FE\u672A\u80FD\u5B8C\u6574\u8BFB\u53D6\uFF0C\u6DF1\u5C42\u73AF\u68C0\u67E5\u4E3A best-effort\uFF08cycle_check: partial\uFF09" : "",
-      "changed: parent"
-    ].filter(Boolean).join("\n");
+    properties[titleName] = { title: richText(title) };
+    if (!names.includes(titleName)) names.push(titleName);
+    titleWritten = true;
   }
-  if (value.already_archived) {
-    return [
-      `\u9875\u9762 ${value.id} \u672C\u6765\u5C31\u5728\u56DE\u6536\u7AD9\u91CC\uFF0C\u672C\u6B21\u6CA1\u6709\u6267\u884C\u5220\u9664`,
-      value.url ? `URL: ${value.url}` : "",
-      "changed: (none)"
-    ].filter(Boolean).join("\n");
-  }
-  return [`\u5DF2\u628A\u9875\u9762 ${value.id} \u79FB\u5165\u56DE\u6536\u7AD9`, value.url ? `URL: ${value.url}` : ""].filter(Boolean).join("\n");
-}
-function pageValue(action, fields) {
-  return { ok: true, action, properties: [], ...fields };
+  const changes = [];
+  if (titleWritten) changes.push("title");
+  if (names.length > 0 && !titleWritten) changes.push("properties");
+  return {
+    properties,
+    names,
+    ...titleFromProps ? { title: titleFromProps } : {},
+    changes
+  };
 }
 function parentItemError(schema, dataSourceId) {
   const relations = relationProperties(schema);
@@ -1722,7 +1843,7 @@ async function rollbackCreatedPage(runner, pageId, cause) {
   const detail = (trash.stderr || trash.stdout || "").trim();
   const partial = !trash.ok;
   const rollbackLine = partial ? `
-\u56DE\u6EDA\u5931\u8D25\uFF1Antn pages trash ${pageId} \u4E5F\u5931\u8D25\u4E86${detail ? `\uFF08${truncate(detail, 300)}\uFF09` : ""}\uFF0C\u8BE5\u9875\u9762/\u884C\u4ECD\u7136\u5B58\u5728\uFF08partial: true\uFF09\u3002\u8BF7\u624B\u52A8\u6E05\u7406\uFF1Anotion_page { action: "trash", id: "${pageId}", yes: true }\u3002` : `
+\u56DE\u6EDA\u5931\u8D25\uFF1Antn pages trash ${pageId} \u4E5F\u5931\u8D25\u4E86${detail ? `\uFF08${truncate(detail, 300)}\uFF09` : ""}\uFF0C\u8BE5\u9875\u9762/\u884C\u4ECD\u7136\u5B58\u5728\uFF08partial: true\uFF09\u3002\u8BF7\u624B\u52A8\u6E05\u7406\uFF1Anotion_page_trash { id: "${pageId}", yes: true }\u3002` : `
 \u5DF2\u56DE\u6EDA\uFF1A\u65B0\u9875\u9762 ${pageId} \u5DF2\u79FB\u5165\u56DE\u6536\u7AD9\uFF08partial: false\uFF09\uFF0C\u6CA1\u6709\u7559\u4E0B\u534A\u6210\u54C1\u3002`;
   const details = {
     ...cause.details,
@@ -1738,43 +1859,31 @@ async function rollbackCreatedPage(runner, pageId, cause) {
   });
 }
 async function createPage(params, runner) {
-  const { props, body, hasBody, icon } = normalizeProps(params.props);
-  const explicitTitle = normalizeTitle(params.title);
   const readPage = makePageReader(runner);
   const container = await resolveContainer(runner, params.parent, "create", readPage);
-  assertReservedKeysAvailable(container.schema, hasBody, icon);
-  const markdown = body ?? "";
-  let properties = {};
-  let propertyNames = [];
-  let propsTitle;
-  if (props) {
-    const built = buildProperties(container.schema, props);
-    properties = built.properties;
-    propertyNames = built.names;
-    propsTitle = built.title;
-    if (explicitTitle) {
-      const titleName = titlePropertyName(container.schema);
-      if (!titleName) {
-        throw new InputError(
-          `\u65E0\u6CD5\u786E\u5B9A ${container.schema.source} \u7684\u6807\u9898\u5C5E\u6027\uFF0C\u4E0D\u80FD\u7528 title \u6307\u5B9A\u6807\u9898\uFF1B\u8BF7\u6539\u7528 props \u5E76\u6307\u5B9A\u6807\u9898\u5C5E\u6027\u540D\u3002`
-        );
-      }
-      properties[titleName] = { title: richText(explicitTitle) };
-      if (!propertyNames.includes(titleName)) propertyNames.push(titleName);
-    }
-  }
+  const markdown = params.body ?? "";
+  const {
+    properties,
+    names,
+    title: propsTitle,
+    changes
+  } = buildPropertyWrite(container.schema, params.props, params.title, {
+    source: container.schema.source
+  });
+  const propertyNames = [...names];
+  const explicitTitle = params.title;
   const draft = planContent(markdown, explicitTitle ?? propsTitle);
   const title = draft.title;
   if (container.kind !== "page" && !title) {
     const hints = writableProperties(container.schema);
     throw new InputError(
-      `\u5728 ${container.kind === "row" ? `\u884C ${container.rowParentId} \u6240\u5728 data source` : container.kind} \u4E2D\u521B\u5EFA\u9875\u9762\u9700\u8981\u6807\u9898\uFF1A\u8BF7\u4F20 title\u3001\u5728 props \u91CC\u5199\u6807\u9898\u5C5E\u6027\uFF08${titlePropertyName(container.schema) ?? "title"}\uFF09\uFF0C\u6216\u8BA9 props.body_content \u4EE5 "# \u6807\u9898" \u5F00\u5934\u3002\u53EF\u5199\u5C5E\u6027\uFF1A${formatHints(hints)}\u3002`,
+      `\u5728 ${container.kind === "row" ? `\u884C ${container.rowParentId} \u6240\u5728 data source` : container.kind} \u4E2D\u521B\u5EFA\u9875\u9762\u9700\u8981\u6807\u9898\uFF1A\u8BF7\u4F20 title\u3001\u5728 props \u91CC\u5199\u6807\u9898\u5C5E\u6027\uFF08${titlePropertyName(container.schema) ?? "title"}\uFF09\uFF0C\u6216\u8BA9 body_content \u4EE5 "# \u6807\u9898" \u5F00\u5934\u3002\u53EF\u5199\u5C5E\u6027\uFF1A${formatHints(hints)}\u3002`,
       { parent: formatParent(container.createParent), hint_properties: hints }
     );
   }
   if (!draft.body.trim()) {
     throw new InputError(
-      "create \u9700\u8981 props.body_content \u6216 title\uFF1Antn pages create \u4E0D\u63A5\u53D7\u7A7A Markdown\uFF0C\u53EA\u6709 parent \u65E0\u6CD5\u521B\u5EFA\u7A7A\u767D\u9875\u9762\u3002"
+      "create \u9700\u8981 body_content \u6216 title\uFF1Antn pages create \u4E0D\u63A5\u53D7\u7A7A Markdown\uFF0C\u53EA\u6709 parent \u65E0\u6CD5\u521B\u5EFA\u7A7A\u767D\u9875\u9762\u3002"
     );
   }
   let rowRelationName;
@@ -1801,34 +1910,40 @@ async function createPage(params, runner) {
   const textId = structuredId ? void 0 : findPageIdInText(createResult.stdout);
   const pageId = structuredId ?? textId;
   const url = pageId ? pageUrlFromRaw(created, pageId) : void 0;
+  const icon = params.icon;
+  const requireTrustedId = (what) => {
+    if (structuredId) return structuredId;
+    throw new InputError(
+      `\u9875\u9762\u5DF2\u521B\u5EFA\uFF08parent ${formatParent(container.createParent)}\uFF09\uFF0C\u4F46\u6CA1\u6709\u4ECE ntn \u7684\u7ED3\u6784\u5316\u8F93\u51FA\u91CC\u53D6\u5230\u9875\u9762 id\uFF0C${what}\u672A\u5199\u5165\u3002\u6CA1\u6709\u53EF\u4FE1 id \u5C31\u4E0D\u81EA\u52A8 trash\uFF08\u907F\u514D\u8BEF\u5220\uFF09\uFF0C\u8BF7\u7528 notion_search/notion_get \u627E\u5230\u8BE5\u9875\u9762\u540E\uFF0C\u7528 notion_page_edit \u5199\u5165\uFF0C\u6216 notion_page_trash \u5220\u9664\uFF08partial: true\uFF0Crollback: unknown_id\uFF09\u3002`,
+      {
+        parent: formatParent(container.createParent),
+        partial: true,
+        rollback: "unknown_id",
+        ...pageId ? { id_candidate: pageId } : {},
+        stdout: truncate(createResult.stdout.trim())
+      }
+    );
+  };
   const needsPatch = propertyNames.length > 0 || icon !== void 0;
   if (needsPatch) {
-    if (!structuredId) {
-      throw new InputError(
-        `\u9875\u9762\u5DF2\u521B\u5EFA\uFF08parent ${formatParent(container.createParent)}\uFF09\uFF0C\u4F46\u6CA1\u6709\u4ECE ntn \u7684\u7ED3\u6784\u5316\u8F93\u51FA\u91CC\u53D6\u5230\u9875\u9762 id\uFF0C${propertyNames.length > 0 ? "props \u548C icon \u90FD" : "icon"}\u672A\u5199\u5165\u3002\u6CA1\u6709\u53EF\u4FE1 id \u5C31\u4E0D\u81EA\u52A8 trash\uFF08\u907F\u514D\u8BEF\u5220\uFF09\uFF0C\u8BF7\u7528 notion_search/notion_get \u627E\u5230\u8BE5\u9875\u9762\u540E\uFF0C\u7528 notion_page edit \u5199\u5165\uFF0C\u6216 notion_page trash \u5220\u9664\uFF08partial: true\uFF0Crollback: unknown_id\uFF09\u3002`,
-        {
-          parent: formatParent(container.createParent),
-          partial: true,
-          rollback: "unknown_id",
-          ...pageId ? { id_candidate: pageId } : {},
-          stdout: truncate(createResult.stdout.trim())
-        }
-      );
-    }
-    const patchResult = await runner({ args: patchArgs(structuredId, properties, icon) });
+    const targetId = requireTrustedId("props/icon");
+    const patchResult = await runner({ args: patchArgs(targetId, properties, icon) });
     if (!patchResult.ok) {
       throw await rollbackCreatedPage(
         runner,
-        structuredId,
+        targetId,
         ntnFailure(
           "PATCH \u9875\u9762\u5C5E\u6027/icon",
           patchResult,
-          container.kind === "row" ? `\u5B50\u884C\u5DF2\u521B\u5EFA\uFF08id ${structuredId}\uFF09\uFF0C\u4F46\u5C5E\u6027/Parent-item relation/icon \u672A\u5199\u5165` : `\u9875\u9762\u5DF2\u521B\u5EFA\uFF08id ${structuredId}\uFF09\uFF0C\u4F46\u5C5E\u6027/icon \u672A\u5199\u5165`
+          container.kind === "row" ? `\u5B50\u884C\u5DF2\u521B\u5EFA\uFF08id ${targetId}\uFF09\uFF0C\u4F46\u5C5E\u6027/Parent-item relation/icon \u672A\u5199\u5165` : `\u9875\u9762\u5DF2\u521B\u5EFA\uFF08id ${targetId}\uFF09\uFF0C\u4F46\u5C5E\u6027/icon \u672A\u5199\u5165`
         )
       );
     }
+    if (icon) changes.push("icon");
   }
-  return pageValue("create", {
+  changes.unshift("body_content");
+  return pageValue({
+    created: true,
     ...pageId ? { id: pageId } : {},
     ...url ? { url } : {},
     parent: formatParent(container.createParent),
@@ -1839,124 +1954,110 @@ async function createPage(params, runner) {
     } : {},
     ...icon ? { icon: icon.display } : {},
     properties: propertyNames,
-    changed: [
-      ...propertyNames.length > 0 || container.kind === "row" ? ["properties"] : [],
-      ...icon ? ["icon"] : []
-    ]
+    changed: changes
   });
+}
+function partialEditError(cause, applied, failedStep) {
+  return new NotionToolError(
+    `${cause.detail}
+\u5DF2\u7ECF\u751F\u6548\u7684\u90E8\u5206\uFF1A${applied.join("\u3001")}\uFF08\u5DF2\u5199\u5165\uFF0C\u4E0D\u4F1A\u56DE\u6EDA\uFF09\u3002\u5931\u8D25\u7684\u662F\uFF1A${failedStep}\u3002\u91CD\u8BD5\u524D\u8BF7\u5148 notion_get \u786E\u8BA4\u9875\u9762\u5F53\u524D\u72B6\u6001\uFF0C\u907F\u514D\u91CD\u590D\u5E94\u7528\u3002`,
+    {
+      code: cause.code,
+      details: { ...cause.details, partial: true, applied, failed_step: failedStep }
+    }
+  );
 }
 async function editPage(params, runner) {
-  const id = requireId(params.id, "edit");
-  const { props, body, hasBody, icon } = normalizeProps(params.props);
-  const explicitTitle = normalizeTitle(params.title);
-  const markdown = body !== void 0 && body.trim() !== "" ? body : void 0;
-  if (!markdown && !props && !explicitTitle && icon === void 0) {
-    throw new InputError(
-      "edit \u9700\u8981 props\uFF08\u542B props.body_content / props.icon\uFF09\u3001title \u6216 props.icon \u81F3\u5C11\u4E00\u9879\uFF1B\u7A7A\u8C03\u7528\u4E0D\u4F1A\u4FEE\u6539\u9875\u9762\u3002"
+  const { id, edits } = params;
+  const result = { changes: [], properties: [], outcome: {} };
+  const applied = [];
+  if (edits.length > 0) {
+    const appliedEdits = await applyContentEdits(runner, id, edits);
+    result.outcome = appliedEdits;
+    result.changes.push("body_content");
+    applied.push(
+      `\u5185\u5BB9\uFF08${appliedEdits.edits_applied}/${appliedEdits.edits_sent} \u6761 edits\uFF09`
     );
+  } else if (params.body !== void 0 && params.body.trim() !== "") {
+    result.outcome = await appendPageContent(runner, id, params.body);
+    result.appended = true;
+    result.changes.push("body_content");
+    applied.push("\u8FFD\u52A0\u7684\u6B63\u6587\u5185\u5BB9");
   }
-  const schema = await schemaForPage(runner, id);
-  assertReservedKeysAvailable(schema, hasBody, icon);
-  let properties = {};
-  const propertyNames = [];
-  if (props) {
-    const built = buildProperties(schema, props);
-    Object.assign(properties, built.properties);
-    propertyNames.push(...built.names);
-  }
-  if (explicitTitle) {
-    const titleName = titlePropertyName(schema);
-    if (!titleName) {
-      throw new InputError(
-        `\u65E0\u6CD5\u786E\u5B9A\u9875\u9762 ${id} \u7684\u6807\u9898\u5C5E\u6027\uFF0C\u4E0D\u80FD\u7528 title \u6539\u6807\u9898\uFF1B\u8BF7\u6539\u7528 props \u5E76\u6307\u5B9A\u6807\u9898\u5C5E\u6027\u540D\u3002`
-      );
-    }
-    properties[titleName] = { title: richText(explicitTitle) };
-    if (!propertyNames.includes(titleName)) propertyNames.push(titleName);
-  }
-  if (markdown) {
-    const beforeChars = await pageTextLength(runner, id);
-    const afterChars = markdown.length;
-    if (beforeChars !== void 0 && beforeChars >= SHRINK_GUARD_MIN_CHARS && afterChars < beforeChars * SHRINK_CONFIRM_RATIO && params.confirm_shrink !== true) {
-      const pct = Math.round((1 - afterChars / beforeChars) * 100);
-      throw new InputError(
-        `edit \u7684 body_content \u4F1A\u3010\u6574\u9875\u66FF\u6362\u3011\u73B0\u6709\u6B63\u6587\uFF0C\u4E0D\u662F\u8FFD\u52A0\u3001\u4E0D\u662F\u5C40\u90E8\u4FEE\u6539\u3002\u8FD9\u6B21\u66FF\u6362\u4F1A\u8BA9\u6B63\u6587\u4ECE\u7EA6 ${beforeChars} \u5B57\u53D8\u6210 ${afterChars} \u5B57\uFF08\u51CF\u5C11 ${pct}%\uFF09\u3002\u4E3A\u907F\u514D\u8BEF\u5220\uFF0C\u786E\u8BA4\u8981\u6574\u9875\u8986\u76D6\u8BF7\u52A0 confirm_shrink: true\uFF1B\u53EA\u60F3\u6539\u4E00\u5C0F\u6BB5\u7684\u8BDD\uFF0C\u8BF7\u91CD\u53D1\u5B8C\u6574\u6B63\u6587\u5185\u5BB9\uFF08\u6216\u6539\u6807\u9898/\u5C5E\u6027/icon \u65F6\u4E0D\u8981\u4F20 body_content\uFF09\u3002`,
-        {
-          id,
-          body_chars_before: beforeChars,
-          body_chars_after: afterChars,
-          shrink_ratio: Number((afterChars / beforeChars).toFixed(3)),
-          confirm_required: "confirm_shrink"
-        }
-      );
-    }
-    const editResult = await runner({ args: ["pages", "edit", id, `--content=${markdown}`, "--json"] });
-    if (!editResult.ok) throw ntnFailure("ntn pages edit", editResult);
-    const edited = parseJsonMaybe(editResult.stdout);
-    if (propertyNames.length > 0 || icon !== void 0) {
-      const patchResult2 = await runner({ args: patchArgs(id, properties, icon) });
-      if (!patchResult2.ok) {
-        throw ntnFailure(
-          "PATCH \u9875\u9762\u5C5E\u6027/icon",
-          patchResult2,
-          `\u9875\u9762 ${id} \u5185\u5BB9\u5DF2\u66F4\u65B0\uFF0C\u4F46${propertyNames.length > 0 ? "\u5C5E\u6027" : ""}${propertyNames.length > 0 && icon ? "\u548C icon" : icon ? "icon" : ""}\u672A\u5199\u5165`
-        );
-      }
-    }
-    const url2 = pageUrlFromRaw(edited, id);
-    return pageValue("edit", {
-      id,
-      ...url2 ? { url: url2 } : {},
-      ...icon ? { icon: icon.display } : {},
-      properties: propertyNames,
-      ...beforeChars !== void 0 ? { body_chars_before: beforeChars, body_chars_after: afterChars } : {},
-      changed: [
-        "body_content",
-        ...propertyNames.length > 0 ? ["properties"] : [],
-        ...icon ? ["icon"] : []
-      ]
+  const needsPatch = params.props !== void 0 || params.title !== void 0 || params.icon !== void 0;
+  if (needsPatch) {
+    const schema = await schemaForPage(runner, id);
+    const { properties, names, changes } = buildPropertyWrite(schema, params.props, params.title, {
+      pageId: id,
+      source: schema.source
     });
+    const patchResult = await runner({ args: patchArgs(id, properties, params.icon) });
+    if (!patchResult.ok) {
+      const cause = ntnFailure("PATCH \u9875\u9762\u5C5E\u6027/icon", patchResult);
+      throw applied.length > 0 ? partialEditError(cause, applied, "\u5C5E\u6027/\u6807\u9898/icon\uFF08PATCH \u9875\u9762\u5C5E\u6027/icon\uFF09") : cause;
+    }
+    const patched = parseJsonMaybe(patchResult.stdout);
+    if (pageHasUrl(patched)) result.url = pageUrlFromRaw(patched, id);
+    result.properties = names;
+    result.changes.push(...changes);
+    if (params.icon !== void 0) result.changes.push("icon");
+    if (names.length > 0) applied.push(`\u5C5E\u6027\uFF08${names.join(", ")}\uFF09`);
+    if (params.icon !== void 0) applied.push("icon");
   }
-  if (propertyNames.length === 0 && icon !== void 0) {
-    const iconOnly = await runner({ args: patchArgs(id, {}, icon) });
-    if (!iconOnly.ok) throw ntnFailure("PATCH \u9875\u9762 icon", iconOnly);
-    const patchedIcon = parseJsonMaybe(iconOnly.stdout);
-    const url2 = pageUrlFromRaw(patchedIcon, id);
-    return pageValue("edit", {
-      id,
-      ...url2 ? { url: url2 } : {},
-      icon: icon.display,
-      properties: [],
-      changed: ["icon"]
-    });
+  if (params.parent !== void 0) {
+    let move2;
+    try {
+      move2 = await movePage(runner, { id, parent: params.parent, yes: params.yes });
+    } catch (error) {
+      const cause = error instanceof NotionToolError ? error : ntnFailure("\u79FB\u52A8\u9875\u9762", {
+        ok: false,
+        stdout: "",
+        stderr: error instanceof Error ? error.message : String(error),
+        code: null
+      });
+      throw applied.length > 0 ? partialEditError(cause, applied, "\u79FB\u52A8\u9875\u9762\uFF08parent\uFF09") : cause;
+    }
+    result.move = move2;
+    if (move2.change) result.changes.push(move2.change);
   }
-  const patchResult = await runner({ args: patchArgs(id, properties, icon) });
-  if (!patchResult.ok) throw ntnFailure("PATCH \u9875\u9762\u5C5E\u6027/icon", patchResult);
-  const patched = parseJsonMaybe(patchResult.stdout);
-  const url = pageUrlFromRaw(patched, id);
-  return pageValue("edit", {
+  const { outcome, move } = result;
+  return pageValue({
     id,
-    ...url ? { url } : {},
-    ...icon ? { icon: icon.display } : {},
-    properties: propertyNames,
-    changed: [...propertyNames.length > 0 ? ["properties"] : [], ...icon ? ["icon"] : []]
+    url: result.url ?? move?.url ?? pageUrl(id),
+    ...move?.parent ? { parent: move.parent } : {},
+    ...move?.parent_item_row_id ? { parent_item_row_id: move.parent_item_row_id } : {},
+    ...move?.parent_item_property ? { parent_item_property: move.parent_item_property } : {},
+    ...move?.already_linked ? { already_linked: true } : {},
+    ...move?.replaced_parent_ids ? { replaced_parent_ids: move.replaced_parent_ids } : {},
+    ...move?.cycle_check ? { cycle_check: move.cycle_check } : {},
+    ...params.icon !== void 0 ? { icon: params.icon.display } : {},
+    properties: result.properties,
+    changed: result.changes,
+    ...outcome.warnings ? { warnings: outcome.warnings } : {},
+    ...outcome.truncated ? { truncated: true } : {},
+    ...result.appended ? { appended: true } : {},
+    ...outcome.edits_sent !== void 0 ? {
+      edits_sent: outcome.edits_sent,
+      edits_applied: outcome.edits_applied,
+      edits_missed: outcome.edits_missed
+    } : {}
   });
 }
-async function attachPage(params, runner) {
-  const id = requireId(params.id, "attach");
-  const spec = parseParentSpec(params.parent, "attach");
+async function movePage(runner, options) {
+  const { id } = options;
+  const spec = parseParentSpec(options.parent, "move");
   if (!spec.bare && spec.kind !== "page") {
     throw new InputError(
-      "attach \u7684 parent \u53EA\u652F\u6301 page:<id> \u6216\uFF08\u88F8\uFF09\u884C id\uFF1A\u9875\u9762\u6302\u5230\u9875\u9762\u4E0B\u7528 POST /v1/pages/{id}/move\uFF0C\u884C\u6302\u5230\u884C\u4E0B\u7528 Parent-item relation\u3002\u8981\u628A\u9875\u9762\u653E\u8FDB\u67D0\u4E2A data source\uFF0C\u8BF7\u7528 notion_page create\u3002"
+      "edit \u7684 parent\uFF08\u79FB\u52A8\u9875\u9762\uFF09\u53EA\u652F\u6301 page:<id> \u6216\uFF08\u88F8\uFF09\u884C id\uFF1A\u9875\u9762\u6302\u5230\u9875\u9762\u4E0B\u7528 POST /v1/pages/{id}/move\uFF0C\u884C\u6302\u5230\u884C\u4E0B\u7528 Parent-item relation\u3002\u8981\u628A\u9875\u9762\u653E\u8FDB\u67D0\u4E2A data source\uFF0C\u8BF7\u7528 notion_page_create\u3002"
     );
   }
   const readPage = makePageReader(runner);
-  const container = await resolveContainer(runner, params.parent, "attach", readPage);
+  const container = await resolveContainer(runner, options.parent, "move", readPage);
   const childPage = await readPage(id);
   const childParent = childPage.parent;
   if (!childParent) {
     throw new InputError(
-      `\u65E0\u6CD5\u786E\u5B9A\u9875\u9762 ${id} \u7684\u5F53\u524D\u7236\u7EA7\uFF08GET v1/pages \u672A\u8FD4\u56DE parent\uFF09\u3002attach \u4E0D\u4F1A\u5728\u6CA1\u6709\u786E\u8BA4\u7684\u60C5\u51B5\u4E0B\u79FB\u52A8\u9875\u9762\u3002`,
+      `\u65E0\u6CD5\u786E\u5B9A\u9875\u9762 ${id} \u7684\u5F53\u524D\u7236\u7EA7\uFF08GET v1/pages \u672A\u8FD4\u56DE parent\uFF09\u3002\u79FB\u52A8\u9875\u9762\u4E0D\u4F1A\u5728\u6CA1\u6709\u786E\u8BA4\u7684\u60C5\u51B5\u4E0B\u6267\u884C\u3002`,
       { id }
     );
   }
@@ -1966,9 +2067,7 @@ async function attachPage(params, runner) {
       throw new InputError(`\u9875\u9762 ${id} \u4E0D\u80FD\u6302\u5230\u81EA\u5DF1\u4E0B\u9762\u3002`, { id, parent: targetParentId });
     }
     if (childParent.kind === "page" && sameNotionId(childParent.id, targetParentId)) {
-      throw new InputError(`\u9875\u9762 ${id} \u5DF2\u7ECF\u662F ${targetParentId} \u7684\u5B50\u9875\u9762\uFF0C\u65E0\u9700 attach\u3002`, {
-        id
-      });
+      throw new InputError(`\u9875\u9762 ${id} \u5DF2\u7ECF\u662F ${targetParentId} \u7684\u5B50\u9875\u9762\uFF0C\u65E0\u9700\u79FB\u52A8\u3002`, { id });
     }
     const cycle = await walkPageAncestors(readPage, { childId: id, parentId: targetParentId });
     if (cycle.cycle) {
@@ -1989,22 +2088,19 @@ async function attachPage(params, runner) {
     });
     if (!result.ok) throw ntnFailure(`\u628A\u9875\u9762 ${id} \u6302\u5230 ${targetParentId} \u4E0B`, result);
     const moved = parseJsonMaybe(result.stdout);
-    const url2 = pageUrlFromRaw(moved, id);
-    return pageValue("attach", {
-      id,
-      url: url2,
+    return {
       parent: formatParent(container.createParent),
       cycle_check: cycle.status,
-      properties: [],
-      changed: ["parent"]
-    });
+      change: "parent",
+      ...pageHasUrl(moved) ? { url: pageUrlFromRaw(moved, id) } : {}
+    };
   }
   if (container.kind !== "row") {
-    throw new InputError("attach \u65E0\u6CD5\u628A\u9875\u9762\u6302\u5230 data source \u5BB9\u5668\u4E0B\uFF1B\u8BF7\u6539\u7528 create\u3002");
+    throw new InputError("\u65E0\u6CD5\u628A\u9875\u9762\u6302\u5230 data source \u5BB9\u5668\u4E0B\uFF1B\u8BF7\u6539\u7528 notion_page_create\u3002");
   }
   if (childParent.kind === "page") {
     throw new InputError(
-      `\u9875\u9762 ${id} \u4E0D\u5728\u6570\u636E\u5E93\u91CC\uFF08\u7236\u7EA7\u662F\u9875\u9762${childParent.id ? ` ${childParent.id}` : ""}\uFF09\uFF0C\u4E0D\u80FD\u7528 Parent-item relation \u6302\u5230\u884C ${container.rowParentId} \u4E0B\uFF1Battach \u884C\u53EA\u9002\u7528\u4E8E\u540C\u4E00\u5E93\u5185\u7684\u884C\u3002`,
+      `\u9875\u9762 ${id} \u4E0D\u5728\u6570\u636E\u5E93\u91CC\uFF08\u7236\u7EA7\u662F\u9875\u9762${childParent.id ? ` ${childParent.id}` : ""}\uFF09\uFF0C\u4E0D\u80FD\u7528 Parent-item relation \u6302\u5230\u884C ${container.rowParentId} \u4E0B\uFF1B\u884C\u2192\u884C\u7684\u79FB\u52A8\u53EA\u9002\u7528\u4E8E\u540C\u4E00\u5E93\u5185\u7684\u884C\u3002`,
       { id, parentRowId: container.rowParentId }
     );
   }
@@ -2014,7 +2110,7 @@ async function attachPage(params, runner) {
   const childDataSourceId = await dataSourceIdForParent(runner, childParent);
   if (!sameNotionId(childDataSourceId, container.dataSourceId)) {
     throw new InputError(
-      `\u884C ${id} \u5C5E\u4E8E data source ${childDataSourceId}\uFF0C\u7236\u884C ${container.rowParentId} \u5C5E\u4E8E ${container.dataSourceId}\uFF1B\u81EA\u5173\u8054 Parent-item \u53EA\u80FD\u5728\u540C\u4E00 data source \u5185\u4F7F\u7528\uFF0C\u8DE8\u5E93\u8BF7\u6539\u7528 page \u7236\u7EA7\u6216 create\u3002`,
+      `\u884C ${id} \u5C5E\u4E8E data source ${childDataSourceId}\uFF0C\u7236\u884C ${container.rowParentId} \u5C5E\u4E8E ${container.dataSourceId}\uFF1B\u81EA\u5173\u8054 Parent-item \u53EA\u80FD\u5728\u540C\u4E00 data source \u5185\u4F7F\u7528\uFF0C\u8DE8\u5E93\u8BF7\u6539\u7528 page \u7236\u7EA7\u6216 notion_page_create\u3002`,
       { id, childDataSourceId, parentDataSourceId: container.dataSourceId }
     );
   }
@@ -2025,20 +2121,17 @@ async function attachPage(params, runner) {
     (existing) => sameNotionId(existing, container.rowParentId)
   );
   if (parentAlreadySet && currentParents.length === 1) {
-    return pageValue("attach", {
-      id,
-      url: pageUrl(id),
+    return {
       parent: formatParent(container.createParent),
       parent_item_property: relation.name,
       parent_item_row_id: container.rowParentId,
       already_linked: true,
-      properties: [],
-      changed: []
-    });
+      change: null
+    };
   }
-  if (currentParents.length > 0 && params.yes !== true) {
+  if (currentParents.length > 0 && options.yes !== true) {
     throw new InputError(
-      `\u884C ${id} \u7684 ${relation.name}\uFF08Parent-item\uFF09\u5DF2\u7ECF\u6307\u5411 ${currentParents.join(", ")}\uFF0Cattach \u5230 ${container.rowParentId} \u4F1A\u8986\u76D6\u8FD9\u4E2A\u94FE\u63A5\u3002\u786E\u8BA4\u8981\u6539\u7236\u7EA7\u8BF7\u4F20 yes: true\uFF1B\u672C\u6B21\u6CA1\u6709\u5199\u5165\u3002`,
+      `\u884C ${id} \u7684 ${relation.name}\uFF08Parent-item\uFF09\u5DF2\u7ECF\u6307\u5411 ${currentParents.join(", ")}\uFF0C\u79FB\u5230 ${container.rowParentId} \u4E0B\u4F1A\u8986\u76D6\u8FD9\u4E2A\u94FE\u63A5\u3002\u786E\u8BA4\u8981\u6539\u7236\u7EA7\u8BF7\u4F20 yes: true\uFF1B\u672C\u6B21\u6CA1\u6709\u5199\u5165\u3002`,
       {
         id,
         parent: formatParent(container.createParent),
@@ -2058,18 +2151,15 @@ async function attachPage(params, runner) {
   const patchResult = await runner({ args: patchArgs(id, properties) });
   if (!patchResult.ok) throw ntnFailure(`\u8BBE\u7F6E ${relation.name}\uFF08Parent-item\uFF09relation`, patchResult);
   const patched = parseJsonMaybe(patchResult.stdout);
-  const url = pageUrlFromRaw(patched, id);
-  return pageValue("attach", {
-    id,
-    url,
+  return {
     parent: formatParent(container.createParent),
     parent_item_property: relation.name,
     parent_item_row_id: container.rowParentId,
     ...currentParents.length > 0 ? { replaced_parent_ids: currentParents } : {},
     cycle_check: "walked",
-    properties: [],
-    changed: ["parent_item_relation"]
-  });
+    change: "parent_item_relation",
+    ...pageHasUrl(patched) ? { url: pageUrlFromRaw(patched, id) } : {}
+  };
 }
 function isNotFound(res) {
   if (res.ok) return false;
@@ -2108,18 +2198,20 @@ var NESTING_BLOCK_TYPES = /* @__PURE__ */ new Set([
   "template",
   "callout"
 ]);
-async function listChildPages(runner, pageId) {
+var MAX_BLOCK_PAGES = 100;
+async function listChildPages(runner, pageId, options) {
   const children = [];
   let cursor;
-  const MAX_PAGES = 100;
-  for (let page = 0; page < MAX_PAGES; page += 1) {
+  for (let page = 0; page < MAX_BLOCK_PAGES; page += 1) {
     const query = cursor ? `?start_cursor=${encodeURIComponent(cursor)}` : "";
     const result = await runner({ args: ["api", `v1/blocks/${pageId}/children${query}`] });
     if (!result.ok) {
+      if (!options.failOnUnreadable && children.length > 0) return children;
       throw ntnFailure(`\u5217\u51FA\u9875\u9762 ${pageId} \u7684\u5B50\u5757`, result);
     }
     const parsed = parseJsonMaybe(result.stdout);
     if (!isPlainObject(parsed)) {
+      if (!options.failOnUnreadable && children.length > 0) return children;
       throw inputError(
         `\u9875\u9762 ${pageId} \u7684\u5B50\u5757\u5217\u8868\u65E0\u6CD5\u89E3\u6790\uFF0C\u4E0D\u80FD\u786E\u8BA4\u5B83\u6709\u591A\u5C11\u5B50\u9875\u9762\uFF0C\u56E0\u6B64\u62D2\u7EDD\u5220\u9664\u3002ntn \u8F93\u51FA\uFF1A${truncate((result.stdout || "").trim(), 200)}`,
         { id: pageId, enumerable: false }
@@ -2150,66 +2242,33 @@ async function listChildPages(runner, pageId) {
     const next = typeof parsed.next_cursor === "string" ? parsed.next_cursor : void 0;
     if (!hasMore) return children;
     if (!next) {
+      if (!options.failOnUnreadable && children.length > 0) return children;
       throw inputError(
         `\u9875\u9762 ${pageId} \u7684\u5B50\u5757\u62A5\u544A has_more=true \u5374\u6CA1\u6709 next_cursor\uFF0C\u65E0\u6CD5\u8BFB\u5B8C\u5B50\u9875\u9762\u5217\u8868\uFF0C\u56E0\u6B64\u62D2\u7EDD\u5220\u9664\u3002`,
         { id: pageId, enumerable: false }
       );
     }
     cursor = next;
-    if (page === MAX_PAGES - 1) {
+    if (page === MAX_BLOCK_PAGES - 1) {
+      if (!options.failOnUnreadable && children.length > 0) return children;
       throw inputError(
-        `\u9875\u9762 ${pageId} \u7684\u5B50\u5757\u8D85\u8FC7 ${MAX_PAGES} \u9875\u4ECD\u672A\u5217\u5B8C\uFF0C\u65E0\u6CD5\u786E\u8BA4\u5B83\u6709\u591A\u5C11\u5B50\u9875\u9762\uFF0C\u56E0\u6B64\u62D2\u7EDD\u5220\u9664\u3002\u8BF7\u5728 Notion \u91CC\u624B\u52A8\u786E\u8BA4\u5E76\u5220\u9664\u3002`,
+        `\u9875\u9762 ${pageId} \u7684\u5B50\u5757\u8D85\u8FC7 ${MAX_BLOCK_PAGES} \u9875\u4ECD\u672A\u5217\u5B8C\uFF0C\u65E0\u6CD5\u786E\u8BA4\u5B83\u6709\u591A\u5C11\u5B50\u9875\u9762\uFF0C\u56E0\u6B64\u62D2\u7EDD\u5220\u9664\u3002\u8BF7\u5728 Notion \u91CC\u624B\u52A8\u786E\u8BA4\u5E76\u5220\u9664\u3002`,
         { id: pageId, children_enumerated: children.length, enumerable: false }
       );
     }
   }
   return children;
 }
-async function pageTextLength(runner, pageId) {
-  let total = 0;
-  let cursor;
-  for (let page = 0; page < 100; page += 1) {
-    const query = cursor ? `?start_cursor=${encodeURIComponent(cursor)}` : "";
-    const result = await runner({ args: ["api", `v1/blocks/${pageId}/children${query}`] });
-    if (!result.ok) return void 0;
-    const parsed = parseJsonMaybe(result.stdout);
-    if (!isPlainObject(parsed)) return void 0;
-    const results = Array.isArray(parsed.results) ? parsed.results : [];
-    for (const block of results) {
-      if (!isPlainObject(block)) continue;
-      const payload = block[String(block.type)];
-      if (!isPlainObject(payload)) continue;
-      if (Array.isArray(payload.rich_text)) {
-        for (const item of payload.rich_text) {
-          if (isPlainObject(item) && typeof item.plain_text === "string") {
-            total += item.plain_text.length;
-          }
-        }
-      }
-      if (typeof payload.expression === "string") total += payload.expression.length;
-    }
-    const hasMore = parsed.has_more === true;
-    const next = typeof parsed.next_cursor === "string" ? parsed.next_cursor : void 0;
-    if (!hasMore || !next) return total;
-    cursor = next;
-  }
-  return void 0;
-}
-var SHRINK_CONFIRM_RATIO = 0.5;
-var SHRINK_GUARD_MIN_CHARS = 200;
 async function trashPage(params, runner) {
-  const id = requireId(params.id, "trash");
-  if (params.yes !== true) {
-    throw new InputError(
-      'trash \u4F1A\u5220\u9664\uFF08\u79FB\u5165\u56DE\u6536\u7AD9\uFF09\u9875\u9762\uFF0C\u5FC5\u987B\u663E\u5F0F\u4F20 yes: true\uFF08\u6216 "true" / "yes" / 1\uFF09\u624D\u4F1A\u8C03\u7528 ntn\uFF1B\u672C\u6B21\u6CA1\u6709\u8C03\u7528 ntn\u3002'
-    );
-  }
+  const { id } = params;
   const target = await classifyTrashTarget(runner, id);
   if (target.kind === "unreadable") {
-    throw ntnFailure(
-      `\u786E\u8BA4\u9875\u9762 ${id} \u7684\u7C7B\u578B\uFF08page / database / data source\uFF09`,
-      { ok: false, stdout: "", stderr: target.reason, code: null }
-    );
+    throw ntnFailure(`\u786E\u8BA4\u9875\u9762 ${id} \u7684\u7C7B\u578B\uFF08page / database / data source\uFF09`, {
+      ok: false,
+      stdout: "",
+      stderr: target.reason,
+      code: null
+    });
   }
   if (target.kind === "missing") {
     throw new InputError(
@@ -2219,22 +2278,22 @@ async function trashPage(params, runner) {
   }
   if (target.kind === "database") {
     throw new InputError(
-      `notion_page cannot delete a database (id ${id}). Removing a database, its data sources and every row in them is far more destructive than deleting a page, so this tool refuses even with yes: true. Ask the user to delete it in Notion (\u2022\u2022\u2022 \u2192 Delete) if that is really intended.`,
+      `notion_page_trash cannot delete a database (id ${id}). Removing a database, its data sources and every row in them is far more destructive than deleting a page, so this tool refuses even with yes: true. Ask the user to delete it in Notion (\u2022\u2022\u2022 \u2192 Delete) if that is really intended.`,
       { id, target: "database", refused: "database_delete" }
     );
   }
   if (target.kind === "page" && target.archived) {
-    return pageValue("trash", {
+    return pageValue({
       id,
       url: pageUrl(id),
+      already_archived: true,
       properties: [],
-      changed: [],
-      already_archived: true
+      changed: []
     });
   }
   if (target.kind === "page") {
-    const children = await listChildPages(runner, id);
-    if (children.length > 0 && params.recursive !== true) {
+    const children = await listChildPages(runner, id, { failOnUnreadable: !params.recursive });
+    if (children.length > 0 && !params.recursive) {
       throw new InputError(
         `\u9875\u9762 ${id} \u6709 ${children.length} \u4E2A\u5B50\u9875\u9762\u3002Notion \u4F1A\u8FDE\u5E26\u5F52\u6863\u6574\u68F5\u5B50\u6811\uFF0C\u6240\u4EE5\u9ED8\u8BA4\u62D2\u7EDD\u3002\u786E\u8BA4\u8981\u4E00\u8D77\u5220\u9664\u8BF7\u52A0 recursive: true\uFF1B\u53EA\u60F3\u5220\u7236\u9875\u9762\u8BF7\u5148\u5728 Notion \u91CC\u79FB\u8D70\u5B50\u9875\u9762\u3002`,
         {
@@ -2248,63 +2307,108 @@ async function trashPage(params, runner) {
   }
   const result = await runner({ args: ["pages", "trash", id, "--yes"] });
   if (!result.ok) throw ntnFailure("ntn pages trash", result);
-  return pageValue("trash", {
-    id,
-    url: pageUrl(id),
-    properties: [],
-    changed: ["trashed"]
-  });
+  return pageValue({ id, url: pageUrl(id), properties: [], changed: ["trashed"] });
 }
-var PAGE_PARAMETERS = {
+var PROPS_DESCRIPTION = `Object map of database column NAME \u2192 simplified value (e.g. {"Status":"\u8FDB\u884C\u4E2D","\u6807\u7B7E":["a","b"],"\u622A\u6B62\u65E5\u671F":"2025-01-31","Done":true}); {} = no property write. The value is converted by the column TYPE from the parent data source's schema: title/rich_text string; number number|numeric string; select/status string or {name} (""/null clears); multi_select string[]; date "YYYY-MM-DD" | ISO string | {start,end?,time_zone?}; checkbox boolean; url/email/phone string (""/null clears); people/relation string[] of ids. null clears a property where Notion allows it, and an object carrying its own type key (e.g. {"select":{"name":"Done"}}) is sent as-is. Unknown names and read-only columns (formula/rollup/created_time/\u2026) are rejected with hint_properties. COLUMNS ONLY: the page icon is the top-level icon parameter and the page body is the top-level body_content parameter, not props keys. No default property values are invented.`;
+var ICON_PARAMETERS = [
+  { type: "string", description: 'An emoji ("\u{1F3AF}") or an http(s) image URL.' },
+  { type: "object", additionalProperties: true, description: 'An already-typed Notion icon object, e.g. {"type":"emoji","emoji":"\u{1F3AF}"} or {"type":"external","external":{"url":"https://\u2026/a.png"}}.' },
+  { type: "null", description: "null clears the icon." }
+];
+var EDIT_ITEM_SCHEMA = {
   type: "object",
   properties: {
-    action: {
+    old_str: {
       type: "string",
-      enum: ["create", "edit", "attach", "trash"],
-      description: "create | edit | attach | trash"
+      description: "Required, non-empty. The existing text to find. It matches the block's PLAIN TEXT, not its markdown: to find text shown as **bold** write `text` without the asterisks, and write a plain `$` where notion_get returned `\\$`. Cross-block matches use \\n or \\n\\n."
     },
-    id: {
+    new_str: {
       type: "string",
-      description: "Page or row id (required for edit/attach/trash; create takes its container from parent)."
+      description: 'Required. The replacement text. "" DELETES old_str. It is markdown: a new_str containing \\n\\n creates separate blocks.'
     },
+    replace_all_matches: {
+      type: "boolean",
+      description: "Default false: if old_str matches more than one place the whole call fails and NOTHING is written. Set true to replace every occurrence. This is detected by Notion, not locally, so the tool cannot say which of your edits was ambiguous in advance \u2014 narrow the old_str or set this flag."
+    }
+  },
+  required: ["old_str", "new_str"],
+  additionalProperties: false
+};
+var CREATE_PARAMETERS = {
+  type: "object",
+  properties: {
     parent: {
       type: "string",
-      description: "create/attach: page:<id> | database:<id> | data-source:<id>, or a bare page/row id (a row id means a child row under that row). Attach only accepts page:<id> or a row id."
+      description: "Required. Where the page goes: page:<id> (child page), database:<id> | data-source:<id> (database row), or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / self-relation column)."
     },
     title: {
       type: "string",
-      description: "Page title. create: sets the title (also used when props carry the title property). edit: updates the title property."
+      description: 'Page title. A row in a database needs one (here, or as the title property in props, or as a leading "# Heading" in body_content).'
     },
-    content: {
+    props: { type: "object", additionalProperties: true, description: PROPS_DESCRIPTION },
+    icon: { oneOf: ICON_PARAMETERS, description: "The page icon." },
+    body_content: {
       type: "string",
-      description: "Page body Markdown. Alias for props.body_content; use one or the other, not both. edit with a body REPLACES the whole page (see the description)."
+      description: 'The page body as Markdown. A leading "# Heading" becomes the title when title is absent.'
+    }
+  },
+  required: ["parent"],
+  additionalProperties: false
+};
+var EDIT_PARAMETERS = {
+  type: "object",
+  properties: {
+    id: {
+      type: "string",
+      description: "Required. The page id (32 hex or dashed UUID) or its Notion URL."
     },
-    props: {
-      type: "object",
-      additionalProperties: true,
-      description: 'Object map of property name \u2192 simplified value ({} = omit). Two reserved keys are page fields, not columns: body_content is the page Markdown body, and icon is the page icon (an emoji like "\u{1F3AF}", an http(s) image URL, or null to clear it). Examples: {"body_content":"# \u6807\u9898\\n\\n\u6B63\u6587","Status":"\u8FDB\u884C\u4E2D","\u6807\u7B7E":["a","b"],"\u622A\u6B62\u65E5\u671F":"2025-01-31","Done":true} and {"icon":"\u{1F3AF}"}.'
+    edits: {
+      type: "array",
+      items: EDIT_ITEM_SCHEMA,
+      description: 'Find-and-replace operations, applied in order (edit[i+1] sees edit[i]\'s result). Max 100. replace_all_matches belongs on the INDIVIDUAL edit object, not on the call. THREE outcomes, do not conflate them: (a) every edit matches -> call succeeds, `warnings` absent; (b) SOME edit matches -> call SUCCEEDS (HTTP 200), the matched edits are applied, and each unmatched one comes back in `warnings` (code "no_match") with edits_applied/edits_missed carrying the tally \u2014 nothing is rolled back, so re-read the page before assuming what it contains; (c) NO edit matches -> the call FAILS with a validation_error from Notion and nothing is written (this is Notion\'s rule, not a local pre-check) \u2014 treat it as "my old_str were wrong", re-read the page with notion_get and build new ones from that. A MULTIPLE match is a different hard error: nothing is written at all unless that one edit sets replace_all_matches:true. Omit `edits` and pass body_content to APPEND instead.'
+    },
+    body_content: {
+      type: "string",
+      description: "Markdown to APPEND at the end of the page. Only used when `edits` is empty or absent \u2014 this is the ONLY way to add new content, and edit never replaces the whole page. Passing body_content TOGETHER with a non-empty edits is an INVALID_INPUT error (nothing is written): append and find-replace cannot be combined in one call."
+    },
+    props: { type: "object", additionalProperties: true, description: PROPS_DESCRIPTION },
+    title: { type: "string", description: "New page title (writes the title property)." },
+    icon: { oneOf: ICON_PARAMETERS, description: "New page icon; null clears it." },
+    parent: {
+      type: "string",
+      description: "Move the page: page:<id> (under that page), or a bare PAGE id, or a bare ROW id (re-link the Parent-item relation of that row). Database/data source parents are not accepted \u2014 use notion_page_create to add a row."
     },
     yes: {
       type: "boolean",
-      description: "trash: must be true, otherwise the tool refuses without calling ntn. attach (row\u2192row): consent to replacing an existing Parent-item link that points at a different parent."
+      description: "Only for a row\u2192row move: consent to REPLACE the row's existing Parent-item link, which otherwise refuses with the current parent ids. Ignored nowhere else \u2014 passing it without parent is an error."
+    }
+  },
+  required: ["id"],
+  additionalProperties: false
+};
+var TRASH_PARAMETERS = {
+  type: "object",
+  properties: {
+    id: {
+      type: "string",
+      description: "Required. The page id (32 hex or dashed UUID) or its Notion URL."
     },
-    confirm_shrink: {
+    yes: {
       type: "boolean",
-      description: "edit on a page with substantial body: consent to replacing the whole body with text that is much shorter (under half). edit's body_content REPLACES the page, so this guard exists to stop a one-section fix from erasing everything else."
+      description: "Required true. Without it the tool refuses without calling ntn, so a trash is never a guess."
     },
     recursive: {
       type: "boolean",
-      description: "trash only: consent to delete a page together with its child pages (Notion archives the whole subtree). Without it a page that has child pages is refused with the child ids."
+      description: "Consent to delete the page together with its child pages (Notion archives the whole subtree). Without it a page that has child pages is refused with the child ids."
     }
   },
-  required: ["action"],
+  required: ["id", "yes"],
   additionalProperties: false
 };
 var PAGE_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
     ok: { type: "boolean", const: true },
-    action: { type: "string", enum: ["create", "edit", "attach", "trash"] },
     id: { type: "string" },
     url: { type: "string" },
     title: { type: "string" },
@@ -2312,49 +2416,158 @@ var PAGE_OUTPUT_SCHEMA = {
     properties: { type: "array", items: { type: "string" } },
     changed: { type: "array", items: { type: "string" } },
     icon: { oneOf: [{ type: "string" }, { type: "null" }] },
-    body_chars_before: { type: "integer" },
-    body_chars_after: { type: "integer" },
+    created: { type: "boolean", const: true },
     parent_item_row_id: { type: "string" },
     parent_item_property: { type: "string" },
     already_linked: { type: "boolean" },
     already_archived: { type: "boolean" },
     replaced_parent_ids: { type: "array", items: { type: "string" } },
-    cycle_check: { type: "string" }
+    cycle_check: { type: "string" },
+    warnings: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          code: { type: "string" },
+          message: { type: "string" }
+        },
+        required: ["code", "message"],
+        additionalProperties: false
+      }
+    },
+    appended: { type: "boolean", const: true },
+    edits_sent: { type: "integer" },
+    edits_applied: { type: "integer" },
+    edits_missed: { type: "integer" },
+    truncated: { type: "boolean", const: true }
   },
-  required: ["ok", "action", "properties", "changed"],
+  required: ["ok", "properties", "changed"],
   additionalProperties: false
 };
-function createNotionPageTool(deps = {}) {
+function createNotionPageCreateTool(deps = {}) {
   const runner = deps.runNtn ?? runNtn;
   return defineNotionTool({
-    name: "notion_page",
-    description: `Create, edit, attach (re-parent) or trash one Notion page. put the page Markdown in props.body_content and the page icon in props.icon; there is no top-level content or icon parameter. action=create needs parent: page:<id> | database:<id> | data-source:<id>, or a bare database row id (a child row, linked through the data source's Parent-item / self-relation column); props are applied by a second request, and a page in a database also needs a title (the title parameter, the title property in props, or a leading "# Heading" in props.body_content). If that second request fails the new page is trashed so no half-made page is left behind, and the error says whether cleanup succeeded: rollback reports trashed, trash_failed or unknown_id, and partial:true means something was left behind. action=edit needs id plus at least one of props (body_content / icon / columns) or title. WARNING: props.body_content in an edit REPLACES the entire page body \u2014 it is not append and not a partial edit, so anything not included in it is deleted. To change one section, resend the complete body; to change only title/properties/icon, do not pass body_content at all. A replacement that leaves under half the previous text is refused unless confirm_shrink:true. action=attach needs id and parent and only re-parents: page\u2192page moves the page, row\u2192row sets the Parent-item relation, and it is not a file upload; it refuses cycle-forming moves and refuses to replace a different existing parent unless yes:true (the same parent is a no-op). action=trash needs id and yes:true, otherwise nothing is called. props is an object map keyed by property NAME (several keys = several properties, {} = no change), and its values are converted by the column type: unknown names and read-only columns are rejected with the writable columns in hint_properties. No default property values are invented.`,
+    name: "notion_page_create",
+    description: `Create one Notion page or database row. parent is required: page:<id> (child page), database:<id> | data-source:<id> (a row in that database), or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / self-relation column). body_content is the page Markdown and icon is the page icon \u2014 both are TOP-LEVEL parameters, not props keys. props carries database COLUMNS only (name \u2192 simplified value), converted by the parent's column types; unknown names and read-only columns are rejected with the writable ones in hint_properties. A page inside a database still needs a title (the title parameter, the title property in props, or a leading "# Heading" in body_content). The columns and icon are written by a second request; if that request fails the new page is trashed so no half-made page is left behind, and the error says whether cleanup worked (rollback: trashed | trash_failed | unknown_id; partial:true means something was left behind). To add content later use notion_page_edit (find-and-replace or append); this tool never edits an existing page.`,
     timeoutMs: TOOL_TIMEOUTS.page,
-    // Every action can write (create/edit/attach/trash mutate the workspace), so
-    // page calls stay exclusive: never overlap two of them.
+    // Every operation here can write, so page calls stay exclusive: never overlap two.
     isConcurrencySafe: () => false,
-    parameters: PAGE_PARAMETERS,
+    parameters: CREATE_PARAMETERS,
     output: {
       schema: PAGE_OUTPUT_SCHEMA,
       render: (_args, value) => textBlocks(describePageValue(value))
     },
     async execute(args, exec) {
-      const raw = args;
-      const action = readEnum(raw.action, "action", [
-        { value: "create", aliases: ["new", "add", "make", "insert"] },
-        { value: "edit", aliases: ["update", "modify", "change", "set", "patch"] },
-        { value: "attach", aliases: ["move", "reparent", "re-parent", "link"] },
-        { value: "trash", aliases: ["delete", "remove", "archive", "destroy", "trash"] }
-      ]);
+      rejectUnexpectedParams(
+        args,
+        ["parent", "title", "props", "icon", "body_content"],
+        "notion_page_create \u53EA\u63A5\u53D7 { parent, title, props, icon, body_content }\u3002"
+      );
       if (exec.signal?.aborted) throw abortError();
-      const typedAction = action;
-      rejectUnexpectedParams(raw, typedAction);
-      const typed = normalizePageArgs(raw, typedAction);
-      const run = bindSignal(runner, exec.signal);
-      if (typedAction === "create") return await createPage(typed, run);
-      if (typedAction === "edit") return await editPage(typed, run);
-      if (typedAction === "attach") return await attachPage(typed, run);
-      return await trashPage(typed, run);
+      const title = normalizeTitle(args.title);
+      const props = normalizeProps(args.props);
+      const icon = normalizeIcon(args.icon);
+      const body = normalizeBody(args.body_content, false);
+      const params = {
+        parent: args.parent,
+        ...title ? { title } : {},
+        ...props ? { props } : {},
+        ...icon ? { icon } : {},
+        ...body === void 0 ? {} : { body }
+      };
+      return await createPage(params, bindSignal(runner, exec.signal));
+    }
+  });
+}
+function createNotionPageEditTool(deps = {}) {
+  const runner = deps.runNtn ?? runNtn;
+  return defineNotionTool({
+    name: "notion_page_edit",
+    description: 'Change an existing Notion page: find-and-replace its text, append Markdown, update title/columns/icon, and/or move it. A single call may combine all of these; they are applied in this fixed order \u2014 (1) body content, (2) title/props/icon, (3) parent move \u2014 and `changed` reports each one that happened. CONTENT: `edits` is a list of {old_str, new_str} operations applied in order, so edit[i+1] sees edit[i]\'s result. old_str matches the block\'s PLAIN TEXT, not its markdown: write `text` for **text**, and a plain $ where notion_get showed \\$; a match can span blocks with \\n. new_str "" DELETES the matched text. MATCH OUTCOMES, three distinct cases \u2014 do not conflate them. (a) EVERY edit matches: call succeeds, `warnings` is absent. (b) SOME edit matches: the call SUCCEEDS, the matching edits stay applied, the unmatched ones come back in `warnings` (code "no_match") and edits_applied/edits_missed give the tally \u2014 nothing is rolled back, so re-read the page before assuming what it now contains; `warnings` is ABSENT when nothing missed (it is never an empty array). (c) NO edit matches: the call FAILS with Notion\'s validation_error and nothing is written. That is Notion\'s rule, not a local pre-check \u2014 treat it as "my old_str were wrong": re-read the page with notion_get and build new old_str from what it actually says. SEPARATELY, an old_str matching MORE THAN ONE place is also a hard error with nothing written, unless THAT edit sets replace_all_matches:true. There is NO whole-page replace: when `edits` is empty or absent and body_content is present, body_content is APPENDED to the end of the page (passing both edits and body_content is an error \u2014 do it in two calls). FIELDS: icon and body_content are TOP-LEVEL parameters, not props keys; props carries database COLUMNS only (name \u2192 simplified value, converted by column type). MOVE: parent page:<id> (or a bare page id) re-parents the page via POST /v1/pages/{id}/move; a bare ROW id re-links that row\'s Parent-item relation. Re-linking a row that already has a different parent needs yes:true (otherwise it refuses and shows the current parent ids); cycle-forming moves are refused. If step (2) or (3) fails after content was already written, the error says exactly what already landed \u2014 read it before retrying. When the returned body was truncated the result says so: truncated markdown is NOT the full page, so do not derive the next old_str from it.',
+    timeoutMs: TOOL_TIMEOUTS.page,
+    isConcurrencySafe: () => false,
+    parameters: EDIT_PARAMETERS,
+    output: {
+      schema: PAGE_OUTPUT_SCHEMA,
+      render: (_args, value) => textBlocks(describePageValue(value))
+    },
+    async execute(args, exec) {
+      rejectUnexpectedParams(
+        args,
+        ["id", "edits", "body_content", "props", "title", "icon", "parent", "yes"],
+        "notion_page_edit \u53EA\u63A5\u53D7 { id, edits, body_content, props, title, icon, parent, yes }\u3002"
+      );
+      if (exec.signal?.aborted) throw abortError();
+      const id = requireId(args.id, "edit");
+      const normalizedProps = normalizeProps(args.props);
+      const { edits, props } = withEditAlias(readContentEdits(args.edits), normalizedProps);
+      const body = normalizeBody(args.body_content, false);
+      const icon = normalizeIcon(args.icon);
+      const title = normalizeTitle(args.title);
+      const hasYes = args.yes !== void 0;
+      const yes = hasYes ? readBoolean(args.yes, "yes") : false;
+      if (hasYes && args.parent === void 0) {
+        throw new InputError(
+          "yes \u53EA\u7528\u4E8E\u300C\u884C\u2192\u884C\u79FB\u52A8\u65F6\u8986\u76D6\u5DF2\u6709 Parent-item \u94FE\u63A5\u300D\uFF0C\u6CA1\u6709 parent \u65F6\u4F20 yes \u6CA1\u6709\u610F\u4E49\uFF1B\u8BF7\u53BB\u6389 yes\u3002\u672C\u6B21\u6CA1\u6709\u5199\u5165\u3002",
+          { field: "yes" }
+        );
+      }
+      const appends = body !== void 0 && body.trim() !== "";
+      if (edits.length > 0 && body !== void 0) {
+        throw new InputError(
+          "edits\uFF08\u67E5\u627E\u66FF\u6362\uFF09\u548C body_content\uFF08\u8FFD\u52A0\u5230\u672B\u5C3E\uFF09\u4E0D\u80FD\u540C\u65F6\u4F20\uFF1A\u4E8C\u9009\u4E00\u3002\u9700\u8981\u65E2\u6539\u53C8\u8FFD\u52A0\u65F6\u8BF7\u5206\u4E24\u6B21\u8C03\u7528 notion_page_edit\u3002\u672C\u6B21\u6CA1\u6709\u5199\u5165\u3002",
+          { conflict: true, fields: ["edits", "body_content"] }
+        );
+      }
+      if (edits.length === 0 && !appends && props === void 0 && title === void 0 && icon === void 0 && args.parent === void 0) {
+        throw new InputError(
+          "notion_page_edit \u9700\u8981 edits\u3001body_content\u3001props\u3001title\u3001icon\u3001parent \u81F3\u5C11\u4E00\u9879\uFF1B\u7A7A\u8C03\u7528\u4E0D\u4F1A\u4FEE\u6539\u9875\u9762\u3002" + (body !== void 0 ? "body_content \u662F\u7A7A\u767D\uFF1A\u8FFD\u52A0\u7A7A\u767D\u5185\u5BB9\u4E0D\u4F1A\u4FEE\u6539\u9875\u9762\u3002" : "\u8981\u8FFD\u52A0\u5185\u5BB9\u8BF7\u4F20 body_content\uFF08\u4E0D\u4F20 edits\uFF09\u3002")
+        );
+      }
+      const params = {
+        id,
+        edits,
+        ...appends ? { body } : {},
+        ...props ? { props } : {},
+        ...title ? { title } : {},
+        ...icon ? { icon } : {},
+        ...args.parent === void 0 ? {} : { parent: args.parent },
+        yes
+      };
+      return await editPage(params, bindSignal(runner, exec.signal));
+    }
+  });
+}
+function createNotionPageTrashTool(deps = {}) {
+  const runner = deps.runNtn ?? runNtn;
+  return defineNotionTool({
+    name: "notion_page_trash",
+    description: "Move one Notion page or database row to the trash. yes:true is required, otherwise nothing is called. Three guards a bare delete does not give you: a database or data source is refused even with yes:true (deleting one destroys its rows too \u2014 ask the user to do it in Notion); a page that is already in the trash returns success with already_archived:true instead of an error; and a page with child pages is refused unless recursive:true, because Notion archives the whole subtree \u2014 the error lists the child ids so you can show the user exactly what else would go. Trash is idempotent: calling it twice is safe.",
+    timeoutMs: TOOL_TIMEOUTS.page,
+    isConcurrencySafe: () => false,
+    parameters: TRASH_PARAMETERS,
+    output: {
+      schema: PAGE_OUTPUT_SCHEMA,
+      render: (_args, value) => textBlocks(describePageValue(value))
+    },
+    async execute(args, exec) {
+      rejectUnexpectedParams(
+        args,
+        ["id", "yes", "recursive"],
+        "notion_page_trash \u53EA\u63A5\u53D7 { id, yes, recursive }\u3002"
+      );
+      if (exec.signal?.aborted) throw abortError();
+      if (args.yes === void 0 || !readBoolean(args.yes, "yes")) {
+        throw new InputError(
+          'notion_page_trash \u4F1A\u5220\u9664\uFF08\u79FB\u5165\u56DE\u6536\u7AD9\uFF09\u9875\u9762\uFF0C\u5FC5\u987B\u663E\u5F0F\u4F20 yes: true\uFF08\u6216 "true" / "yes" / 1\uFF09\u624D\u4F1A\u8C03\u7528 ntn\uFF1B\u672C\u6B21\u6CA1\u6709\u8C03\u7528 ntn\u3002',
+          { yes: args.yes }
+        );
+      }
+      const params = {
+        id: requireId(args.id, "trash"),
+        recursive: args.recursive === void 0 ? false : readBoolean(args.recursive, "recursive")
+      };
+      return await trashPage(params, bindSignal(runner, exec.signal));
     }
   });
 }
@@ -3034,7 +3247,9 @@ function apply(ctx, config) {
   const run = makeRunner(() => readConfig(config));
   ctx.tools.register(createNotionSearchTool({ run }));
   ctx.tools.register(createNotionGetTool(run));
-  ctx.tools.register(createNotionPageTool({ runNtn: run }));
+  ctx.tools.register(createNotionPageCreateTool({ runNtn: run }));
+  ctx.tools.register(createNotionPageEditTool({ runNtn: run }));
+  ctx.tools.register(createNotionPageTrashTool({ runNtn: run }));
   ctx.tools.register(createNotionQueryTool({ runNtn: run }));
 }
 export {
