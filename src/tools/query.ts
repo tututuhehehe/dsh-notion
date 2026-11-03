@@ -32,6 +32,7 @@ import {
   TOOL_TIMEOUTS,
 } from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
+import { QUERY_PARAMS } from "../text/params.ts";
 import { TOOL_DESCRIPTIONS } from "../text/tools.ts";
 import { parseResolveDataSources } from "../lib/datasources.ts";
 import { describeFailure } from "../lib/failures.ts";
@@ -503,36 +504,32 @@ const QUERY_PARAMETERS = {
       // then degrades this whole tool's argument type to `unknown`. The empty case
       // is guarded at execution instead.
       type: "string",
-      description:
-        "Notion data source id, database id, or Notion URL. If the database has multiple data sources, pass one data source id explicitly.",
+      description: QUERY_PARAMS.database_or_data_source,
     },
     limit: {
       type: "integer",
-      description: `Max rows per page (default ${DEFAULT_QUERY_LIMIT}, clamped to ${MAX_QUERY_LIMIT}).`,
+      description: QUERY_PARAMS.limit({ fallback: DEFAULT_QUERY_LIMIT, max: MAX_QUERY_LIMIT }),
     },
     start_cursor: {
       oneOf: [{ type: "string" }, { type: "null" }],
-      description:
-        "Pagination cursor from a previous response's next_cursor. Omit for the first page.",
+      description: QUERY_PARAMS.start_cursor,
     },
     filter: {
       type: "object",
       additionalProperties: true,
-      description: "Raw Notion filter JSON object, passed through verbatim.",
+      description: QUERY_PARAMS.filter,
     },
     under: {
       type: "string",
-      description:
-        "Only rows linked to this parent row (id or Notion URL), filtered through the data source's Parent-item / self-relation column. Combined with filter via AND; refuses when filter already targets that same relation column.",
+      description: QUERY_PARAMS.sort,
     },
     sort: {
       oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }],
-      description: 'Sort spec "Property asc|desc", or an ordered array of specs for multiple sorts.',
+      description: QUERY_PARAMS.under,
     },
     include_content: {
       type: "boolean",
-      description:
-        "Also fetch each row's Markdown with ntn pages get (default false; one extra call per row).",
+      description: QUERY_PARAMS.include_content,
     },
   },
   required: ["database_or_data_source"],

@@ -89,6 +89,16 @@ import {
   TOOL_TIMEOUTS,
 } from "../dsh/tool.ts";
 import type { JsonObject, NotionTool } from "../dsh/tool.ts";
+import {
+  CREATE_PARAMS,
+  EDIT_ITEM_TEXT,
+  EDIT_PARAMS,
+  ICON_PARAMETER_TEXT_CREATE,
+  ICON_PARAMETER_TEXT_EDIT,
+  ICON_TEXT,
+  PROPS_DESCRIPTION,
+  TRASH_PARAMS,
+} from "../text/params.ts";
 import { TOOL_DESCRIPTIONS } from "../text/tools.ts";
 import { parseResolveDataSources } from "../lib/datasources.ts";
 import { failureHint, failureStatus, snippet } from "../lib/failures.ts";
@@ -2671,18 +2681,10 @@ async function trashPage(
  * maximum or format — the registry rejects those.
  * ------------------------------------------------------------------ */
 
-/** Shared description of the `props` map; identical on create and edit. */
-const PROPS_DESCRIPTION =
-  "Object map of database column NAME → simplified value (e.g. {\"Status\":\"进行中\",\"标签\":[\"a\",\"b\"],\"截止日期\":\"2025-01-31\",\"Done\":true}); {} = no property write. " +
-  "The value is converted by the column TYPE from the parent data source's schema: title/rich_text string; number number|numeric string; select/status string or {name} (\"\"/null clears); multi_select string[]; date \"YYYY-MM-DD\" | ISO string | {start,end?,time_zone?}; checkbox boolean; url/email/phone string (\"\"/null clears); people/relation string[] of ids. " +
-  "null clears a property where Notion allows it, and an object carrying its own type key (e.g. {\"select\":{\"name\":\"Done\"}}) is sent as-is. " +
-  "Unknown names and read-only columns (formula/rollup/created_time/…) are rejected with hint_properties. " +
-  "COLUMNS ONLY: the page icon is the top-level icon parameter and the page body is the top-level body_content parameter, not props keys. No default property values are invented.";
-
 const ICON_PARAMETERS = [
-  { type: "string", description: "An emoji (\"🎯\") or an http(s) image URL." },
-  { type: "object", additionalProperties: true, description: "An already-typed Notion icon object, e.g. {\"type\":\"emoji\",\"emoji\":\"🎯\"} or {\"type\":\"external\",\"external\":{\"url\":\"https://…/a.png\"}}." },
-  { type: "null", description: "null clears the icon." },
+  { type: "string", description: ICON_TEXT.string },
+  { type: "object", additionalProperties: true, description: ICON_TEXT.object },
+  { type: "null", description: ICON_TEXT.null },
 ];
 
 /** Notion rejects an empty `old_str`; that is enforced in readContentEdits, not in the schema. */
@@ -2691,25 +2693,15 @@ const EDIT_ITEM_SCHEMA = {
   properties: {
     old_str: {
       type: "string",
-      description:
-        "Required, non-empty. The existing text to find. Substring matching: one word, one sentence or several " +
-        "blocks all work — you do not have to resend the whole paragraph. " +
-        "COPY WHAT notion_get SHOWED YOU, MARKERS AND ALL — that always matches, at any length. " +
-        "A marker-free plain fragment also works, but only if it sits inside ONE formatting run: on " +
-        "`Alpha **bold** omega`, `bold` and `Alpha ` match, `Alpha bold` does not (it crosses the bold boundary). " +
-        "So the one way to fail is a plain fragment spanning a formatting change — when unsure, copy the markers. " +
-        "Adjacent blocks join with \\n, which merges them on replace. A `$` may be bare or escaped.",
+      description: EDIT_ITEM_TEXT.old_str,
     },
     new_str: {
       type: "string",
-      description:
-        "Required. The replacement text. \"\" DELETES old_str. It is markdown, so **bold**, `code`, [link](url), ## headings and - list items all render as that formatting; a new_str containing \\n\\n creates separate blocks and a single \\n is a line break inside one block. " +
-        "A `$` may be written bare or escaped — this tool removes the escape before sending, so pasting the \\\\$ that notion_get renders is safe.",
+      description: EDIT_ITEM_TEXT.new_str,
     },
     replace_all_matches: {
       type: "boolean",
-      description:
-        "Default false: if old_str matches more than one place the whole call fails and NOTHING is written. Set true to replace every occurrence. This is detected by Notion, not locally, so the tool cannot say which of your edits was ambiguous in advance — narrow the old_str or set this flag.",
+      description: EDIT_ITEM_TEXT.replace_all_matches,
     },
   },
   required: ["old_str", "new_str"],
@@ -2721,19 +2713,17 @@ const CREATE_PARAMETERS = {
   properties: {
     parent: {
       type: "string",
-      description:
-        "Where the page goes. OMIT it to create the page at the WORKSPACE ROOT (Notion's default when no parent is given; such a page only has a title, so props cannot carry columns). Otherwise: page:<id> (child page), database:<id> | data-source:<id> (a row in that database), or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / self-relation column). A Notion URL is accepted anywhere an id is: the id is extracted from it.",
+      description: CREATE_PARAMS.parent,
     },
     title: {
       type: "string",
-      description:
-        "Page title. A row in a database needs one (here, or as the title property in props, or as a leading \"# Heading\" in body_content).",
+      description: CREATE_PARAMS.title,
     },
     props: { type: "object", additionalProperties: true, description: PROPS_DESCRIPTION },
-    icon: { oneOf: ICON_PARAMETERS, description: "The page icon." },
+    icon: { oneOf: ICON_PARAMETERS, description: ICON_PARAMETER_TEXT_CREATE },
     body_content: {
       type: "string",
-      description: "The page body as Markdown. A leading \"# Heading\" becomes the title when title is absent.",
+      description: CREATE_PARAMS.body_content,
     },
   },
   // `parent` is NOT required: omitting it creates the page at the WORKSPACE ROOT, which
@@ -2747,38 +2737,27 @@ const EDIT_PARAMETERS = {
   properties: {
     id: {
       type: "string",
-      description: "Required. The page id (32 hex or dashed UUID) or its Notion URL.",
+      description: EDIT_PARAMS.id,
     },
     edits: {
       type: "array",
       items: EDIT_ITEM_SCHEMA,
-      description:
-        "Find-and-replace operations, applied in order (edit[i+1] sees edit[i]'s result). Max 100. " +
-        "replace_all_matches belongs on the INDIVIDUAL edit object, not on the call. " +
-        "Notion does the matching, so a call can end three ways: " +
-        "all match -> success; " +
-        "SOME match -> success, with the misses in `warnings` (nothing is rolled back, so do not assume the page now equals what you sent); " +
-        "NONE match -> the call fails and nothing is written, which means the old_str were stale: re-read with notion_get instead of retrying the same string. " +
-        "An old_str matching MORE THAN ONE place is a separate hard error: nothing is written unless that edit sets replace_all_matches:true. " +
-        "Omit `edits` and pass body_content to APPEND instead.",
+      description: EDIT_PARAMS.edits,
     },
     body_content: {
       type: "string",
-      description:
-        "Markdown to APPEND at the end of the page. Only used when `edits` is empty or absent — this is the ONLY way to add new content, and edit never replaces the whole page. Passing body_content TOGETHER with a non-empty edits is an INVALID_INPUT error (nothing is written): append and find-replace cannot be combined in one call.",
+      description: EDIT_PARAMS.body_content,
     },
     props: { type: "object", additionalProperties: true, description: PROPS_DESCRIPTION },
-    title: { type: "string", description: "New page title (writes the title property)." },
-    icon: { oneOf: ICON_PARAMETERS, description: "New page icon; null clears it." },
+    title: { type: "string", description: EDIT_PARAMS.title },
+    icon: { oneOf: ICON_PARAMETERS, description: ICON_PARAMETER_TEXT_EDIT },
     parent: {
       type: "string",
-      description:
-        "Move the page: page:<id> (under that page), or a bare PAGE id, or a bare ROW id (re-link the Parent-item relation of that row). A Notion URL is accepted anywhere an id is. Database/data source parents are not accepted — use notion_page_create to add a row.",
+      description: EDIT_PARAMS.parent,
     },
     yes: {
       type: "boolean",
-      description:
-        "Only for a row→row move: consent to REPLACE the row's existing Parent-item link, which otherwise refuses with the current parent ids. Ignored nowhere else — passing it without parent is an error.",
+      description: EDIT_PARAMS.yes,
     },
   },
   required: ["id"],
@@ -2790,17 +2769,15 @@ const TRASH_PARAMETERS = {
   properties: {
     id: {
       type: "string",
-      description: "Required. The page id (32 hex or dashed UUID) or its Notion URL.",
+      description: TRASH_PARAMS.id,
     },
     yes: {
       type: "boolean",
-      description:
-        "Required true. Without it the tool refuses without calling ntn, so a trash is never a guess.",
+      description: TRASH_PARAMS.yes,
     },
     recursive: {
       type: "boolean",
-      description:
-        "Consent to delete the page together with its child pages (Notion archives the whole subtree). Without it a page that has child pages is refused with the child ids.",
+      description: TRASH_PARAMS.recursive,
     },
   },
   required: ["id", "yes"],

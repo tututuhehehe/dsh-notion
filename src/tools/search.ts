@@ -23,6 +23,7 @@ import {
   TOOL_TIMEOUTS,
 } from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
+import { SEARCH_PARAMS } from "../text/params.ts";
 import { TOOL_DESCRIPTIONS } from "../text/tools.ts";
 import { describeFailure, snippet } from "../lib/failures.ts";
 import { parseJsonStdout, runNtn } from "../lib/runNtn.ts";
@@ -277,18 +278,16 @@ export function createNotionSearchTool(deps: Partial<SearchDeps> = {}): NotionTo
       properties: {
         query: {
           type: "string",
-          description:
-            "Keyword matched against object TITLES only (never body text). See the tool description for how " +
-            "matching works: it is token-OR, and an exact title in double quotes is the precise lookup.",
+          description: SEARCH_PARAMS.query,
         },
         limit: {
           type: "integer",
-          description: `Max results (default ${DEFAULT_LIMIT}). Values above ${MAX_LIMIT} are clamped to ${MAX_LIMIT}.`,
+          description: SEARCH_PARAMS.limit({ fallback: DEFAULT_LIMIT, max: MAX_LIMIT }),
         },
         filter_object: {
           type: "string",
           enum: ["page", "database"],
-          description: "Restrict hits to pages or databases (data sources). Omit to search both.",
+          description: SEARCH_PARAMS.filter_object,
         },
       },
       required: ["query"],

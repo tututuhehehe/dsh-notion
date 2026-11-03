@@ -28,6 +28,7 @@ import {
   TOOL_TIMEOUTS,
 } from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
+import { GET_PARAMS } from "../text/params.ts";
 import { TOOL_DESCRIPTIONS } from "../text/tools.ts";
 import { describeFailure, failureHint } from "../lib/failures.ts";
 import { extractNotionId } from "../lib/ids.ts";
@@ -119,16 +120,12 @@ const GET_PARAMETERS = {
   properties: {
     id_or_url: {
       type: "string",
-      description:
-        "Notion page or database ID (dashed UUID or 32-character id) or a notion.so / app.notion.com URL.",
+      description: GET_PARAMS.id_or_url,
     },
     format: {
       type: "string",
       enum: ["md", "json"],
-      description:
-        "Page output. 'md' (default) returns the Markdown body with properties as frontmatter; " +
-        "'json' returns the structured page payload (markdown plus url/title/truncation metadata). " +
-        "Databases are always returned as schema, regardless of format.",
+      description: GET_PARAMS.format,
     },
   },
   required: ["id_or_url"],
