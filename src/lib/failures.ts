@@ -34,6 +34,11 @@ const FAILURE_HINTS: readonly FailureHint[] = [
     hint: "Hint: the Notion CLI is not installed where this process can see it. Install it with `npm i -g ntn` (or `curl -fsSL https://ntn.dev | bash`), then run `ntn login`.",
   },
   {
+    // The binary exists but the OS refused to execute it — a different fix from "missing".
+    match: /EACCES|EPERM/i,
+    hint: "Hint: `ntn` was found but the OS refused to execute it (EACCES/EPERM). Fix the file's permissions or its mount options; reinstalling will not help while the permission is wrong.",
+  },
+  {
     match: /api token is invalid|unauthorized|\b401\b|invalid_token/i,
     hint: "Hint: the token was rejected. Set a valid NOTION_API_TOKEN (or run `ntn login`), and make sure the target pages/databases are shared with that integration.",
   },

@@ -328,7 +328,7 @@ Multiple matches found for "<old_str>". Found N matches...
 
 **`old_str` 可以跨块。** 用 `\n` 或 `\n\n` 把相邻两块的文本连起来就能命中跨块的一段，替换时整段按 `new_str` 的块结构重写。
 
-**`truncated: true` 时不要用它来写 `old_str`。** 返回里带 `truncated: true` 表示 Notion 截断了返回的正文——那**不是**完整页面，从里面复制出来的 `old_str` 很可能匹配不到，或匹配到你以为只有一处的地方。读完整页请用 `notion_get`（必要时用 `format="json"`）或读一个更窄的范围。
+**`truncated: true` 时不要用它来写 `old_str`。** 返回里带 `truncated: true` 表示 Notion 截断了返回的正文——那**不是**完整页面，从里面复制出来的 `old_str` 很可能匹配不到，或匹配到你以为只有一处的地方。补救办法：`format="json"` 看 `unknown_block_ids`；子页面各有自己的 id，可以单独读；`notion_page_edit` 只要有准确的 `old_str` 就能改，不需要先读完整页；数据库改用 `notion_query` 按 `limit` / `start_cursor` 取行。实测截断很少见——229 KB、1000 块的页面照样整页返回。
 
 **`old_str` 不要覆盖到子页面/子数据库块。** 如果 `old_str` 太宽、把嵌入的 `<page url="…">标题</page>` 或 `<database>` 块也包了进去，`new_str` 就会**删掉那个子页面**，Notion 会直接拒绝：
 
