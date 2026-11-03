@@ -205,10 +205,13 @@ describe("searchNotion", () => {
       code: 4,
       stderr: "error: Public API request failed: API token is invalid.",
     });
-    await assert.rejects(
-      () => searchNotion({ query: "notion" }, runner),
-      /the token was rejected — set a valid NOTION_API_TOKEN/
-    );
+    // The hint wording lives in src/lib/failures.ts (shared by every Notion tool), so this
+    // pins WHICH hint is chosen — token, never the workspace advice that would also fire.
+    await assert.rejects(() => searchNotion({ query: "notion" }, runner), (error: Error) => {
+      assert.match(error.message, /the token was rejected\. Set a valid NOTION_API_TOKEN/);
+      assert.doesNotMatch(error.message, /not authenticated yet/);
+      return true;
+    });
   });
 
   it("surfaces a missing-workspace error with the login hint", async () => {
@@ -217,12 +220,12 @@ describe("searchNotion", () => {
       code: 4,
       stderr: "error: No workspace selected.",
     });
-    await assert.rejects(() => searchNotion({ query: "notion" }, runner), /authenticate first/);
+    await assert.rejects(() => searchNotion({ query: "notion" }, runner), /not authenticated yet\. Run `ntn login`/);
   });
 
   it("surfaces an install hint when ntn is not on PATH", async () => {
     const runner = runnerReturning("", [], { ok: false, code: null, stderr: "spawn ntn ENOENT" });
-    await assert.rejects(() => searchNotion({ query: "notion" }, runner), /install the Notion CLI/);
+    await assert.rejects(() => searchNotion({ query: "notion" }, runner), /Notion CLI is not installed/);
   });
 
   it("fails before spawning ntn when query is blank", async () => {
@@ -304,6 +307,17 @@ describe("createNotionSearchTool", () => {
     assert.deepEqual(tool.parameters.required, ["query"]);
     assert.deepEqual(Object.keys(tool.parameters.properties).sort(), ["filter_object", "limit", "query"]);
     assert.equal(tool.parameters.additionalProperties, false);
+  });
+
+  // The reported bug: the tool description and the query parameter described matching
+  // differently (token-OR vs the old "FUZZY match" wording), so a model read one mental
+  // model or the other depending on where it looked. Semantics live in ONE place.
+  it("states matching semantics once, in the tool description", () => {
+    const tool = mountWith(runnerReturning("{}"));
+    assert.match(tool.description, /TOKEN-OR, NOT SUBSTRING/);
+    const query = String(tool.parameters.properties.query.description);
+    assert.match(query, /See the tool description/);
+    assert.doesNotMatch(query, /FUZZY|matches words inside the title/);
   });
 
   // DSH tool definitions have no per-call preview channel: there is no `onUpdate`, so there is

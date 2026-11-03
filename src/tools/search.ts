@@ -23,6 +23,7 @@ import {
   TOOL_TIMEOUTS,
 } from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
+import { describeFailure, snippet } from "../lib/failures.ts";
 import { parseJsonStdout, runNtn } from "../lib/runNtn.ts";
 import type { RunNtnOptions, RunNtnResult } from "../lib/runNtn.ts";
 
@@ -195,13 +196,6 @@ export function normalizeHit(raw: unknown): SearchHit | null {
   };
 }
 
-/** ntn 输出里带点噪音时也别把整坨塞进错误消息 */
-function snippet(text: string): string {
-  const trimmed = text.trim();
-  if (!trimmed) return "<empty>";
-  return trimmed.length > 300 ? `${trimmed.slice(0, 300)}…` : trimmed;
-}
-
 export function parseSearchResponse(stdout: string): { results: SearchHit[]; hasMore: boolean } {
   let payload: unknown;
   try {
@@ -226,36 +220,6 @@ export function parseSearchResponse(stdout: string): { results: SearchHit[]; has
 }
 
 // ---------------------------------------------------------------------------
-// 失败文案：ntn 的错误本身够具体，但"没装"和"没登录"必须给出可执行动作
-// ---------------------------------------------------------------------------
-
-const FAILURE_HINTS: Array<{ match: RegExp; hint: string }> = [
-  {
-    match: /not found on PATH|ENOENT/i,
-    hint: "Hint: install the Notion CLI with `npm i -g ntn` (or `curl -fsSL https://ntn.dev | bash`), then run `ntn login`.",
-  },
-  // token 那条必须排在 workspace 之前：ntn 的 token 错误文案里**也**带 "run `ntn login`"，
-  // 顺序反过来就会被 workspace 提示吞掉，而且 workspace 提示并不解决无效 token。
-  {
-    match: /api token is invalid|unauthorized|\b401\b/i,
-    hint: "Hint: the token was rejected — set a valid NOTION_API_TOKEN or run `ntn login`, and make sure the target pages/databases are shared with that integration.",
-  },
-  {
-    match: /no workspace selected|not logged in|not authenticated/i,
-    hint: "Hint: authenticate first — run `ntn login`, or set NOTION_API_TOKEN (plus NOTION_WORKSPACE_ID). Then share the target pages/databases with that integration.",
-  },
-];
-
-export function describeFailure(result: RunNtnResult): string {
-  const stderr = result.stderr.trim();
-  const status = result.code === null ? "no exit code (timed out or could not start)" : `exit ${result.code}`;
-  const hint = FAILURE_HINTS.find((entry) => entry.match.test(stderr))?.hint;
-  // stderr 也要截断：API 报错体/栈可能很长，别整坨塞进模型上下文
-  const detail = stderr ? snippet(stderr) : "ntn printed no error text.";
-  return [`notion_search failed: ntn ${status}.`, detail, hint].filter((part): part is string => Boolean(part)).join("\n");
-}
-
-// ---------------------------------------------------------------------------
 // 真正干活：构造 argv -> runNtn -> 归一化
 // ---------------------------------------------------------------------------
 
@@ -264,7 +228,9 @@ export async function searchNotion(params: SearchParams, runner: SearchRunner = 
   const limit = normalizeLimit(params.limit);
   const body = buildSearchBody({ query, limit, filter_object: params.filter_object });
   const result = await runner({ args: buildSearchArgs(body) });
-  if (!result.ok) throw new Error(describeFailure(result));
+  // 失败诊断在 src/lib/failures.ts（四个 Notion 工具共用同一套提示）；这里只补工具名前缀，
+  // 让模型看到的仍是 "notion_search failed: ntn exit N."。
+  if (!result.ok) throw new Error(describeFailure(result, "notion_search failed"));
   const { results, hasMore } = parseSearchResponse(result.stdout);
   return { query, limit, results: results.slice(0, limit), hasMore };
 }
@@ -275,9 +241,8 @@ export function formatOutcome(outcome: SearchOutcome): string {
   const body =
     outcome.results.length === 0
       ? [
-          "No matches. Notion search scans TITLES only (never body text).",
-          'Next: retry the EXACT title in double quotes, e.g. "My Page Title" — that is the reliable lookup.',
-          "If it still misses, the page may be seconds old and not indexed yet: retry once, then search a distinctive single word.",
+          "No matches. Notion search scans TITLES only (never body text): retry the EXACT title in double quotes, " +
+            'e.g. "My Page Title".',
           "Do NOT simply shorten the query: matching is token-OR, so fewer words means MORE unrelated hits, not fewer.",
         ]
       : outcome.results.map((hit, index) => {
@@ -303,21 +268,13 @@ export function createNotionSearchTool(deps: Partial<SearchDeps> = {}): NotionTo
   return defineNotionTool<SearchOutcome>({
     name: "notion_search",
     description:
-      "Search the Notion workspace by TITLE and return hits with id, title, URL and object type " +
-      "(page|database|data_source). " +
-      "MATCHING IS TOKEN-OR, NOT SUBSTRING — this is the single most important thing to know: Notion splits " +
-      "the query into words and returns anything whose title contains ANY ONE of them, ranked. So a long query " +
-      "returns loosely-related pages that share one word, and hit #1 is often unrelated. Example from a real " +
-      "workspace: querying a page's full title returns 10 hits, only one of which is that page. " +
-      "TO LOOK UP ONE KNOWN PAGE, WRAP THE EXACT TITLE IN DOUBLE QUOTES (\\\"PRD · notion_page\\\") — that " +
-      "returns exactly that page. Do that FIRST whenever you already know the title. " +
-      "Titles only: page body text is never searched, so a term that appears only in the body finds nothing. " +
-      "An empty result does NOT prove the object is missing (a just-created page is not indexed for a " +
-      "second or two; retry once before concluding absence). " +
-      "Use filter_object to cut noise, and prefer refining the query over raising limit (capped at 50). " +
-      "Verify before you act: ids from here must be confirmed with notion_get, because a loosely related hit " +
-      "looks like a legitimate match. For a data_source hit, notion_get/notion_query need " +
-      "data-source:<id> or database:<id> to be unambiguous.",
+      "Search Notion by TITLE; returns id, title, URL and object type (page|database). " +
+      "MATCHING IS TOKEN-OR, NOT SUBSTRING: the query is split into words and any title containing ANY ONE of " +
+      "them comes back, ranked — so a long query yields loosely-related hits, not just the one you meant. " +
+      'Wrap a known EXACT title in double quotes ("PRD · notion_page") to get exactly that hit. ' +
+      "TITLES only: body text is never searched, and a 0-hit result does NOT prove absence (a fresh page may " +
+      "not be indexed for a second or two; retry once). A hit is not proof it is the right object: verify " +
+      "with notion_get. Use filter_object or limit to narrow; prefer refining the query over raising limit.",
     timeoutMs: TOOL_TIMEOUTS.search,
     // Read-only and independent of every other call: safe to run alongside siblings.
     isConcurrencySafe: () => true,
@@ -327,10 +284,8 @@ export function createNotionSearchTool(deps: Partial<SearchDeps> = {}): NotionTo
         query: {
           type: "string",
           description:
-            "Keyword to match against object titles. This is a FUZZY match: Notion matches " +
-            "words inside the title, case-insensitively, and returns related hits — so a miss " +
-            "does NOT prove the page is absent, and a hit may be only loosely related. It never " +
-            "searches page body text.",
+            "Keyword matched against object TITLES only (never body text). See the tool description for how " +
+            "matching works: it is token-OR, and an exact title in double quotes is the precise lookup.",
         },
         limit: {
           type: "integer",
