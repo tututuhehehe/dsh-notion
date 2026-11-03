@@ -152,10 +152,14 @@ describe("the page split is expressible to the model", () => {
     assert.equal(paramSchema(edit).properties.block_update, undefined);
   });
 
-  it("requires `yes` on trash, `parent` on create and `id` on edit/trash", () => {
+  it("requires `yes` on trash and `id` on edit/trash — but NOT `parent` on create", () => {
     assert.deepEqual(paramSchema(trash).required, ["id", "yes"]);
-    assert.deepEqual(paramSchema(create).required, ["parent"]);
     assert.deepEqual(paramSchema(edit).required, ["id"]);
+    // `parent` is deliberately optional: omitting it creates the page at the workspace
+    // root, which is what `ntn pages create` (it documents --parent as optional) and
+    // POST /v1/pages do. Nothing on create is required.
+    assert.equal(paramSchema(create).required, undefined);
+    assert.equal("parent" in paramSchema(create).properties, true);
   });
 });
 

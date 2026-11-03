@@ -831,6 +831,9 @@ function rejectUnexpectedParams(params, allowed, usage) {
     });
   }
 }
+function containerParentLabel(container) {
+  return container.kind === "workspace" ? void 0 : formatParent(container.createParent);
+}
 var PAGE_SCHEMA = {
   source: "page",
   properties: /* @__PURE__ */ new Map([["title", { name: "title", type: "title" }]])
@@ -1865,7 +1868,8 @@ async function rollbackCreatedPage(runner, pageId, cause) {
 }
 async function createPage(params, runner) {
   const readPage = makePageReader(runner);
-  const container = await resolveContainer(runner, params.parent, "create", readPage);
+  const container = params.parent === void 0 ? { kind: "workspace", schema: PAGE_SCHEMA } : await resolveContainer(runner, params.parent, "create", readPage);
+  const parentLabel = containerParentLabel(container);
   const markdown = params.body ?? "";
   const {
     properties,
@@ -1879,11 +1883,11 @@ async function createPage(params, runner) {
   const explicitTitle = params.title;
   const draft = planContent(markdown, explicitTitle ?? propsTitle);
   const title = draft.title;
-  if (container.kind !== "page" && !title) {
+  if (container.kind !== "page" && container.kind !== "workspace" && !title) {
     const hints = writableProperties(container.schema);
     throw new InputError(
       `\u5728 ${container.kind === "row" ? `\u884C ${container.rowParentId} \u6240\u5728 data source` : container.kind} \u4E2D\u521B\u5EFA\u9875\u9762\u9700\u8981\u6807\u9898\uFF1A\u8BF7\u4F20 title\u3001\u5728 props \u91CC\u5199\u6807\u9898\u5C5E\u6027\uFF08${titlePropertyName(container.schema) ?? "title"}\uFF09\uFF0C\u6216\u8BA9 body_content \u4EE5 "# \u6807\u9898" \u5F00\u5934\u3002\u53EF\u5199\u5C5E\u6027\uFF1A${formatHints(hints)}\u3002`,
-      { parent: formatParent(container.createParent), hint_properties: hints }
+      { ...parentLabel ? { parent: parentLabel } : { parent: "workspace" }, hint_properties: hints }
     );
   }
   if (!draft.body.trim()) {
@@ -1904,8 +1908,7 @@ async function createPage(params, runner) {
       "pages",
       "create",
       "--json",
-      "--parent",
-      formatParent(container.createParent),
+      ...parentLabel === void 0 ? [] : ["--parent", parentLabel],
       `--content=${draft.body}`
     ]
   });
@@ -1919,9 +1922,9 @@ async function createPage(params, runner) {
   const requireTrustedId = (what) => {
     if (structuredId) return structuredId;
     throw new InputError(
-      `\u9875\u9762\u5DF2\u521B\u5EFA\uFF08parent ${formatParent(container.createParent)}\uFF09\uFF0C\u4F46\u6CA1\u6709\u4ECE ntn \u7684\u7ED3\u6784\u5316\u8F93\u51FA\u91CC\u53D6\u5230\u9875\u9762 id\uFF0C${what}\u672A\u5199\u5165\u3002\u6CA1\u6709\u53EF\u4FE1 id \u5C31\u4E0D\u81EA\u52A8 trash\uFF08\u907F\u514D\u8BEF\u5220\uFF09\uFF0C\u8BF7\u7528 notion_search/notion_get \u627E\u5230\u8BE5\u9875\u9762\u540E\uFF0C\u7528 notion_page_edit \u5199\u5165\uFF0C\u6216 notion_page_trash \u5220\u9664\uFF08partial: true\uFF0Crollback: unknown_id\uFF09\u3002`,
+      `\u9875\u9762\u5DF2\u521B\u5EFA\uFF08parent ${parentLabel ?? "workspace"}\uFF09\uFF0C\u4F46\u6CA1\u6709\u4ECE ntn \u7684\u7ED3\u6784\u5316\u8F93\u51FA\u91CC\u53D6\u5230\u9875\u9762 id\uFF0C${what}\u672A\u5199\u5165\u3002\u6CA1\u6709\u53EF\u4FE1 id \u5C31\u4E0D\u81EA\u52A8 trash\uFF08\u907F\u514D\u8BEF\u5220\uFF09\uFF0C\u8BF7\u7528 notion_search/notion_get \u627E\u5230\u8BE5\u9875\u9762\u540E\uFF0C\u7528 notion_page_edit \u5199\u5165\uFF0C\u6216 notion_page_trash \u5220\u9664\uFF08partial: true\uFF0Crollback: unknown_id\uFF09\u3002`,
       {
-        parent: formatParent(container.createParent),
+        parent: parentLabel ?? "workspace",
         partial: true,
         rollback: "unknown_id",
         ...pageId ? { id_candidate: pageId } : {},
@@ -1951,7 +1954,7 @@ async function createPage(params, runner) {
     created: true,
     ...pageId ? { id: pageId } : {},
     ...url ? { url } : {},
-    parent: formatParent(container.createParent),
+    parent: parentLabel ?? "workspace",
     ...title ? { title } : {},
     ...container.kind === "row" ? {
       parent_item_row_id: container.rowParentId,
@@ -2391,7 +2394,7 @@ var CREATE_PARAMETERS = {
   properties: {
     parent: {
       type: "string",
-      description: "Required. Where the page goes: page:<id> (child page), database:<id> | data-source:<id> (database row), or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / self-relation column)."
+      description: "Where the page goes. OMIT it to create the page at the WORKSPACE ROOT (Notion's default when no parent is given; such a page only has a title, so props cannot carry columns). Otherwise: page:<id> (child page), database:<id> | data-source:<id> (a row in that database), or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / self-relation column)."
     },
     title: {
       type: "string",
@@ -2404,7 +2407,9 @@ var CREATE_PARAMETERS = {
       description: 'The page body as Markdown. A leading "# Heading" becomes the title when title is absent.'
     }
   },
-  required: ["parent"],
+  // `parent` is NOT required: omitting it creates the page at the WORKSPACE ROOT, which
+  // is what `ntn pages create` and POST /v1/pages do when no parent is given. Requiring
+  // it would be a restriction neither the CLI nor the API has.
   additionalProperties: false
 };
 var EDIT_PARAMETERS = {
@@ -2500,7 +2505,7 @@ function createNotionPageCreateTool(deps = {}) {
   const runner = deps.runNtn ?? runNtn;
   return defineNotionTool({
     name: "notion_page_create",
-    description: `Create one Notion page or database row. parent is required: page:<id> (child page), database:<id> | data-source:<id> (a row in that database), or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / self-relation column). body_content is the page Markdown and icon is the page icon \u2014 both are TOP-LEVEL parameters, not props keys. props carries database COLUMNS only (name \u2192 simplified value), converted by the parent's column types; unknown names and read-only columns are rejected with the writable ones in hint_properties. A page inside a database still needs a title (the title parameter, the title property in props, or a leading "# Heading" in body_content). The columns and icon are written by a second request; if that request fails the new page is trashed so no half-made page is left behind, and the error says whether cleanup worked (rollback: trashed | trash_failed | unknown_id; partial:true means something was left behind). To add content later use notion_page_edit (find-and-replace or append); this tool never edits an existing page.`,
+    description: `Create one Notion page or database row. parent says where it goes and may be OMITTED: without it the page is created at the WORKSPACE ROOT (a real location, not an error \u2014 that page only has a title, so props cannot carry columns). With it: page:<id> (child page), database:<id> | data-source:<id> (a row in that database), or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / self-relation column). body_content is the page Markdown and icon is the page icon \u2014 both are TOP-LEVEL parameters, not props keys. props carries database COLUMNS only (name \u2192 simplified value), converted by the parent's column types; unknown names and read-only columns are rejected with the writable ones in hint_properties. A page inside a database still needs a title (the title parameter, the title property in props, or a leading "# Heading" in body_content). The columns and icon are written by a second request; if that request fails the new page is trashed so no half-made page is left behind, and the error says whether cleanup worked (rollback: trashed | trash_failed | unknown_id; partial:true means something was left behind). To add content later use notion_page_edit (find-and-replace or append); this tool never edits an existing page.`,
     timeoutMs: TOOL_TIMEOUTS.page,
     // Every operation here can write, so page calls stay exclusive: never overlap two.
     isConcurrencySafe: () => false,

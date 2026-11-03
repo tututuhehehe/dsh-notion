@@ -209,6 +209,13 @@ interface PropertyHint {
  * `row` means the parent is a database row, so the new page is a child row.
  */
 type Container =
+  /**
+   * No parent given. Notion puts such a page at the WORKSPACE ROOT
+   * (`parent: {type:"workspace"}`), which is a first-class location, not an error —
+   * `ntn pages create` documents `--parent` as optional and the API accepts the call.
+   * It only has the title property, so `props` may carry nothing else.
+   */
+  | { kind: "workspace"; schema: PropertySchemaSet }
   | { kind: "page"; createParent: ParsedParent; schema: PropertySchemaSet }
   | {
       kind: "data_source";
@@ -223,6 +230,14 @@ type Container =
       dataSourceId: string;
       rowParentId: string;
     };
+
+/**
+ * Where a container lives, as one label for argv/messages/details.
+ * `undefined` for the workspace root, which has no id to print.
+ */
+function containerParentLabel(container: Container): string | undefined {
+  return container.kind === "workspace" ? undefined : formatParent(container.createParent);
+}
 
 /** Page children only expose their title property. */
 const PAGE_SCHEMA: PropertySchemaSet = {
@@ -1783,7 +1798,14 @@ async function createPage(params: CreateParams, runner: NtnRunner): Promise<Page
   // Resolving the container also resolves the schema (C4: via data source, not database).
   // The reader memoizes GET v1/pages so a bare row parent is fetched once.
   const readPage = makePageReader(runner);
-  const container = await resolveContainer(runner, params.parent, "create", readPage);
+  // No parent is a valid request, not a missing argument: `ntn pages create` documents
+  // `--parent` as optional and Notion creates the page at the workspace root. Refusing it
+  // would be a restriction the API does not have.
+  const container: Container =
+    params.parent === undefined
+      ? { kind: "workspace", schema: PAGE_SCHEMA }
+      : await resolveContainer(runner, params.parent, "create", readPage);
+  const parentLabel = containerParentLabel(container);
 
   const markdown = params.body ?? "";
   const {
@@ -1800,13 +1822,16 @@ async function createPage(params: CreateParams, runner: NtnRunner): Promise<Page
   const draft = planContent(markdown, explicitTitle ?? propsTitle);
   const title = draft.title;
 
-  if (container.kind !== "page" && !title) {
+  // A database row needs a title (it is the row's identity in the table). A page — child
+  // or workspace-level — does not: Notion happily creates an untitled page whose body
+  // carries the content, and `create` already rejects a call with neither title nor body.
+  if (container.kind !== "page" && container.kind !== "workspace" && !title) {
     const hints = writableProperties(container.schema);
     throw new InputError(
       `在 ${container.kind === "row" ? `行 ${container.rowParentId} 所在 data source` : container.kind} 中创建页面需要标题：` +
         `请传 title、在 props 里写标题属性（${titlePropertyName(container.schema) ?? "title"}），` +
         `或让 body_content 以 "# 标题" 开头。可写属性：${formatHints(hints)}。`,
-      { parent: formatParent(container.createParent), hint_properties: hints }
+      { ...(parentLabel ? { parent: parentLabel } : { parent: "workspace" }), hint_properties: hints }
     );
   }
 
@@ -1836,8 +1861,7 @@ async function createPage(params: CreateParams, runner: NtnRunner): Promise<Page
       "pages",
       "create",
       "--json",
-      "--parent",
-      formatParent(container.createParent),
+      ...(parentLabel === undefined ? [] : ["--parent", parentLabel]),
       `--content=${draft.body}`,
     ],
   });
@@ -1856,12 +1880,12 @@ async function createPage(params: CreateParams, runner: NtnRunner): Promise<Page
   const requireTrustedId = (what: string): string => {
     if (structuredId) return structuredId;
     throw new InputError(
-      `页面已创建（parent ${formatParent(container.createParent)}），但没有从 ntn 的结构化输出里取到页面 id，` +
+      `页面已创建（parent ${parentLabel ?? "workspace"}），但没有从 ntn 的结构化输出里取到页面 id，` +
         `${what}未写入。` +
         `没有可信 id 就不自动 trash（避免误删），请用 notion_search/notion_get 找到该页面后，` +
         `用 notion_page_edit 写入，或 notion_page_trash 删除（partial: true，rollback: unknown_id）。`,
       {
-        parent: formatParent(container.createParent),
+        parent: parentLabel ?? "workspace",
         partial: true,
         rollback: "unknown_id",
         ...(pageId ? { id_candidate: pageId } : {}),
@@ -1901,7 +1925,7 @@ async function createPage(params: CreateParams, runner: NtnRunner): Promise<Page
     created: true,
     ...(pageId ? { id: pageId } : {}),
     ...(url ? { url } : {}),
-    parent: formatParent(container.createParent),
+    parent: parentLabel ?? "workspace",
     ...(title ? { title } : {}),
     ...(container.kind === "row"
       ? {
@@ -2647,7 +2671,7 @@ const CREATE_PARAMETERS = {
     parent: {
       type: "string",
       description:
-        "Required. Where the page goes: page:<id> (child page), database:<id> | data-source:<id> (database row), or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / self-relation column).",
+        "Where the page goes. OMIT it to create the page at the WORKSPACE ROOT (Notion's default when no parent is given; such a page only has a title, so props cannot carry columns). Otherwise: page:<id> (child page), database:<id> | data-source:<id> (a row in that database), or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / self-relation column).",
     },
     title: {
       type: "string",
@@ -2661,7 +2685,9 @@ const CREATE_PARAMETERS = {
       description: "The page body as Markdown. A leading \"# Heading\" becomes the title when title is absent.",
     },
   },
-  required: ["parent"],
+  // `parent` is NOT required: omitting it creates the page at the WORKSPACE ROOT, which
+  // is what `ntn pages create` and POST /v1/pages do when no parent is given. Requiring
+  // it would be a restriction neither the CLI nor the API has.
   additionalProperties: false,
 };
 
@@ -2783,7 +2809,9 @@ export function createNotionPageCreateTool(deps: NotionPageDeps = {}): NotionToo
     name: "notion_page_create",
     description:
       "Create one Notion page or database row. " +
-      "parent is required: page:<id> (child page), database:<id> | data-source:<id> (a row in that database), " +
+      "parent says where it goes and may be OMITTED: without it the page is created at the WORKSPACE ROOT " +
+      "(a real location, not an error — that page only has a title, so props cannot carry columns). " +
+      "With it: page:<id> (child page), database:<id> | data-source:<id> (a row in that database), " +
       "or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / " +
       "self-relation column). " +
       "body_content is the page Markdown and icon is the page icon — both are TOP-LEVEL parameters, not props keys. " +

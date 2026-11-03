@@ -175,7 +175,7 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
 
 | 工具 | 参数 | 说明 |
 | --- | --- | --- |
-| `notion_page_create` | `parent`（必填）、`title`、`props`、`icon`、`body_content` | `parent` 见下；`props` 只放真实列 |
+| `notion_page_create` | `parent`（**可省略**）、`title`、`props`、`icon`、`body_content` | 省略 `parent` = 建在**工作区根级**；`props` 只放真实列 |
 | `notion_page_edit` | `id`（必填）、`edits`、`body_content`、`props`、`title`、`icon`、`parent`、`yes` | 至少给一项；`edits` 与 `body_content` **互斥**；`yes` 只在行→行覆盖父级时与 `parent` 一起用 |
 | `notion_page_trash` | `id`（必填）、`yes`（必填 `true`）、`recursive` | 三种保护见下 |
 
@@ -209,6 +209,7 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
 
 | 写法 | `notion_page_create` | `notion_page_edit`（移动） |
 | --- | --- | --- |
+| **省略 `parent`** | **建在工作区根级**（Notion 的默认位置；这种页只有 title，`props` 不能带列） | —（移动必须给 `parent`） |
 | `page:<id>` | 该页面下的子页面 | 移到该页面下（`POST /v1/pages/{id}/move`） |
 | `<裸 page id>` | 同上（先确认它确实不是数据库行） | 同上 |
 | `<裸 row id>` | 该行所在 data source 下的子行，并设好 Parent-item 关系 | 重新指向该行的 Parent-item 关系 |
@@ -528,7 +529,7 @@ plugin_manager install_bundle target=/absolute/path/to/dsh-notion
 
 ### Create
 
-`notion_page_create` needs `parent` — `page:<id>`, `database:<id>`, `data-source:<id>`, or a bare database row id (a child row linked through the data source's Parent-item / self-relation column). Properties, icon and Parent-item link are applied by a second request; if that request fails the new page is trashed so no half-made page is left behind, and the error reports `rollback` (`trashed` / `trash_failed` / `unknown_id`) plus `partial: true` if something was left behind. A page in a database also needs a title: the `title` parameter, the title property in `props`, or a leading `# Heading` of `body_content`.
+`notion_page_create` takes an OPTIONAL `parent` — omit it to create the page at the workspace root (Notion's own default when there is no parent; such a page only has a title, so `props` cannot carry columns). Otherwise: `page:<id>`, `database:<id>`, `data-source:<id>`, or a bare database row id (a child row linked through the data source's Parent-item / self-relation column). Properties, icon and Parent-item link are applied by a second request; if that request fails the new page is trashed so no half-made page is left behind, and the error reports `rollback` (`trashed` / `trash_failed` / `unknown_id`) plus `partial: true` if something was left behind. A page in a database also needs a title: the `title` parameter, the title property in `props`, or a leading `# Heading` of `body_content`.
 
 ### Edit — find and replace
 

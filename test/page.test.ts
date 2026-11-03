@@ -1899,3 +1899,64 @@ describe("notion_page_edit: steps are independent — one failing must not cance
     assert.notEqual(result.details.partial, true);
   });
 });
+
+describe("notion_page_create: no parent means the WORKSPACE ROOT, not an error", () => {
+  /**
+   * `ntn pages create` documents `--parent` as OPTIONAL, and POST /v1/pages accepts a
+   * call with no parent, creating the page at the workspace root
+   * (`parent: {type:"workspace", workspace:true}`). Requiring `parent` in this tool was a
+   * restriction neither the CLI nor the API has, so the schema must not require it and
+   * the argv must simply omit the flag.
+   */
+  function workspaceScript(): (args: string[]) => RunNtnResult {
+    return (args) => {
+      if (args[0] === "pages" && args[1] === "create") {
+        return ntnOk({ object: "page", id: NEW_PAGE_ID, url: "https://app.notion.com/p/x" });
+      }
+      if (args[0] === "api" && String(args[1] ?? "").startsWith("v1/pages/")) {
+        return ntnOk({ object: "page", id: NEW_PAGE_ID });
+      }
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    };
+  }
+
+  it("omits --parent entirely and reports the workspace as the location", async () => {
+    const { tool, calls } = createHarness(workspaceScript());
+    const result = await tool.execute("create-workspace", {
+      title: "根级页面",
+      body_content: "正文",
+    });
+
+    assert.equal(result.isError, false, text(result));
+    const create = calls.find((args) => args[0] === "pages" && args[1] === "create");
+    assert.ok(create, "no pages create call");
+    assert.equal(
+      create.includes("--parent"),
+      false,
+      "no --parent flag may be passed when no parent was given"
+    );
+    // The rendered/structured result must say where it landed.
+    assert.equal(result.details.parent, "workspace");
+    assert.match(text(result), /workspace/);
+  });
+
+  it("still passes --parent normally, so the optional case did not break the required one", async () => {
+    const { tool, calls } = createHarness(workspaceScript());
+    await tool.execute("create-child", {
+      parent: `page:${ACCEPTANCE.parentPageId}`,
+      title: "子页面",
+    });
+    const create = calls.find((args) => args[0] === "pages" && args[1] === "create");
+    assert.ok(create, "no pages create call");
+    const index = create.indexOf("--parent");
+    assert.notEqual(index, -1, "--parent must be passed when a parent IS given");
+    assert.equal(create[index + 1], `page:${ACCEPTANCE.parentPageId}`);
+  });
+
+  it("allows a workspace page with no title (Notion does), while a database row still needs one", async () => {
+    const { tool } = createHarness(workspaceScript());
+    // Body-only at the workspace root: valid, Notion creates an untitled page.
+    const ok = await tool.execute("create-workspace-untitled", { body_content: "只有正文" });
+    assert.equal(ok.isError, false, text(ok));
+  });
+});
