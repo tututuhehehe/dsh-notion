@@ -1958,22 +1958,71 @@ type MoveOutcome = {
   url?: string;
 };
 
+/** One `notion_page_edit` step that did not land; `error` is whatever it threw. */
+type AppliedFailure = { step: string; error: unknown };
+
+/** Normalize a caught value into the NotionToolError the model should read. */
+function asToolError(error: unknown, label: string): NotionToolError {
+  if (error instanceof NotionToolError) return error;
+  return ntnFailure(label, {
+    ok: false,
+    stdout: "",
+    stderr: error instanceof Error ? error.message : String(error),
+    code: null,
+  });
+}
+
 /**
- * A later write failed after an earlier one landed. The caller has to know that a retry
- * would apply the first write a second time, so the error says so in words AND in
- * structured details (`partial`, `applied`).
+ * Report an edit where some steps landed and some did not.
+ *
+ * This is deliberately an ERROR rather than a success carrying warnings: at least one
+ * thing the caller explicitly asked for did not happen, and DSH renders a thrown error
+ * in a way a model reliably acts on. What must NOT happen is the model concluding that
+ * NOTHING happened — that is what makes it retry and double-apply the steps that did
+ * succeed. So the message leads with what landed, names each failure, and says the
+ * successful parts will not be rolled back.
+ *
+ * `applied` is empty only when every requested step failed, in which case there is no
+ * debt and the first failure is surfaced as a plain error (no misleading "already
+ * written" text).
  */
-function partialEditError(
-  cause: NotionToolError,
+function editWithFailures(
+  failed: AppliedFailure[],
   applied: string[],
-  failedStep: string
+  result: EditResult
 ): NotionToolError {
+  const causes = failed.map((failure) => ({
+    step: failure.step,
+    cause: asToolError(failure.error, failure.step),
+  }));
+  const failedSteps = causes.map((entry) => entry.step);
+  if (applied.length === 0) {
+    // Nothing landed: keep the original error's meaning and details untouched.
+    const primary = causes[0]!;
+    return primary.cause;
+  }
+  const reported = causes
+    .map((entry) => `  - ${entry.step}：${entry.cause.detail}`)
+    .join("\n");
   return new NotionToolError(
-    `${cause.detail}\n已经生效的部分：${applied.join("、")}（已写入，不会回滚）。` +
-      `失败的是：${failedStep}。重试前请先 notion_get 确认页面当前状态，避免重复应用。`,
+    `部分成功。已经生效的部分：${applied.join("、")}（已写入，不会回滚）。\n` +
+      `失败的部分：\n${reported}\n` +
+      `这些步骤互不依赖，所以其余步骤照常执行了。重试时请只重发失败的部分；` +
+      `重发全部会把已生效的部分重复应用一遍。`,
     {
-      code: cause.code,
-      details: { ...cause.details, partial: true, applied, failed_step: failedStep },
+      code: causes[0]!.cause.code,
+      details: {
+        partial: true,
+        applied,
+        failed_steps: failedSteps,
+        failures: causes.map((entry) => ({
+          step: entry.step,
+          code: entry.cause.code,
+          message: entry.cause.detail,
+          ...entry.cause.details,
+        })),
+        changed: result.changes,
+      },
     }
   );
 }
@@ -1982,24 +2031,40 @@ async function editPage(params: EditParams, runner: NtnRunner): Promise<PageTool
   const { id, edits } = params;
   const result: EditResult = { changes: [], properties: [], outcome: {} };
 
-  // ORDER, and it is deliberately this order: (1) content, (2) properties/title/icon,
-  // (3) the move. Content first because a caller that "fixes the text and then files the
-  // page somewhere else" reads its own intent that way, and because a move that lands
-  // before the content would make the content edit's failure look like a failed move.
-  // Each later step reports what the earlier ones already wrote if it fails.
+  // ORDER and INDEPENDENCE, both deliberate:
+  //
+  // Order is (1) content, (2) properties/title/icon, (3) the move, because a caller that
+  // "fixes the text and then files the page elsewhere" reads its own intent that way.
+  //
+  // INDEPENDENCE is the more important half: the three steps do not depend on each
+  // other, so a failure in one must NOT cancel the others. An old_str that matches
+  // nothing is a bad argument, not a broken page — refusing to apply a valid title or
+  // a valid move because of it would leave the caller with neither, and the natural
+  // retry (with a corrected old_str) would then re-apply the very steps that had
+  // already succeeded. So every step runs, failures are COLLECTED, and the call reports
+  // exactly what landed and what did not.
   const applied: string[] = [];
+  const failed: AppliedFailure[] = [];
   if (edits.length > 0) {
-    const appliedEdits = await applyContentEdits(runner, id, edits);
-    result.outcome = appliedEdits;
-    result.changes.push("body_content");
-    applied.push(
-      `内容（${appliedEdits.edits_applied}/${appliedEdits.edits_sent} 条 edits）`
-    );
+    try {
+      const appliedEdits = await applyContentEdits(runner, id, edits);
+      result.outcome = appliedEdits;
+      result.changes.push("body_content");
+      applied.push(
+        `内容（${appliedEdits.edits_applied}/${appliedEdits.edits_sent} 条 edits）`
+      );
+    } catch (error) {
+      failed.push({ step: "正文（edits）", error });
+    }
   } else if (params.body !== undefined && params.body.trim() !== "") {
-    result.outcome = await appendPageContent(runner, id, params.body);
-    result.appended = true;
-    result.changes.push("body_content");
-    applied.push("追加的正文内容");
+    try {
+      result.outcome = await appendPageContent(runner, id, params.body);
+      result.appended = true;
+      result.changes.push("body_content");
+      applied.push("追加的正文内容");
+    } catch (error) {
+      failed.push({ step: "追加正文（body_content）", error });
+    }
   }
 
   const needsPatch =
@@ -2029,37 +2094,23 @@ async function editPage(params: EditParams, runner: NtnRunner): Promise<PageTool
       if (names.length > 0) applied.push(`属性（${names.join(", ")}）`);
       if (params.icon !== undefined) applied.push("icon");
     } catch (error) {
-      const cause =
-        error instanceof NotionToolError
-          ? error
-          : ntnFailure("PATCH 页面属性/icon", {
-              ok: false,
-              stdout: "",
-              stderr: error instanceof Error ? error.message : String(error),
-              code: null,
-            });
-      throw applied.length > 0
-        ? partialEditError(cause, applied, "属性/标题/icon（PATCH 页面属性/icon）")
-        : cause;
+      failed.push({ step: "属性/标题/icon（PATCH 页面属性/icon）", error });
     }
   }
 
   if (params.parent !== undefined) {
-    let move: MoveOutcome;
     try {
-      move = await movePage(runner, { id, parent: params.parent, yes: params.yes });
+      const move = await movePage(runner, { id, parent: params.parent, yes: params.yes });
+      result.move = move;
+      if (move.change) result.changes.push(move.change);
     } catch (error) {
-      const cause = error instanceof NotionToolError ? error : ntnFailure("移动页面", {
-        ok: false,
-        stdout: "",
-        stderr: error instanceof Error ? error.message : String(error),
-        code: null,
-      });
-      throw applied.length > 0 ? partialEditError(cause, applied, "移动页面（parent）") : cause;
+      failed.push({ step: "移动页面（parent）", error });
     }
-    result.move = move;
-    if (move.change) result.changes.push(move.change);
   }
+
+  // Every step has run. If any of them failed, the call still reports what DID land —
+  // see `AppliedFailure` for why a partial edit is success-with-debt, not a plain error.
+  if (failed.length > 0) throw editWithFailures(failed, applied, result);
 
   const { outcome, move } = result;
   return pageValue({
@@ -2789,6 +2840,10 @@ export function createNotionPageEditTool(deps: NotionPageDeps = {}): NotionTool<
       "Change an existing Notion page: find-and-replace its text, append Markdown, update title/columns/icon, " +
       "and/or move it. A single call may combine all of these; they are applied in this fixed order — " +
       "(1) body content, (2) title/props/icon, (3) parent move — and `changed` reports each one that happened. " +
+      "THE THREE STEPS ARE INDEPENDENT: if one fails, the others still run. A failed old_str does NOT stop a " +
+      "valid title change or a valid move, because those do not depend on it. The result then says 部分成功 and " +
+      "lists what landed vs. what failed — retry ONLY the failed part, since resending everything re-applies " +
+      "the parts that already succeeded. " +
       "CONTENT: `edits` is a list of {old_str, new_str} operations applied in order, so edit[i+1] sees edit[i]'s " +
       "result. old_str matches ANY SUBSTRING of the page text (one word, one sentence, several blocks) — not just " +
       "a whole block. The match target is the MARKDOWN notion_get shows, so copy it as-is with markers " +

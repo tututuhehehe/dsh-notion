@@ -1962,13 +1962,45 @@ async function createPage(params, runner) {
     changed: changes
   });
 }
-function partialEditError(cause, applied, failedStep) {
+function asToolError(error, label) {
+  if (error instanceof NotionToolError) return error;
+  return ntnFailure(label, {
+    ok: false,
+    stdout: "",
+    stderr: error instanceof Error ? error.message : String(error),
+    code: null
+  });
+}
+function editWithFailures(failed, applied, result) {
+  const causes = failed.map((failure) => ({
+    step: failure.step,
+    cause: asToolError(failure.error, failure.step)
+  }));
+  const failedSteps = causes.map((entry) => entry.step);
+  if (applied.length === 0) {
+    const primary = causes[0];
+    return primary.cause;
+  }
+  const reported = causes.map((entry) => `  - ${entry.step}\uFF1A${entry.cause.detail}`).join("\n");
   return new NotionToolError(
-    `${cause.detail}
-\u5DF2\u7ECF\u751F\u6548\u7684\u90E8\u5206\uFF1A${applied.join("\u3001")}\uFF08\u5DF2\u5199\u5165\uFF0C\u4E0D\u4F1A\u56DE\u6EDA\uFF09\u3002\u5931\u8D25\u7684\u662F\uFF1A${failedStep}\u3002\u91CD\u8BD5\u524D\u8BF7\u5148 notion_get \u786E\u8BA4\u9875\u9762\u5F53\u524D\u72B6\u6001\uFF0C\u907F\u514D\u91CD\u590D\u5E94\u7528\u3002`,
+    `\u90E8\u5206\u6210\u529F\u3002\u5DF2\u7ECF\u751F\u6548\u7684\u90E8\u5206\uFF1A${applied.join("\u3001")}\uFF08\u5DF2\u5199\u5165\uFF0C\u4E0D\u4F1A\u56DE\u6EDA\uFF09\u3002
+\u5931\u8D25\u7684\u90E8\u5206\uFF1A
+${reported}
+\u8FD9\u4E9B\u6B65\u9AA4\u4E92\u4E0D\u4F9D\u8D56\uFF0C\u6240\u4EE5\u5176\u4F59\u6B65\u9AA4\u7167\u5E38\u6267\u884C\u4E86\u3002\u91CD\u8BD5\u65F6\u8BF7\u53EA\u91CD\u53D1\u5931\u8D25\u7684\u90E8\u5206\uFF1B\u91CD\u53D1\u5168\u90E8\u4F1A\u628A\u5DF2\u751F\u6548\u7684\u90E8\u5206\u91CD\u590D\u5E94\u7528\u4E00\u904D\u3002`,
     {
-      code: cause.code,
-      details: { ...cause.details, partial: true, applied, failed_step: failedStep }
+      code: causes[0].cause.code,
+      details: {
+        partial: true,
+        applied,
+        failed_steps: failedSteps,
+        failures: causes.map((entry) => ({
+          step: entry.step,
+          code: entry.cause.code,
+          message: entry.cause.detail,
+          ...entry.cause.details
+        })),
+        changed: result.changes
+      }
     }
   );
 }
@@ -1976,18 +2008,27 @@ async function editPage(params, runner) {
   const { id, edits } = params;
   const result = { changes: [], properties: [], outcome: {} };
   const applied = [];
+  const failed = [];
   if (edits.length > 0) {
-    const appliedEdits = await applyContentEdits(runner, id, edits);
-    result.outcome = appliedEdits;
-    result.changes.push("body_content");
-    applied.push(
-      `\u5185\u5BB9\uFF08${appliedEdits.edits_applied}/${appliedEdits.edits_sent} \u6761 edits\uFF09`
-    );
+    try {
+      const appliedEdits = await applyContentEdits(runner, id, edits);
+      result.outcome = appliedEdits;
+      result.changes.push("body_content");
+      applied.push(
+        `\u5185\u5BB9\uFF08${appliedEdits.edits_applied}/${appliedEdits.edits_sent} \u6761 edits\uFF09`
+      );
+    } catch (error) {
+      failed.push({ step: "\u6B63\u6587\uFF08edits\uFF09", error });
+    }
   } else if (params.body !== void 0 && params.body.trim() !== "") {
-    result.outcome = await appendPageContent(runner, id, params.body);
-    result.appended = true;
-    result.changes.push("body_content");
-    applied.push("\u8FFD\u52A0\u7684\u6B63\u6587\u5185\u5BB9");
+    try {
+      result.outcome = await appendPageContent(runner, id, params.body);
+      result.appended = true;
+      result.changes.push("body_content");
+      applied.push("\u8FFD\u52A0\u7684\u6B63\u6587\u5185\u5BB9");
+    } catch (error) {
+      failed.push({ step: "\u8FFD\u52A0\u6B63\u6587\uFF08body_content\uFF09", error });
+    }
   }
   const needsPatch = params.props !== void 0 || params.title !== void 0 || params.icon !== void 0;
   if (needsPatch) {
@@ -2008,31 +2049,19 @@ async function editPage(params, runner) {
       if (names.length > 0) applied.push(`\u5C5E\u6027\uFF08${names.join(", ")}\uFF09`);
       if (params.icon !== void 0) applied.push("icon");
     } catch (error) {
-      const cause = error instanceof NotionToolError ? error : ntnFailure("PATCH \u9875\u9762\u5C5E\u6027/icon", {
-        ok: false,
-        stdout: "",
-        stderr: error instanceof Error ? error.message : String(error),
-        code: null
-      });
-      throw applied.length > 0 ? partialEditError(cause, applied, "\u5C5E\u6027/\u6807\u9898/icon\uFF08PATCH \u9875\u9762\u5C5E\u6027/icon\uFF09") : cause;
+      failed.push({ step: "\u5C5E\u6027/\u6807\u9898/icon\uFF08PATCH \u9875\u9762\u5C5E\u6027/icon\uFF09", error });
     }
   }
   if (params.parent !== void 0) {
-    let move2;
     try {
-      move2 = await movePage(runner, { id, parent: params.parent, yes: params.yes });
+      const move2 = await movePage(runner, { id, parent: params.parent, yes: params.yes });
+      result.move = move2;
+      if (move2.change) result.changes.push(move2.change);
     } catch (error) {
-      const cause = error instanceof NotionToolError ? error : ntnFailure("\u79FB\u52A8\u9875\u9762", {
-        ok: false,
-        stdout: "",
-        stderr: error instanceof Error ? error.message : String(error),
-        code: null
-      });
-      throw applied.length > 0 ? partialEditError(cause, applied, "\u79FB\u52A8\u9875\u9762\uFF08parent\uFF09") : cause;
+      failed.push({ step: "\u79FB\u52A8\u9875\u9762\uFF08parent\uFF09", error });
     }
-    result.move = move2;
-    if (move2.change) result.changes.push(move2.change);
   }
+  if (failed.length > 0) throw editWithFailures(failed, applied, result);
   const { outcome, move } = result;
   return pageValue({
     id,
@@ -2506,7 +2535,7 @@ function createNotionPageEditTool(deps = {}) {
   const runner = deps.runNtn ?? runNtn;
   return defineNotionTool({
     name: "notion_page_edit",
-    description: 'Change an existing Notion page: find-and-replace its text, append Markdown, update title/columns/icon, and/or move it. A single call may combine all of these; they are applied in this fixed order \u2014 (1) body content, (2) title/props/icon, (3) parent move \u2014 and `changed` reports each one that happened. CONTENT: `edits` is a list of {old_str, new_str} operations applied in order, so edit[i+1] sees edit[i]\'s result. old_str matches ANY SUBSTRING of the page text (one word, one sentence, several blocks) \u2014 not just a whole block. The match target is the MARKDOWN notion_get shows, so copy it as-is with markers (**bold**, `code`, [link](url), ## heading, - item); stripping them is the one way to break it (a paragraph shown as `Alpha **b** omega` does not match as `Alpha b omega`). Adjacent blocks join with \\n (and merge on replace). The one reversal: where notion_get shows \\\\$ use \\\\$ in old_str but a bare $ in new_str, or the page is corrupted. new_str "" DELETES the matched text. MATCH OUTCOMES, three distinct cases \u2014 do not conflate them. (a) EVERY edit matches: call succeeds, `warnings` is absent. (b) SOME edit matches: the call SUCCEEDS, the matching edits stay applied, the unmatched ones come back in `warnings` (code "no_match") and edits_applied/edits_missed give the tally \u2014 nothing is rolled back, so re-read the page before assuming what it now contains; `warnings` is ABSENT when nothing missed (it is never an empty array). (c) NO edit matches: the call FAILS with Notion\'s validation_error and nothing is written. That is Notion\'s rule, not a local pre-check \u2014 treat it as "my old_str were wrong": re-read the page with notion_get and build new old_str from what it actually says. SEPARATELY, an old_str matching MORE THAN ONE place is also a hard error with nothing written, unless THAT edit sets replace_all_matches:true. There is NO whole-page replace: when `edits` is empty or absent and body_content is present, body_content is APPENDED to the end of the page (passing both edits and body_content is an error \u2014 do it in two calls). FIELDS: icon and body_content are TOP-LEVEL parameters, not props keys; props carries database COLUMNS only (name \u2192 simplified value, converted by column type). MOVE: parent page:<id> (or a bare page id) re-parents the page via POST /v1/pages/{id}/move; a bare ROW id re-links that row\'s Parent-item relation. Re-linking a row that already has a different parent needs yes:true (otherwise it refuses and shows the current parent ids); cycle-forming moves are refused. If step (2) or (3) fails after content was already written, the error says exactly what already landed \u2014 read it before retrying. When the returned body was truncated the result says so: truncated markdown is NOT the full page, so do not derive the next old_str from it.',
+    description: 'Change an existing Notion page: find-and-replace its text, append Markdown, update title/columns/icon, and/or move it. A single call may combine all of these; they are applied in this fixed order \u2014 (1) body content, (2) title/props/icon, (3) parent move \u2014 and `changed` reports each one that happened. THE THREE STEPS ARE INDEPENDENT: if one fails, the others still run. A failed old_str does NOT stop a valid title change or a valid move, because those do not depend on it. The result then says \u90E8\u5206\u6210\u529F and lists what landed vs. what failed \u2014 retry ONLY the failed part, since resending everything re-applies the parts that already succeeded. CONTENT: `edits` is a list of {old_str, new_str} operations applied in order, so edit[i+1] sees edit[i]\'s result. old_str matches ANY SUBSTRING of the page text (one word, one sentence, several blocks) \u2014 not just a whole block. The match target is the MARKDOWN notion_get shows, so copy it as-is with markers (**bold**, `code`, [link](url), ## heading, - item); stripping them is the one way to break it (a paragraph shown as `Alpha **b** omega` does not match as `Alpha b omega`). Adjacent blocks join with \\n (and merge on replace). The one reversal: where notion_get shows \\\\$ use \\\\$ in old_str but a bare $ in new_str, or the page is corrupted. new_str "" DELETES the matched text. MATCH OUTCOMES, three distinct cases \u2014 do not conflate them. (a) EVERY edit matches: call succeeds, `warnings` is absent. (b) SOME edit matches: the call SUCCEEDS, the matching edits stay applied, the unmatched ones come back in `warnings` (code "no_match") and edits_applied/edits_missed give the tally \u2014 nothing is rolled back, so re-read the page before assuming what it now contains; `warnings` is ABSENT when nothing missed (it is never an empty array). (c) NO edit matches: the call FAILS with Notion\'s validation_error and nothing is written. That is Notion\'s rule, not a local pre-check \u2014 treat it as "my old_str were wrong": re-read the page with notion_get and build new old_str from what it actually says. SEPARATELY, an old_str matching MORE THAN ONE place is also a hard error with nothing written, unless THAT edit sets replace_all_matches:true. There is NO whole-page replace: when `edits` is empty or absent and body_content is present, body_content is APPENDED to the end of the page (passing both edits and body_content is an error \u2014 do it in two calls). FIELDS: icon and body_content are TOP-LEVEL parameters, not props keys; props carries database COLUMNS only (name \u2192 simplified value, converted by column type). MOVE: parent page:<id> (or a bare page id) re-parents the page via POST /v1/pages/{id}/move; a bare ROW id re-links that row\'s Parent-item relation. Re-linking a row that already has a different parent needs yes:true (otherwise it refuses and shows the current parent ids); cycle-forming moves are refused. If step (2) or (3) fails after content was already written, the error says exactly what already landed \u2014 read it before retrying. When the returned body was truncated the result says so: truncated markdown is NOT the full page, so do not derive the next old_str from it.',
     timeoutMs: TOOL_TIMEOUTS.page,
     isConcurrencySafe: () => false,
     parameters: EDIT_PARAMETERS,

@@ -1512,12 +1512,13 @@ describe("notion_page_edit: combined operations and failure debt", () => {
     assert.match(text(result), /已经生效的部分：内容/);
     // The count is the actual value the model needs to judge a retry: 1 of 1 edits.
     assert.match(text(result), /内容（1\/1 条 edits）/);
-    assert.match(text(result), /失败的是：属性/);
+    assert.match(text(result), /失败的部分：/);
+    assert.match(text(result), /属性\/标题\/icon/);
     assert.match(text(result), /不会回滚/);
     // Structured: `partial` + the applied steps, mirroring the create-rollback details.
     assert.equal(result.details.partial, true);
     assert.deepEqual(result.details.applied, ["内容（1/1 条 edits）"]);
-    assert.match(String(result.details.failed_step), /属性/);
+    assert.deepEqual(result.details.failed_steps, ["属性/标题/icon（PATCH 页面属性/icon）"]);
   });
 
   it("discloses that content and properties already landed when the move fails", async () => {
@@ -1538,10 +1539,11 @@ describe("notion_page_edit: combined operations and failure debt", () => {
     assert.match(result.content[0].text, /move rejected/);
     // Both earlier writes are named, in the order they were applied.
     assert.match(text(result), /已经生效的部分：内容（1\/1 条 edits）、属性（Done）/);
-    assert.match(text(result), /失败的是：移动页面/);
+    assert.match(text(result), /失败的部分：/);
+    assert.match(text(result), /移动页面/);
     assert.equal(result.details.partial, true);
     assert.deepEqual(result.details.applied, ["内容（1/1 条 edits）", "属性（Done）"]);
-    assert.match(String(result.details.failed_step), /移动页面/);
+    assert.deepEqual(result.details.failed_steps, ["移动页面（parent）"]);
   });
 
   it("reports a clean failure with no debt when the content request itself fails", async () => {
@@ -1696,7 +1698,7 @@ describe("notion_page_edit: LOCAL validation failures must also disclose prior w
     assert.match(rendered, /属性\/标题\/icon/);
     assert.equal(result.details.partial, true);
     assert.deepEqual(result.details.applied, ["内容（1/1 条 edits）"]);
-    assert.equal(result.details.failed_step, "属性/标题/icon（PATCH 页面属性/icon）");
+    assert.deepEqual(result.details.failed_steps, ["属性/标题/icon（PATCH 页面属性/icon）"]);
   });
 
   it("names the already-written content when an UNKNOWN COLUMN is rejected by LOCAL validation", async () => {
@@ -1809,5 +1811,91 @@ describe("notion_page_create: a leading H1 must never vanish", () => {
     assert.doesNotMatch(content, /^# Same Title/m);
     assert.doesNotMatch(content, /\\# Same Title/);
     assert.match(content, /only body/);
+  });
+});
+
+describe("notion_page_edit: steps are independent — one failing must not cancel the others", () => {
+  /**
+   * The three steps (content, properties/icon, move) do not depend on each other. An
+   * old_str that matches nothing is a bad ARGUMENT, not a broken page, so a valid title
+   * or a valid move must still be applied. Refusing them would leave the caller with
+   * neither, and the natural retry (fix old_str, resend everything) would then
+   * re-apply the steps that had already succeeded.
+   */
+  function ev(args: string[]): RunNtnResult {
+    const path = String(args[1] ?? "");
+    if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}` && args[3] !== "PATCH") {
+      return pageWithParent(DS_PARENT);
+    }
+    if (args[0] === "api" && args[1] === `v1/pages/${NEW_PAGE_ID}` && args[3] !== "PATCH") {
+      return pageWithParent(PAGE_PARENT);
+    }
+    if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
+      return ntnOk(DATA_SOURCE_SCHEMA);
+    }
+    // The content step always misses: Notion answers with a validation_error.
+    if (args[0] === "api" && path.endsWith("/markdown")) {
+      return ntnFail("No matches found for NOT PRESENT.\n\nFetch the page again");
+    }
+    if (args[0] === "api" && path.endsWith("/move")) {
+      return ntnOk({ object: "page", id: EDIT_PAGE_ID, parent: PAGE_PARENT });
+    }
+    if (args[0] === "api" && args[2] === "-X") {
+      return ntnOk({ object: "page", id: EDIT_PAGE_ID });
+    }
+    return ntnFail(`unexpected call: ${args.join(" ")}`);
+  }
+
+  it("still applies the title, icon and move when the content edit fails", async () => {
+    const { tool, calls } = editHarness(ev);
+    const result = await tool.execute("edit-independent", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "NOT PRESENT", new_str: "x" }],
+      title: "新标题",
+      icon: "🎯",
+      parent: `page:${NEW_PAGE_ID}`,
+    });
+
+    assert.equal(result.isError, true);
+    // The later steps really ran — this is the whole point of the change.
+    const patches = calls.filter((a) => a[2] === "-X" && a[1] === `v1/pages/${EDIT_PAGE_ID}`);
+    assert.equal(patches.length, 1, "properties/icon PATCH must still run");
+    assert.equal(
+      calls.filter((a) => String(a[1] ?? "").endsWith("/move")).length,
+      1,
+      "the move must still run"
+    );
+    // And the report separates what landed from what did not.
+    // The acceptance data source names its title column "Name", not "title".
+    assert.deepEqual(result.details.applied, ["属性（Name）", "icon"]);
+    assert.deepEqual(result.details.failed_steps, ["正文（edits）"]);
+    const rendered = text(result);
+    assert.match(rendered, /部分成功/);
+    assert.match(rendered, /已经生效的部分：属性（Name）、icon/);
+    assert.match(rendered, /正文（edits）/);
+    assert.match(rendered, /不会回滚/);
+  });
+
+  it("reports a plain error when EVERY step fails, with no misleading 'already written' text", async () => {
+    const allFail = (args: string[]): RunNtnResult => {
+      const path = String(args[1] ?? "");
+      if (path.endsWith("/markdown")) return ntnFail("No matches found for NOT PRESENT.");
+      if (path.endsWith("/move")) return ntnFail("move rejected");
+      if (args[2] === "-X") return ntnFail("property write rejected");
+      return ev(args);
+    };
+    const { tool } = editHarness(allFail);
+    const result = await tool.execute("edit-allfail", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "NOT PRESENT", new_str: "x" }],
+      props: { Done: true },
+      parent: `page:${NEW_PAGE_ID}`,
+    });
+
+    assert.equal(result.isError, true);
+    // Nothing landed, so nothing may be claimed as applied.
+    assert.doesNotMatch(text(result), /已经生效的部分/);
+    assert.doesNotMatch(text(result), /部分成功/);
+    assert.notEqual(result.details.partial, true);
   });
 });
