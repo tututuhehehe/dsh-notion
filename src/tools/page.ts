@@ -89,6 +89,7 @@ import {
   TOOL_TIMEOUTS,
 } from "../dsh/tool.ts";
 import type { JsonObject, NotionTool } from "../dsh/tool.ts";
+import { PAGE_ERRORS } from "../text/errors.ts";
 import {
   CREATE_PARAMS,
   EDIT_ITEM_TEXT,
@@ -181,7 +182,7 @@ function rejectUnexpectedParams(params: JsonObject, allowed: readonly string[], 
     (key) => params[key] !== undefined && !allowed.includes(key)
   );
   if (unexpected.length > 0) {
-    throw new InputError(`${usage} 多余的参数：${unexpected.join(", ")}。`, {
+    throw new InputError(PAGE_ERRORS.rejectUnexpectedParams_1({ usage: usage, join: unexpected.join(", ") }), {
       unexpected_params: unexpected,
     });
   }
@@ -324,8 +325,7 @@ function normalizeIcon(raw: unknown): NormalizedIcon | undefined {
   if (typeof raw === "string") {
     const value = raw.trim();
     if (!value) {
-      throw new InputError(
-        "icon 不能是空字符串：不设置 icon 就省略这个参数，清除已有 icon 请传 null。",
+      throw new InputError(PAGE_ERRORS.normalizeIcon_1,
         { field: "icon" }
       );
     }
@@ -333,9 +333,7 @@ function normalizeIcon(raw: unknown): NormalizedIcon | undefined {
       return { payload: { type: "external", external: { url: value } }, display: value };
     }
     if ([...value].length > MAX_EMOJI_LENGTH) {
-      throw new InputError(
-        `icon 看起来既不是 emoji 也不是图片 URL（长度 ${[...value].length}）：${describeValue(value)}。` +
-          '请传单个 emoji（如 "🎯"）、http(s) 图片 URL，或 null 清除。',
+      throw new InputError(PAGE_ERRORS.normalizeIcon_2({ length: [...value].length, value: describeValue(value) }),
         { field: "icon", value }
       );
     }
@@ -347,8 +345,7 @@ function normalizeIcon(raw: unknown): NormalizedIcon | undefined {
     if (type === "emoji") {
       const emoji = typeof raw.emoji === "string" ? raw.emoji.trim() : "";
       if (!emoji) {
-        throw new InputError(
-          'icon 的 emoji 对象缺少 emoji 文本：需要 { "type": "emoji", "emoji": "🎯" }。',
+        throw new InputError(PAGE_ERRORS.normalizeIcon_3,
           { field: "icon" }
         );
       }
@@ -357,9 +354,7 @@ function normalizeIcon(raw: unknown): NormalizedIcon | undefined {
     if (type === "external") {
       const url = isPlainObject(raw.external) ? raw.external.url : undefined;
       if (typeof url !== "string" || !HTTP_URL_RE.test(url.trim())) {
-        throw new InputError(
-          'icon 的 external 对象需要一个 http(s) url：' +
-            '{ "type": "external", "external": { "url": "https://…/a.png" } }。',
+        throw new InputError(PAGE_ERRORS.normalizeIcon_4,
           { field: "icon" }
         );
       }
@@ -369,16 +364,12 @@ function normalizeIcon(raw: unknown): NormalizedIcon | undefined {
       // Escape hatch: a caller that already knows the exact Notion payload wins.
       return { payload: raw, display: `${String(type)} icon` };
     }
-    throw new InputError(
-      'icon 的对象形式必须带 type：接受 "emoji" / "external" / "custom_emoji" / "file"，' +
-        `或直接传 emoji 字符串、图片 URL、null。收到 ${describeValue(raw)}。`,
+    throw new InputError(PAGE_ERRORS.normalizeIcon_5({ raw: describeValue(raw) }),
       { field: "icon", value: raw }
     );
   }
 
-  throw new InputError(
-    `icon 必须是 emoji 字符串、http(s) 图片 URL、已构好的 Notion icon 对象，或 null（清除）；` +
-      `收到 ${describeValue(raw)}。`,
+  throw new InputError(PAGE_ERRORS.normalizeIcon_6({ raw: describeValue(raw) }),
     { field: "icon", value: raw }
   );
 }
@@ -392,14 +383,14 @@ function normalizeIcon(raw: unknown): NormalizedIcon | undefined {
 function normalizeBody(raw: unknown, required: boolean): string | undefined {
   if (raw === undefined || raw === null) {
     if (required) {
-      throw new InputError("body_content 必须是 Markdown 字符串，不能是 null。", {
+      throw new InputError(PAGE_ERRORS.normalizeBody_1, {
         field: "body_content",
       });
     }
     return undefined;
   }
   if (typeof raw !== "string") {
-    throw new InputError(`body_content 必须是 Markdown 字符串（页面正文），收到 ${describeValue(raw)}。`, {
+    throw new InputError(PAGE_ERRORS.normalizeBody_2({ raw: describeValue(raw) }), {
       field: "body_content",
     });
   }
@@ -417,12 +408,10 @@ function normalizeBody(raw: unknown, required: boolean): string | undefined {
 function normalizeProps(raw: unknown): Record<string, unknown> | undefined {
   if (raw === undefined || raw === null) return undefined;
   if (Array.isArray(raw)) {
-    throw new InputError(
-      "props 必须是对象 map（{属性名: 值}），不是数组。例如 {\"Status\":\"进行中\",\"标签\":[\"a\",\"b\"]}。"
-    );
+    throw new InputError(PAGE_ERRORS.normalizeProps_1);
   }
   if (!isPlainObject(raw)) {
-    throw new InputError(`props 必须是对象 map（{属性名: 值}），收到 ${describeValue(raw)}。`);
+    throw new InputError(PAGE_ERRORS.normalizeProps_2({ raw: describeValue(raw) }));
   }
   const entries = Object.entries(raw).filter(([, value]) => value !== undefined);
   return entries.length ? Object.fromEntries(entries) : undefined;
@@ -430,7 +419,7 @@ function normalizeProps(raw: unknown): Record<string, unknown> | undefined {
 
 function normalizeTitle(raw: unknown): string | undefined {
   if (raw === undefined || raw === null) return undefined;
-  if (typeof raw !== "string") throw new InputError("title 必须是字符串。");
+  if (typeof raw !== "string") throw new InputError(PAGE_ERRORS.normalizeTitle_1);
   // A newline is NOT rejected: Notion accepts one in a title and normalises it to a space
   // (verified live: "a\nb" is stored as "a b"). Refusing it would reject input the API takes.
   const title = raw.trim();
@@ -447,7 +436,7 @@ function parseParentSpec(raw: unknown, op: "create" | "move"): ParentSpec {
       ? "page:<id>（把页面挂到该页面下）或父行 id（把行挂到父行下）"
       : "page:<id>、database:<id>、data-source:<id>，或数据库行 id（作为子行父级）";
   if (typeof raw !== "string" || !raw.trim()) {
-    throw new InputError(`${op === "move" ? "移动页面（parent）" : "create"} 需要 parent：${usage}。`);
+    throw new InputError(PAGE_ERRORS.parseParentSpec_1({ create: op === "move" ? "移动页面（parent）" : "create", usage: usage }));
   }
   const value = raw.trim();
   const match = /^(page|database|data[_-]?source)\s*:\s*(.+)$/i.exec(value);
@@ -456,10 +445,7 @@ function parseParentSpec(raw: unknown, op: "create" | "move"): ParentSpec {
     // (`requireId`), so the two cannot disagree about whether a URL is acceptable.
     const bare = isNotionId(value) ? value : extractNotionId(value);
     if (!bare) {
-      throw new InputError(
-        `parent 格式无效：${describeValue(raw)}。用法：${usage}。` +
-          "接受 Notion id（32 位 hex / UUID）或该对象的 Notion URL。"
-      );
+      throw new InputError(PAGE_ERRORS.parseParentSpec_2({ raw: describeValue(raw), usage: usage }));
     }
     return { bare: true, id: bare };
   }
@@ -468,10 +454,7 @@ function parseParentSpec(raw: unknown, op: "create" | "move"): ParentSpec {
   const rawId = match[2].trim();
   const id = isNotionId(rawId) ? rawId : extractNotionId(rawId);
   if (!id) {
-    throw new InputError(
-      `parent 里的 id 无效：${describeValue(match[2])}。接受 Notion id（32 位 hex / UUID）或 URL，` +
-        "例如 data-source:716f546f-1824-45f0-b73a-481bf8b5f5db。"
-    );
+    throw new InputError(PAGE_ERRORS.parseParentSpec_3({ match: describeValue(match[2]) }));
   }
   return { bare: false, kind, id };
 }
@@ -485,17 +468,13 @@ function parseParentSpec(raw: unknown, op: "create" | "move"): ParentSpec {
  */
 function requireId(raw: unknown, op: PageOp): string {
   if (typeof raw !== "string" || !raw.trim()) {
-    throw new InputError(
-      `${op} 需要 id：页面 id（32 位 hex 或带连字符的 UUID）或该页面的 Notion URL。`
-    );
+    throw new InputError(PAGE_ERRORS.requireId_1({ op: op }));
   }
   const text = raw.trim();
   if (isNotionId(text)) return text;
   const extracted = extractNotionId(text);
   if (extracted) return extracted;
-  throw new InputError(
-    `id 无效：${describeValue(raw)}。只接受 Notion 页面 id（32 位 hex / UUID）或该页面的 Notion URL。`
-  );
+  throw new InputError(PAGE_ERRORS.requireId_2({ raw: describeValue(raw) }));
 }
 
 /* ------------------------------------------------------------------ *
@@ -521,9 +500,7 @@ function ntnFailure(label: string, result: RunNtnResult, note?: string): NotionT
     result.code === null && !detail
       ? `（${failureStatus(result)}）`
       : exit;
-  return new NotionToolError(
-    `${note ? `${note}；` : ""}${label} 失败${status}${detail ? `：${truncate(detail)}` : ""}` +
-      (hint ? `\n${hint}` : ""),
+  return new NotionToolError(PAGE_ERRORS.ntnFailure_1({ note: note ? `${note}；` : "", label, status, detail: detail ? `：${truncate(detail)}` : "", hint }),
     {
       code: NOTION_ERROR_CODES.ntnFailed,
       details: {
@@ -547,8 +524,7 @@ async function fetchDataSourceSchema(
   const parsed = parseJsonMaybe(result.stdout);
   const properties = extractSchemaProperties(parsed);
   if (!properties) {
-    throw new InputError(
-      `无法从 ${path} 读取属性列表：请确认 id 正确、Integration 已被邀请到该数据库，并且 parent 类型匹配（新版数据库用 data-source:<id>）。`,
+    throw new InputError(PAGE_ERRORS.fetchDataSourceSchema_1({ path: path }),
       { endpoint: path }
     );
   }
@@ -567,16 +543,13 @@ async function resolveDatabaseDataSource(runner: NtnRunner, databaseId: string):
   }
   const refs = parseResolveDataSources(parseJsonMaybe(result.stdout));
   if (refs.length === 0) {
-    throw new InputError(
-      `database ${databaseId} 没有返回任何 data source id。请确认 Integration 已被邀请，并改用 data-source:<id> 指定。`,
+    throw new InputError(PAGE_ERRORS.resolveDatabaseDataSource_1({ databaseId: databaseId }),
       { databaseId }
     );
   }
   if (refs.length > 1) {
     const lines = refs.map((ref) => `- ${ref.id}${ref.name ? ` (${ref.name})` : ""}`);
-    throw new InputError(
-      `database ${databaseId} 有 ${refs.length} 个 data source，需要唯一一个才能确定 schema。` +
-        `请改用 parent: data-source:<id>，可选：\n${lines.join("\n")}`,
+    throw new InputError(PAGE_ERRORS.resolveDatabaseDataSource_2({ databaseId: databaseId, length: refs.length, n: lines.join("\n") }),
       { databaseId, data_source_ids: refs.map((ref) => ref.id) }
     );
   }
@@ -692,8 +665,7 @@ async function assertNoRowCycle(
 
   while (queue.length > 0) {
     if (visited.size > MAX_ANCESTOR_WALK) {
-      throw new InputError(
-        `Parent-item 祖先链超过 ${MAX_ANCESTOR_WALK} 层，无法确认不会形成环；已停止，未写入。`,
+      throw new InputError(PAGE_ERRORS.assertNoRowCycle_1({ MAX_ANCESTOR_WALK: MAX_ANCESTOR_WALK }),
         { id: childId, parent: parentId, cycle_check: "too_deep" }
       );
     }
@@ -703,8 +675,7 @@ async function assertNoRowCycle(
     visited.add(key);
 
     if (sameNotionId(current, childId)) {
-      throw new InputError(
-        `行 ${childId} 不能挂到 ${parentId} 下：那会形成 Parent-item 环（${parentId} 的祖先里有 ${childId}）。`,
+      throw new InputError(PAGE_ERRORS.assertNoRowCycle_2({ childId: childId, parentId: parentId, parentId2: parentId, childId2: childId }),
         {
           id: childId,
           parent: parentId,
@@ -719,8 +690,7 @@ async function assertNoRowCycle(
     try {
       page = await readPage(current);
     } catch (error) {
-      throw new InputError(
-        `无法读取祖先行 ${current}，因此无法确认把 ${childId} 挂到 ${parentId} 下不会形成环；已在写入前停止。`,
+      throw new InputError(PAGE_ERRORS.assertNoRowCycle_3({ current: current, childId: childId, parentId: parentId }),
         {
           id: childId,
           parent: parentId,
@@ -744,8 +714,7 @@ async function assertNoRowCycle(
         try {
           ancestorDataSourceId = await resolveDatabaseDataSource(runner, ancestorParent.id);
         } catch (error) {
-          throw new InputError(
-            `无法确认祖先行 ${current} 所属的 data source，因此无法确认把 ${childId} 挂到 ${parentId} 下不会形成环；已在写入前停止。`,
+          throw new InputError(PAGE_ERRORS.assertNoRowCycle_4({ current: current, childId: childId, parentId: parentId }),
             {
               id: childId,
               parent: parentId,
@@ -838,17 +807,13 @@ async function classifyBareParent(
     // passes through untouched so its own kind survives.
     if (error instanceof NotionToolError) throw error;
     const detail = error instanceof Error ? error.message : String(error);
-    throw new InputError(
-      `无法把 ${id} 当作 parent：读取它作为页面失败${detail ? `（${truncate(detail, 300)}）` : ""}。` +
-        `${op === "create" ? "create" : "移动页面"} 的裸 id 必须是页面或数据库行；如果它是 database 或 data source，请写成 database:<id> / data-source:<id>。`,
+    throw new InputError(PAGE_ERRORS.classifyBareParent_1({ id: id, detail: detail ? `（${truncate(detail, 300)}）` : "", create: op === "create" ? "create" : "移动页面" }),
       { parent: id }
     );
   }
   const parent = page.parent;
   if (!parent) {
-    throw new InputError(
-      `无法把 ${id} 当作 parent：GET v1/pages 没有返回 parent。` +
-        `${op === "create" ? "create" : "移动页面"} 的裸 id 必须是页面或数据库行；如果它是 database 或 data source，请写成 database:<id> / data-source:<id>。`,
+    throw new InputError(PAGE_ERRORS.classifyBareParent_2({ id: id, create: op === "create" ? "create" : "移动页面" }),
       { parent: id }
     );
   }
@@ -905,8 +870,7 @@ function richText(content: string): unknown[] {
 
 function requireString(prop: PropertySchema, value: unknown): string {
   if (typeof value !== "string") {
-    throw new InputError(
-      `属性 "${prop.name}" (${prop.type}) 需要字符串，收到 ${describeValue(value)}。`,
+    throw new InputError(PAGE_ERRORS.requireString_1({ name: prop.name, type: prop.type, value: describeValue(value) }),
       { property: prop.name, expected: prop.type }
     );
   }
@@ -918,8 +882,7 @@ function stringList(prop: PropertySchema, value: unknown): string[] {
   if (Array.isArray(value) && value.every((item) => typeof item === "string")) {
     return (value as string[]).filter((item) => item.trim() !== "");
   }
-  throw new InputError(
-    `属性 "${prop.name}" (${prop.type}) 需要 string[]，收到 ${describeValue(value)}。`,
+  throw new InputError(PAGE_ERRORS.stringList_1({ name: prop.name, type: prop.type, value: describeValue(value) }),
     { property: prop.name, expected: "string[]" }
   );
 }
@@ -966,9 +929,9 @@ function buildPropertyValue(prop: PropertySchema, value: unknown): JsonObject {
       case "relation":
         return { relation: [] };
       case "title":
-        throw new InputError(`属性 "${prop.name}" 是标题，不能设为 null。`, { property: prop.name });
+        throw new InputError(PAGE_ERRORS.buildPropertyValue_1({ name: prop.name }), { property: prop.name });
       default:
-        throw new InputError(`属性 "${prop.name}" (${prop.type}) 不支持用 null 清空。`, {
+        throw new InputError(PAGE_ERRORS.buildPropertyValue_2({ name: prop.name, type: prop.type }), {
           property: prop.name,
           expected: prop.type,
         });
@@ -983,7 +946,7 @@ function buildPropertyValue(prop: PropertySchema, value: unknown): JsonObject {
   switch (prop.type) {
     case "title": {
       const text = requireString(prop, value);
-      if (!text.trim()) throw new InputError(`标题属性 "${prop.name}" 不能为空。`, { property: prop.name });
+      if (!text.trim()) throw new InputError(PAGE_ERRORS.buildPropertyValue_3({ name: prop.name }), { property: prop.name });
       return { title: richText(text) };
     }
     case "rich_text": {
@@ -993,8 +956,7 @@ function buildPropertyValue(prop: PropertySchema, value: unknown): JsonObject {
       } else if (Array.isArray(value) && value.every((item) => typeof item === "string")) {
         text = (value as string[]).join("\n");
       } else {
-        throw new InputError(
-          `属性 "${prop.name}" (rich_text) 需要字符串，收到 ${describeValue(value)}。`,
+        throw new InputError(PAGE_ERRORS.buildPropertyValue_4({ name: prop.name, value: describeValue(value) }),
           { property: prop.name, expected: "string" }
         );
       }
@@ -1005,8 +967,7 @@ function buildPropertyValue(prop: PropertySchema, value: unknown): JsonObject {
       if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) {
         return { number: Number(value) };
       }
-      throw new InputError(
-        `属性 "${prop.name}" (number) 需要数字，收到 ${describeValue(value)}。`,
+      throw new InputError(PAGE_ERRORS.buildPropertyValue_5({ name: prop.name, value: describeValue(value) }),
         { property: prop.name, expected: "number" }
       );
     }
@@ -1019,8 +980,7 @@ function buildPropertyValue(prop: PropertySchema, value: unknown): JsonObject {
             ? value.name
             : undefined;
       if (name === undefined) {
-        throw new InputError(
-          `属性 "${prop.name}" (${prop.type}) 需要选项名字符串，收到 ${describeValue(value)}。`,
+        throw new InputError(PAGE_ERRORS.buildPropertyValue_6({ name: prop.name, type: prop.type, value: describeValue(value) }),
           { property: prop.name, expected: "string" }
         );
       }
@@ -1042,15 +1002,13 @@ function buildPropertyValue(prop: PropertySchema, value: unknown): JsonObject {
         }
         return { date };
       }
-      throw new InputError(
-        `属性 "${prop.name}" (date) 需要日期字符串或 {start,end}，收到 ${describeValue(value)}。`,
+      throw new InputError(PAGE_ERRORS.buildPropertyValue_7({ name: prop.name, value: describeValue(value) }),
         { property: prop.name, expected: "string | {start,end}" }
       );
     }
     case "checkbox": {
       if (typeof value !== "boolean") {
-        throw new InputError(
-          `属性 "${prop.name}" (checkbox) 需要 true/false，收到 ${describeValue(value)}。`,
+        throw new InputError(PAGE_ERRORS.buildPropertyValue_8({ name: prop.name, value: describeValue(value) }),
           { property: prop.name, expected: "boolean" }
         );
       }
@@ -1068,8 +1026,7 @@ function buildPropertyValue(prop: PropertySchema, value: unknown): JsonObject {
       return { [prop.type]: ids.map((id) => ({ id })) };
     }
     default:
-      throw new InputError(
-        `属性 "${prop.name}" 的类型 ${prop.type} 暂不支持通过简化值写入；可改用 props 里直接给 Notion 原生 payload，例如 {"${prop.name}": {"${prop.type}": ...}}。`,
+      throw new InputError(PAGE_ERRORS.buildPropertyValue_9({ name: prop.name, type: prop.type, name2: prop.name, type2: prop.type }),
         { property: prop.name, type: prop.type }
       );
   }
@@ -1079,14 +1036,12 @@ function resolveProperty(schema: PropertySchemaSet, name: string): PropertySchem
   const prop = schema.properties.get(name);
   const hints = writableProperties(schema);
   if (!prop) {
-    throw new InputError(
-      `未知属性 "${name}"。可用可写属性：${formatHints(hints)}。`,
+    throw new InputError(PAGE_ERRORS.resolveProperty_1({ name: name, hints: formatHints(hints) }),
       { property: name, hint_properties: hints }
     );
   }
   if (READ_ONLY_PROPERTY_TYPES.has(prop.type)) {
-    throw new InputError(
-      `属性 "${name}" 的类型是 ${prop.type}（只读），不能写入。可写属性：${formatHints(hints)}。`,
+    throw new InputError(PAGE_ERRORS.resolveProperty_2({ name: name, type: prop.type, hints: formatHints(hints) }),
       { property: name, type: prop.type, hint_properties: hints }
     );
   }
@@ -1461,8 +1416,7 @@ const MARKDOWN_REQUEST_DEFAULTS: JsonObject = {
 function readContentEdit(raw: unknown, index: number): ContentEdit {
   const path = `edits[${index}]`;
   if (!isPlainObject(raw)) {
-    throw new InputError(
-      `${path} 必须是 { old_str, new_str, replace_all_matches? }，收到 ${describeValue(raw)}。`,
+    throw new InputError(PAGE_ERRORS.readContentEdit_1({ path: path, raw: describeValue(raw) }),
       { field: path, value: raw }
     );
   }
@@ -1470,32 +1424,27 @@ function readContentEdit(raw: unknown, index: number): ContentEdit {
     (key) => raw[key] !== undefined && !["old_str", "new_str", "replace_all_matches"].includes(key)
   );
   if (unexpected.length > 0) {
-    throw new InputError(
-      `${path} 只接受 old_str / new_str / replace_all_matches，多余字段：${unexpected.join(", ")}。`,
+    throw new InputError(PAGE_ERRORS.readContentEdit_2({ path: path, join: unexpected.join(", ") }),
       { field: path, unexpected_params: unexpected }
     );
   }
   if (typeof raw.old_str !== "string") {
-    throw new InputError(
-      `${path}.old_str 必须是字符串（要查找的原文），收到 ${describeValue(raw.old_str)}。`,
+    throw new InputError(PAGE_ERRORS.readContentEdit_3({ path: path, old_str: describeValue(raw.old_str) }),
       { field: `${path}.old_str`, value: raw.old_str }
     );
   }
   if (raw.old_str === "") {
-    throw new InputError(
-      `${path}.old_str 不能是空字符串：Notion 会拒绝空 old_str。要追加内容请用 body_content 且不传 edits。`,
+    throw new InputError(PAGE_ERRORS.readContentEdit_4({ path: path }),
       { field: `${path}.old_str` }
     );
   }
   if (raw.new_str === undefined) {
-    throw new InputError(
-      `${path}.new_str 是必填的：替换成什么就写什么，想删除这段文字请传 ""（空字符串）。`,
+    throw new InputError(PAGE_ERRORS.readContentEdit_5({ path: path }),
       { field: `${path}.new_str`, value: raw.new_str }
     );
   }
   if (typeof raw.new_str !== "string") {
-    throw new InputError(
-      `${path}.new_str 必须是字符串，收到 ${describeValue(raw.new_str)}。`,
+    throw new InputError(PAGE_ERRORS.readContentEdit_6({ path: path, new_str: describeValue(raw.new_str) }),
       { field: `${path}.new_str`, value: raw.new_str }
     );
   }
@@ -1528,15 +1477,12 @@ function unescapeDollar(text: string): string {
 function readContentEdits(raw: unknown): ContentEdit[] {
   if (raw === undefined || raw === null) return [];
   if (!Array.isArray(raw)) {
-    throw new InputError(
-      `edits 必须是数组：[{ old_str, new_str, replace_all_matches? }, ...]，收到 ${describeValue(raw)}。` +
-        `要追加内容请改用 body_content（不传 edits）。`,
+    throw new InputError(PAGE_ERRORS.readContentEdits_1({ raw: describeValue(raw) }),
       { field: "edits", value: raw }
     );
   }
   if (raw.length > MAX_CONTENT_UPDATES) {
-    throw new InputError(
-      `edits 最多 ${MAX_CONTENT_UPDATES} 条（Notion 限制），收到 ${raw.length} 条。请拆成多次 notion_page_edit 调用。`,
+    throw new InputError(PAGE_ERRORS.readContentEdits_2({ MAX_CONTENT_UPDATES: MAX_CONTENT_UPDATES, length: raw.length }),
       { field: "edits", count: raw.length, max: MAX_CONTENT_UPDATES }
     );
   }
@@ -1557,8 +1503,7 @@ function withEditAlias(
 ): { edits: ContentEdit[]; props: Record<string, unknown> | undefined } {
   if (!props || !("block_update" in props)) return { edits, props };
   if (edits.length > 0) {
-    throw new InputError(
-      "edits 和 props.block_update 是同一个东西（查找替换列表），不要同时传；请统一用 edits。本次没有写入任何内容。",
+    throw new InputError(PAGE_ERRORS.withEditAlias_1,
       { conflict: true, fields: ["edits", "props.block_update"] }
     );
   }
@@ -1621,11 +1566,7 @@ const DELETION_REFUSAL_RE =
 function markdownFailure(pageId: string, result: RunNtnResult): NotionToolError {
   const detail = (result.stderr || result.stdout || "").trim();
   if (DELETION_REFUSAL_RE.test(detail)) {
-    return new NotionToolError(
-      `这次编辑会删除页面 ${pageId} 里的子页面或子数据库，Notion 因此拒绝执行（本次没有写入任何内容）。` +
-        "old_str 匹配的是整段文本，很容易连带覆盖 `<page url=\"...\">…</page>` 或 `<database ...>` 这类块。" +
-        "请把 old_str 缩小到那段文字本身（不要包含子页面/子数据库块），或先在 Notion 里把子页面移走再改。" +
-        `ntn 输出：${truncate(detail, 600)}`,
+    return new NotionToolError(PAGE_ERRORS.markdownFailure_1({ pageId: pageId, detail: truncate(detail, 600) }),
       {
         code: NOTION_ERROR_CODES.ntnFailed,
         details: {
@@ -1737,11 +1678,7 @@ function buildPropertyWrite(
   if (title) {
     const titleName = titlePropertyName(schema);
     if (!titleName) {
-      throw new InputError(
-        context.pageId
-          ? `无法确定页面 ${context.pageId} 的标题属性，不能用 title 改标题；请改用 props 并指定标题属性名。`
-          : `无法确定 ${context.source} 的标题属性，不能用 title 指定标题；请改用 props 并指定标题属性名。`
-      );
+      throw new InputError(PAGE_ERRORS.buildPropertyWrite_1({ pageId: context.pageId, source: context.source }));
     }
     properties[titleName] = { title: richText(title) };
     if (!names.includes(titleName)) names.push(titleName);
@@ -1774,9 +1711,7 @@ function parentItemError(schema: PropertySchemaSet, dataSourceId: string): Input
         )
         .join(", ")}`
     : "该 data source 没有任何 relation 列";
-  return new InputError(
-    `data source ${dataSourceId} 没有可用的 Parent-item / 自关联 relation 列，无法把行挂到父行下（${detail}）。` +
-      "请在 Notion 里为这个库加一个指向自身的 relation 属性（默认名 Parent-item），或用 notion_get 查看现有列后重试。",
+  return new InputError(PAGE_ERRORS.parentItemError_1({ dataSourceId: dataSourceId, detail: detail }),
     {
       dataSourceId,
       hint_properties: hints,
@@ -1843,7 +1778,7 @@ async function rollbackCreatedPage(
     rollback_code: trash.code,
     ...(detail ? { rollback_error: truncate(detail, 600) } : {}),
   };
-  return new NotionToolError(`${cause.detail}${rollbackLine}`, {
+  return new NotionToolError(PAGE_ERRORS.rollbackCreatedPage_1({ detail: cause.detail, rollbackLine: rollbackLine }), {
     code: partial ? NOTION_ERROR_CODES.partialWrite : cause.code,
     details,
   });
@@ -1891,10 +1826,7 @@ async function createPage(params: CreateParams, runner: NtnRunner): Promise<Page
   // carries the content, and `create` already rejects a call with neither title nor body.
   if (container.kind !== "page" && container.kind !== "workspace" && !title) {
     const hints = writableProperties(container.schema);
-    throw new InputError(
-      `在 ${container.kind === "row" ? `行 ${container.rowParentId} 所在 data source` : container.kind} 中创建页面需要标题：` +
-        `请传 title、在 props 里写标题属性（${titlePropertyName(container.schema) ?? "title"}），` +
-        `或让 body_content 以 "# 标题" 开头。可写属性：${formatHints(hints)}。`,
+    throw new InputError(PAGE_ERRORS.createPage_1({ kind: container.kind === "row" ? `行 ${container.rowParentId} 所在 data source` : container.kind, title: titlePropertyName(container.schema) ?? "title", hints: formatHints(hints) }),
       { ...(parentLabel ? { parent: parentLabel } : { parent: "workspace" }), hint_properties: hints }
     );
   }
@@ -1903,9 +1835,7 @@ async function createPage(params: CreateParams, runner: NtnRunner): Promise<Page
   // with exit 5. A title-only create is fine because frontmatter makes the body
   // non-empty, but a bare `parent` with no title cannot create a page.
   if (!draft.body.trim()) {
-    throw new InputError(
-      "create 需要 body_content 或 title：ntn pages create 不接受空 Markdown，只有 parent 无法创建空白页面。"
-    );
+    throw new InputError(PAGE_ERRORS.createPage_2);
   }
 
   // A row parent means the new page is a child row: link it with the Parent-item column.
@@ -1943,11 +1873,7 @@ async function createPage(params: CreateParams, runner: NtnRunner): Promise<Page
   /** Fail before any follow-up write when there is no trusted id to write to. */
   const requireTrustedId = (what: string): string => {
     if (structuredId) return structuredId;
-    throw new InputError(
-      `页面已创建（parent ${parentLabel ?? "workspace"}），但没有从 ntn 的结构化输出里取到页面 id，` +
-        `${what}未写入。` +
-        `没有可信 id 就不自动 trash（避免误删），请用 notion_search/notion_get 找到该页面后，` +
-        `用 notion_page_edit 写入，或 notion_page_trash 删除（partial: true，rollback: unknown_id）。`,
+    throw new InputError(PAGE_ERRORS.createPage_3({ workspace: parentLabel ?? "workspace", what: what }),
       {
         parent: parentLabel ?? "workspace",
         partial: true,
@@ -2095,11 +2021,7 @@ function editWithFailures(
   const reported = causes
     .map((entry) => `  - ${entry.step}：${entry.cause.detail}`)
     .join("\n");
-  return new NotionToolError(
-    `部分成功。已经生效的部分：${applied.join("、")}（已写入，不会回滚）。\n` +
-      `失败的部分：\n${reported}\n` +
-      `这些步骤互不依赖，所以其余步骤照常执行了。重试时请只重发失败的部分；` +
-      `重发全部会把已生效的部分重复应用一遍。`,
+  return new NotionToolError(PAGE_ERRORS.editWithFailures_1({ join: applied.join("、"), reported: reported }),
     {
       code: causes[0]!.cause.code,
       details: {
@@ -2244,10 +2166,7 @@ async function movePage(
   // Reject database/data-source parents before spending an ntn call on them.
   const spec = parseParentSpec(options.parent, "move");
   if (!spec.bare && spec.kind !== "page") {
-    throw new InputError(
-      "edit 的 parent（移动页面）只支持 page:<id> 或（裸）行 id：页面挂到页面下用 POST /v1/pages/{id}/move，行挂到行下用 Parent-item relation。" +
-        "要把页面放进某个 data source，请用 notion_page_create。"
-    );
+    throw new InputError(PAGE_ERRORS.movePage_1);
   }
 
   const readPage = makePageReader(runner);
@@ -2255,8 +2174,7 @@ async function movePage(
   const childPage = await readPage(id);
   const childParent = childPage.parent;
   if (!childParent) {
-    throw new InputError(
-      `无法确定页面 ${id} 的当前父级（GET v1/pages 未返回 parent）。移动页面不会在没有确认的情况下执行。`,
+    throw new InputError(PAGE_ERRORS.movePage_2({ id: id }),
       { id }
     );
   }
@@ -2264,17 +2182,16 @@ async function movePage(
   if (container.kind === "page") {
     const targetParentId = container.createParent.id;
     if (sameNotionId(id, targetParentId)) {
-      throw new InputError(`页面 ${id} 不能挂到自己下面。`, { id, parent: targetParentId });
+      throw new InputError(PAGE_ERRORS.movePage_3({ id: id }), { id, parent: targetParentId });
     }
     if (childParent.kind === "page" && sameNotionId(childParent.id, targetParentId)) {
-      throw new InputError(`页面 ${id} 已经是 ${targetParentId} 的子页面，无需移动。`, { id });
+      throw new InputError(PAGE_ERRORS.movePage_4({ id: id, targetParentId: targetParentId }), { id });
     }
 
     // Deeper page-tree cycles (A→B→A) are checked best effort: one GET per ancestor.
     const cycle = await walkPageAncestors(readPage, { childId: id, parentId: targetParentId });
     if (cycle.cycle) {
-      throw new InputError(
-        `页面 ${id} 不能挂到页面 ${targetParentId} 下：会形成环（${cycle.cycle.join(" → ")}）。`,
+      throw new InputError(PAGE_ERRORS.movePage_5({ id: id, targetParentId: targetParentId, join: cycle.cycle.join(" → ") }),
         { id, parent: targetParentId, cycle: true, cycle_path: cycle.cycle, cycle_check: "cycle" }
       );
     }
@@ -2303,26 +2220,22 @@ async function movePage(
   if (container.kind !== "row") {
     // Unreachable: database/data-source parents are rejected above. Kept so the
     // row-only fields below are type-safe instead of a cast.
-    throw new InputError("无法把页面挂到 data source 容器下；请改用 notion_page_create。");
+    throw new InputError(PAGE_ERRORS.movePage_6);
   }
 
   // Parent is a row: only a row can be re-linked with a self-relation.
   if (childParent.kind === "page") {
-    throw new InputError(
-      `页面 ${id} 不在数据库里（父级是页面${childParent.id ? ` ${childParent.id}` : ""}），` +
-        `不能用 Parent-item relation 挂到行 ${container.rowParentId} 下；行→行的移动只适用于同一库内的行。`,
+    throw new InputError(PAGE_ERRORS.movePage_7({ id: id, id2: childParent.id ? ` ${childParent.id}` : "", rowParentId: container.rowParentId }),
       { id, parentRowId: container.rowParentId }
     );
   }
   if (sameNotionId(id, container.rowParentId)) {
-    throw new InputError(`行 ${id} 不能挂到自己下面。`, { id });
+    throw new InputError(PAGE_ERRORS.movePage_8({ id: id }), { id });
   }
 
   const childDataSourceId = await dataSourceIdForParent(runner, childParent);
   if (!sameNotionId(childDataSourceId, container.dataSourceId)) {
-    throw new InputError(
-      `行 ${id} 属于 data source ${childDataSourceId}，父行 ${container.rowParentId} 属于 ${container.dataSourceId}；` +
-        "自关联 Parent-item 只能在同一 data source 内使用，跨库请改用 page 父级或 notion_page_create。",
+    throw new InputError(PAGE_ERRORS.movePage_9({ id: id, childDataSourceId: childDataSourceId, rowParentId: container.rowParentId, dataSourceId: container.dataSourceId }),
       { id, childDataSourceId, parentDataSourceId: container.dataSourceId }
     );
   }
@@ -2346,9 +2259,7 @@ async function movePage(
     };
   }
   if (currentParents.length > 0 && options.yes !== true) {
-    throw new InputError(
-      `行 ${id} 的 ${relation.name}（Parent-item）已经指向 ${currentParents.join(", ")}，` +
-        `移到 ${container.rowParentId} 下会覆盖这个链接。确认要改父级请传 yes: true；本次没有写入。`,
+    throw new InputError(PAGE_ERRORS.movePage_10({ id: id, name: relation.name, join: currentParents.join(", "), rowParentId: container.rowParentId }),
       {
         id,
         parent: formatParent(container.createParent),
@@ -2510,9 +2421,7 @@ async function listChildPages(
       // The child list is the ONLY evidence this guard has. An unparseable response
       // is "I could not enumerate", not "there are no children": treating it as empty
       // would approve a subtree delete blind, so refuse instead.
-      throw inputError(
-        `页面 ${pageId} 的子块列表无法解析，不能确认它有多少子页面，因此拒绝删除。` +
-          `ntn 输出：${truncate((result.stdout || "").trim(), 200)}`,
+      throw inputError(PAGE_ERRORS.listChildPages_1({ pageId: pageId, trim: truncate((result.stdout || "").trim(), 200) }),
         { id: pageId, enumerable: false }
       );
     }
@@ -2557,8 +2466,7 @@ async function listChildPages(
     if (!next) {
       if (!options.failOnUnreadable && children.length > 0) return children;
       // More blocks exist but no cursor was offered: the enumeration is incomplete.
-      throw inputError(
-        `页面 ${pageId} 的子块报告 has_more=true 却没有 next_cursor，无法读完子页面列表，因此拒绝删除。`,
+      throw inputError(PAGE_ERRORS.listChildPages_2({ pageId: pageId }),
         { id: pageId, enumerable: false }
       );
     }
@@ -2566,9 +2474,7 @@ async function listChildPages(
     if (page === MAX_BLOCK_PAGES - 1) {
       if (!options.failOnUnreadable && children.length > 0) return children;
       // Refuse rather than approve a delete over a subtree we could not enumerate.
-      throw inputError(
-        `页面 ${pageId} 的子块超过 ${MAX_BLOCK_PAGES} 页仍未列完，无法确认它有多少子页面，因此拒绝删除。` +
-          "请在 Notion 里手动确认并删除。",
+      throw inputError(PAGE_ERRORS.listChildPages_3({ pageId: pageId, MAX_BLOCK_PAGES: MAX_BLOCK_PAGES }),
         { id: pageId, children_enumerated: children.length, enumerable: false }
       );
     }
@@ -2602,9 +2508,7 @@ async function trashPage(
     });
   }
   if (target.kind === "missing") {
-    throw new InputError(
-      `页面 ${id} 不存在，或没有被当前的 Notion integration 共享（••• → Connections），因此无法删除。` +
-        "请先用 notion_search 确认 id 正确。",
+    throw new InputError(PAGE_ERRORS.trashPage_1({ id: id }),
       { id, target: "missing" }
     );
   }
@@ -2612,11 +2516,7 @@ async function trashPage(
     // Notion refusal here is a policy choice of the plugin, not a malformed argument,
     // so `inputError`'s "fix your arguments" framing would be misleading. Keep it
     // visible to the model as an unusable request.
-    throw new InputError(
-      `notion_page_trash cannot delete a database (id ${id}). Removing a database, its data ` +
-        "sources and every row in them is far more destructive than deleting a page, so " +
-        "this tool refuses even with yes: true. Ask the user to delete it in Notion " +
-        "(••• → Delete) if that is really intended.",
+    throw new InputError(PAGE_ERRORS.trashPage_2({ id: id }),
       { id, target: "database", refused: "database_delete" }
     );
   }
@@ -2653,10 +2553,7 @@ async function trashPage(
         children.length > MAX_LISTED_CHILDREN
           ? `\n  …另有 ${children.length - MAX_LISTED_CHILDREN} 个未列出（共 ${children.length} 个，完整列表见 Notion）。`
           : "";
-      throw new InputError(
-        `页面 ${id} 有 ${children.length} 个子页面/嵌套容器：\n${listed}${overflow}\n` +
-          "Notion 会连带归档整棵子树，所以默认拒绝。确认要一起删除请加 recursive: true；" +
-          "只想删父页面请先在 Notion 里移走这些子页面。",
+      throw new InputError(PAGE_ERRORS.trashPage_3({ id: id, length: children.length, listed: listed, overflow: overflow }),
         {
           id,
           children: children.map((child) => child.id),
@@ -2909,8 +2806,7 @@ export function createNotionPageEditTool(deps: NotionPageDeps = {}): NotionTool<
       const hasYes = args.yes !== undefined;
       const yes = hasYes ? readBoolean(args.yes, "yes") : false;
       if (hasYes && args.parent === undefined) {
-        throw new InputError(
-          "yes 只用于「行→行移动时覆盖已有 Parent-item 链接」，没有 parent 时传 yes 没有意义；请去掉 yes。本次没有写入。",
+        throw new InputError(PAGE_ERRORS.createNotionPageEditTool_1,
           { field: "yes" }
         );
       }
@@ -2920,19 +2816,12 @@ export function createNotionPageEditTool(deps: NotionPageDeps = {}): NotionTool<
       // vs append). Running one and silently dropping the other would report success for a
       // write that never happened, so the combination is refused instead of guessed.
       if (edits.length > 0 && body !== undefined) {
-        throw new InputError(
-          "edits（查找替换）和 body_content（追加到末尾）不能同时传：二选一。" +
-            "需要既改又追加时请分两次调用 notion_page_edit。本次没有写入。",
+        throw new InputError(PAGE_ERRORS.createNotionPageEditTool_2,
           { conflict: true, fields: ["edits", "body_content"] }
         );
       }
       if (edits.length === 0 && !appends && props === undefined && title === undefined && icon === undefined && args.parent === undefined) {
-        throw new InputError(
-          "notion_page_edit 需要 edits、body_content、props、title、icon、parent 至少一项；空调用不会修改页面。" +
-            (body !== undefined
-              ? "body_content 是空白：追加空白内容不会修改页面。"
-              : "要追加内容请传 body_content（不传 edits）。")
-        );
+        throw new InputError(PAGE_ERRORS.createNotionPageEditTool_3({ bodyProvided: body !== undefined }));
       }
 
       const params: EditParams = {
@@ -2973,8 +2862,7 @@ export function createNotionPageTrashTool(deps: NotionPageDeps = {}): NotionTool
       );
       if (exec.signal?.aborted) throw abortError();
       if (args.yes === undefined || !readBoolean(args.yes, "yes")) {
-        throw new InputError(
-          'notion_page_trash 会删除（移入回收站）页面，必须显式传 yes: true（或 "true" / "yes" / 1）才会调用 ntn；本次没有调用 ntn。',
+        throw new InputError(PAGE_ERRORS.createNotionPageTrashTool_1,
           { yes: args.yes }
         );
       }

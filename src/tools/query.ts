@@ -32,6 +32,7 @@ import {
   TOOL_TIMEOUTS,
 } from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
+import { QUERY_ERRORS } from "../text/errors.ts";
 import { QUERY_PARAMS } from "../text/params.ts";
 import { TOOL_DESCRIPTIONS } from "../text/tools.ts";
 import { parseResolveDataSources } from "../lib/datasources.ts";
@@ -147,13 +148,13 @@ export function normalizeSort(sort?: string | string[]): string[] {
     // "item.trim is not a function", which says nothing the caller can act on.
     if (typeof item !== "string") {
       throw inputError(
-        `sort entries must be "Property asc|desc" strings, got ${describe(item)}.`,
+        QUERY_ERRORS.sortEntryNotString({ got: describe(item) }),
         { sort: item }
       );
     }
     const spec = item.trim();
     if (!spec) {
-      throw inputError('sort entries must be non-empty "Property asc|desc" strings.');
+      throw inputError(QUERY_ERRORS.sortEntryEmpty);
     }
     specs.push(spec);
   }

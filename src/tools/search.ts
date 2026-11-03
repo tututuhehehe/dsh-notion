@@ -23,6 +23,7 @@ import {
   TOOL_TIMEOUTS,
 } from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
+import { SEARCH_ERRORS } from "../text/errors.ts";
 import { SEARCH_PARAMS } from "../text/params.ts";
 import { TOOL_DESCRIPTIONS } from "../text/tools.ts";
 import { describeFailure, snippet } from "../lib/failures.ts";
@@ -95,8 +96,7 @@ export function normalizeQuery(query: unknown): string {
   const value = typeof query === "string" ? query.trim() : "";
   if (!value) {
     throw inputError(
-      "notion_search requires a non-empty query: pass a keyword. Notion search matches titles " +
-        "(page/database names), not page body text."
+      SEARCH_ERRORS.emptyQuery
     );
   }
   return value;

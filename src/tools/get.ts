@@ -28,6 +28,7 @@ import {
   TOOL_TIMEOUTS,
 } from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
+import { GET_ERRORS } from "../text/errors.ts";
 import { GET_PARAMS } from "../text/params.ts";
 import { TOOL_DESCRIPTIONS } from "../text/tools.ts";
 import { describeFailure, failureHint } from "../lib/failures.ts";
@@ -228,8 +229,7 @@ export async function executeNotionGet(
   const id = extractNotionId(raw);
   if (!id) {
     throw inputError(
-      `Could not find a Notion ID in "${raw}". Pass a 32-character id ` +
-        `(with or without dashes) or a notion.so / app.notion.com URL.`,
+      GET_ERRORS.noIdInInput({ raw }),
       { id_or_url: raw }
     );
   }
