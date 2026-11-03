@@ -89,6 +89,7 @@ import {
   TOOL_TIMEOUTS,
 } from "../dsh/tool.ts";
 import type { JsonObject, NotionTool } from "../dsh/tool.ts";
+import { PAGE_RESULT_TEXT } from "../text/results.ts";
 import { PAGE_ERRORS } from "../text/errors.ts";
 import {
   CREATE_PARAMS,
@@ -1287,8 +1288,20 @@ export function describePageValue(value: PageToolValue): string {
   if (value.already_linked) {
     lines.push(
       value.parent_item_property
-        ? `行 ${value.id} 已经在父行 ${value.parent_item_row_id} 下（Parent-item 列：${value.parent_item_property}），无需改动`
-        : `页面 ${value.id} 已经挂在 ${value.parent} 下，无需改动`
+        ? PAGE_RESULT_TEXT.alreadyLinked({
+            hasParentItem: true,
+            id: value.id as string,
+            parentItemRowId: value.parent_item_row_id as string,
+            parentItemProperty: value.parent_item_property as string,
+            parent: value.parent as string,
+          })
+        : PAGE_RESULT_TEXT.alreadyLinked({
+            hasParentItem: false,
+            id: value.id as string,
+            parentItemRowId: "",
+            parentItemProperty: "",
+            parent: value.parent as string,
+          })
     );
     if (value.url) lines.push(`URL: ${value.url}`);
     lines.push("changed: (none)");
@@ -1313,7 +1326,7 @@ export function describePageValue(value: PageToolValue): string {
     lines.push(`替换了原来的父级：${value.replaced_parent_ids.join(", ")}`);
   }
   if (value.cycle_check === "partial") {
-    lines.push("注意：页面祖先链未能完整读取，深层环检查为 best-effort（cycle_check: partial）");
+    lines.push(PAGE_RESULT_TEXT.cycleCheckPartial);
   }
   // Report each kind of write separately. A create used to print only "已写入列：title",
   // which left the caller unable to tell whether the Markdown body had landed too.
@@ -1321,8 +1334,8 @@ export function describePageValue(value: PageToolValue): string {
     if (value.title) lines.push(`标题：${value.title}`);
     lines.push(
       value.body_chars
-        ? `正文：已写入 ${value.body_chars} 字`
-        : "正文：未提交正文内容（本次只有标题/属性）"
+        ? PAGE_RESULT_TEXT.bodyWritten({ chars: value.body_chars })
+        : PAGE_RESULT_TEXT.bodyNotProvided
     );
   }
   if (value.properties.length) lines.push(`已写入列：${value.properties.join(", ")}`);
@@ -1330,13 +1343,14 @@ export function describePageValue(value: PageToolValue): string {
 
   if (value.edits_sent !== undefined) {
     lines.push(
-      `edits: ${value.edits_applied ?? 0}/${value.edits_sent} 条已应用` +
-        ((value.edits_missed ?? 0) > 0
-          ? `，${value.edits_missed} 条 old_str 没有匹配（页面其余部分未改动，见 warnings）`
-          : "，全部匹配")
+      PAGE_RESULT_TEXT.editTally({
+        applied: value.edits_applied ?? 0,
+        sent: value.edits_sent,
+        missed: value.edits_missed ?? 0,
+      })
     );
   } else if (value.appended) {
-    lines.push("正文已追加到页面末尾（edits 为空 + body_content）");
+    lines.push(PAGE_RESULT_TEXT.appended);
   }
 
   if (value.warnings) {
@@ -1344,7 +1358,7 @@ export function describePageValue(value: PageToolValue): string {
   }
   if (value.truncated) {
     lines.push(
-      "注意：Notion 返回的 markdown 被截断（truncated: true），它不是完整页面；下一次 old_str 不要以它为准。"
+      PAGE_RESULT_TEXT.truncated
     );
   }
   return lines.join("\n");

@@ -8,6 +8,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { assertOutput, mount } from "./fixtures/dsh.ts";
 import {
@@ -356,6 +357,57 @@ describe("argument guards: no internal TypeError may reach the model", () => {
         yes,
       });
       assert.equal(result.isError, false, `yes=${JSON.stringify(yes)}: ${result.content[0].text}`);
+    }
+  });
+});
+
+describe("all model-facing text lives in src/text/", () => {
+  /**
+   * The point of src/text/ is that someone can read every word the model sees in one
+   * place. That only holds if the text is actually there — the moment a sentence goes
+   * back into the implementation, the folder stops being a reliable review surface.
+   *
+   * This is a guard, not a style rule: short field labels (`URL: …`, `ID: …`) stay in
+   * the render code on purpose — wrapping them in functions adds indirection with no
+   * review value — so they are deliberately out of scope here.
+   */
+  const TOOL_FILES = ["page.ts", "search.ts", "get.ts", "query.ts"];
+
+  /** True when a string looks like prose aimed at the model rather than a field label. */
+  const looksLikeProse = (text: string): boolean =>
+    text.length > 40 || /[\u4e00-\u9fff]/.test(text);
+
+  it("no throw site builds its own long or non-English message", () => {
+    const offenders: string[] = [];
+    for (const file of TOOL_FILES) {
+      const source = readFileSync(new URL(`../src/tools/${file}`, import.meta.url), "utf8");
+      // Every error message must come from text/errors.ts, so a throw here may only
+      // reference a PAGE_ERRORS / SEARCH_ERRORS / GET_ERRORS / QUERY_ERRORS constant.
+      const throwRe = /(?:new InputError\(|new NotionToolError\(|throw inputError\()([\s\S]{0,80})/g;
+      for (const match of source.matchAll(throwRe)) {
+        const head = match[1]!.trim();
+        // Allowed: a text-module constant, or re-wrapping an error that already exists
+        // (`error.message`) — that carries no new wording of its own.
+        const fromTextModule =
+          /^(PAGE|SEARCH|GET|QUERY)_ERRORS\./.test(head) || /^(error|cause)\.message\b/.test(head);
+        if (!fromTextModule && looksLikeProse(head)) {
+          offenders.push(`${file}: ${head.slice(0, 60)}`);
+        }
+      }
+    }
+    assert.deepEqual(offenders, [], "these messages should come from src/text/errors.ts");
+  });
+
+  it("the text modules are the single home for tool and parameter descriptions", () => {
+    for (const file of TOOL_FILES) {
+      const source = readFileSync(new URL(`../src/tools/${file}`, import.meta.url), "utf8");
+      // A `description:` that is a literal string (not a reference) is a leak.
+      const inline = [...source.matchAll(/description:\s*\n?\s*([`'"])/g)];
+      assert.deepEqual(
+        inline.map((m) => m[0].trim()),
+        [],
+        `${file} must reference src/text/params.ts instead of inlining descriptions`
+      );
     }
   });
 });

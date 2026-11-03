@@ -28,6 +28,7 @@ import {
   TOOL_TIMEOUTS,
 } from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
+import { GET_RESULT_TEXT } from "../text/results.ts";
 import { GET_ERRORS } from "../text/errors.ts";
 import { GET_PARAMS } from "../text/params.ts";
 import { TOOL_DESCRIPTIONS } from "../text/tools.ts";
@@ -631,10 +632,11 @@ function renderDatabaseText(result: NotionDatabaseResult): string {
 
   if (result.parent_item_candidates && result.parent_item_candidates.length > 0) {
     lines.push(
-      "Parent-item candidates (use one with notion_page_edit parent / a child-row create): " +
-        result.parent_item_candidates
+      GET_RESULT_TEXT.parentItemCandidates({
+        list: result.parent_item_candidates
           .map((candidate) => `${candidate.property} (data source ${candidate.data_source_id})`)
-          .join(", ")
+          .join(", "),
+      })
     );
   }
 
@@ -654,7 +656,7 @@ function renderDatabaseText(result: NotionDatabaseResult): string {
   }
 
   lines.push("");
-  lines.push("Schema only — no rows. Use notion_query with a data_source_id to read pages.");
+  lines.push(GET_RESULT_TEXT.schemaOnly);
   return lines.join("\n");
 }
 

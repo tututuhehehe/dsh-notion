@@ -133,6 +133,476 @@ function describe(value) {
   }
 }
 
+// src/text/results.ts
+var PAGE_RESULT_TEXT = {
+  /** 移动时目标父级与当前一致 —— 报告「无需改动」而不是「已移动」 */
+  alreadyLinked: (p) => p.hasParentItem ? `\u884C ${p.id} \u5DF2\u7ECF\u5728\u7236\u884C ${p.parentItemRowId} \u4E0B\uFF08Parent-item \u5217\uFF1A${p.parentItemProperty}\uFF09\uFF0C\u65E0\u9700\u6539\u52A8` : `\u9875\u9762 ${p.id} \u5DF2\u7ECF\u6302\u5728 ${p.parent} \u4E0B\uFF0C\u65E0\u9700\u6539\u52A8`,
+  /** trash 的目标本来就在回收站里 —— 说明这次没有执行删除 */
+  alreadyArchived: (p) => `\u9875\u9762 ${p.id} \u672C\u6765\u5C31\u5728\u56DE\u6536\u7AD9\u91CC\uFF0C\u672C\u6B21\u6CA1\u6709\u6267\u884C\u5220\u9664`,
+  /** 环检测只跑了 best-effort（祖先链读不全） */
+  cycleCheckPartial: "\u6CE8\u610F\uFF1A\u9875\u9762\u7956\u5148\u94FE\u672A\u80FD\u5B8C\u6574\u8BFB\u53D6\uFF0C\u6DF1\u5C42\u73AF\u68C0\u67E5\u4E3A best-effort\uFF08cycle_check: partial\uFF09",
+  /** create 的结果：正文写了多少字。和「已写入列」分开两行，因为二者是两件事。 */
+  bodyWritten: (p) => `\u6B63\u6587\uFF1A\u5DF2\u5199\u5165 ${p.chars} \u5B57`,
+  /** create 的结果：本次没有正文（只有标题/属性） */
+  bodyNotProvided: "\u6B63\u6587\uFF1A\u672A\u63D0\u4EA4\u6B63\u6587\u5185\u5BB9\uFF08\u672C\u6B21\u53EA\u6709\u6807\u9898/\u5C5E\u6027\uFF09",
+  /** edit 的查找替换统计：N/M 条已应用，并说明没匹配的那些 */
+  editTally: (p) => `edits: ${p.applied}/${p.sent} \u6761\u5DF2\u5E94\u7528` + (p.missed > 0 ? `\uFF0C${p.missed} \u6761 old_str \u6CA1\u6709\u5339\u914D\uFF08\u9875\u9762\u5176\u4F59\u90E8\u5206\u672A\u6539\u52A8\uFF0C\u89C1 warnings\uFF09` : "\uFF0C\u5168\u90E8\u5339\u914D"),
+  /** edit 走的是追加路径（edits 为空 + body_content） */
+  appended: "\u6B63\u6587\u5DF2\u8FFD\u52A0\u5230\u9875\u9762\u672B\u5C3E\uFF08edits \u4E3A\u7A7A + body_content\uFF09",
+  /** Notion 截断了返回的 markdown —— 提醒别拿它当完整页面用 */
+  truncated: "\u6CE8\u610F\uFF1ANotion \u8FD4\u56DE\u7684 markdown \u88AB\u622A\u65AD\uFF08truncated: true\uFF09\uFF0C\u5B83\u4E0D\u662F\u5B8C\u6574\u9875\u9762\uFF1B\u4E0B\u4E00\u6B21 old_str \u4E0D\u8981\u4EE5\u5B83\u4E3A\u51C6\u3002"
+};
+var GET_RESULT_TEXT = {
+  /** 数据库 schema 里列出可作为 Parent-item 的列 */
+  parentItemCandidates: (p) => "Parent-item candidates (use one with notion_page_edit parent / a child-row create): " + p.list,
+  /** 数据库结果说明：只给了 schema，没有倒出行 */
+  schemaOnly: "Schema only \u2014 no rows. Use notion_query with a data_source_id to read pages."
+};
+
+// src/text/errors.ts
+var SEARCH_ERRORS = {
+  /** query 缺失或全是空白 */
+  emptyQuery: "notion_search requires a non-empty query: pass a keyword. Notion search matches titles (page/database names), not page body text."
+};
+var GET_ERRORS = {
+  /** id_or_url 里提取不出 Notion id */
+  noIdInInput: (p) => `Could not find a Notion ID in "${p.raw}". Pass a 32-character id (with or without dashes) or a notion.so / app.notion.com URL.`
+};
+var QUERY_ERRORS = {
+  /** sort 数组里的一项不是 "Property asc|desc" 字符串 */
+  sortEntryNotString: (p) => `sort entries must be "Property asc|desc" strings, got ${p.got}.`,
+  /** sort 数组里出现空字符串 */
+  sortEntryEmpty: 'sort entries must be non-empty "Property asc|desc" strings.'
+};
+var PAGE_ERRORS = {
+  /* ---------- rejectUnexpectedParams ---------- */
+  /** … 多余的参数：…。 */
+  rejectUnexpectedParams_1: (p) => `${p.usage} \u591A\u4F59\u7684\u53C2\u6570\uFF1A${p.join}\u3002`,
+  // usage ← usage
+  // join ← unexpected.join(", ")
+  /* ---------- normalizeIcon ---------- */
+  /** icon 不能是空字符串：不设置 icon 就省略这个参数，清除已有 icon 请传 null。" */
+  normalizeIcon_1: "icon \u4E0D\u80FD\u662F\u7A7A\u5B57\u7B26\u4E32\uFF1A\u4E0D\u8BBE\u7F6E icon \u5C31\u7701\u7565\u8FD9\u4E2A\u53C2\u6570\uFF0C\u6E05\u9664\u5DF2\u6709 icon \u8BF7\u4F20 null\u3002",
+  /** icon 看起来既不是 emoji 也不是图片 URL（长度 …）：…。 + '请传单个 emoji（如 "🎯"）、http(s… */
+  normalizeIcon_2: (p) => `icon \u770B\u8D77\u6765\u65E2\u4E0D\u662F emoji \u4E5F\u4E0D\u662F\u56FE\u7247 URL\uFF08\u957F\u5EA6 ${p.length}\uFF09\uFF1A${p.value}\u3002\u8BF7\u4F20\u5355\u4E2A emoji\uFF08\u5982 "\u{1F3AF}"\uFF09\u3001http(s) \u56FE\u7247 URL\uFF0C\u6216 null \u6E05\u9664\u3002`,
+  // length ← [...value].length
+  // value ← describeValue(value)
+  /** icon 的 emoji 对象缺少 emoji 文本：需要 { "type": "emoji", "emoji": "🎯" }。… */
+  normalizeIcon_3: 'icon \u7684 emoji \u5BF9\u8C61\u7F3A\u5C11 emoji \u6587\u672C\uFF1A\u9700\u8981 { "type": "emoji", "emoji": "\u{1F3AF}" }\u3002',
+  /** icon 的 external 对象需要一个 http(s) url：' + '{ "type": "external", "e… */
+  normalizeIcon_4: 'icon \u7684 external \u5BF9\u8C61\u9700\u8981\u4E00\u4E2A http(s) url\uFF1A{ "type": "external", "external": { "url": "https://\u2026/a.png" } }\u3002',
+  /** icon 的对象形式必须带 type：接受 "emoji" / "external" / "custom_emoji" / "f… */
+  normalizeIcon_5: (p) => `icon \u7684\u5BF9\u8C61\u5F62\u5F0F\u5FC5\u987B\u5E26 type\uFF1A\u63A5\u53D7 "emoji" / "external" / "custom_emoji" / "file"\uFF0C\u6216\u76F4\u63A5\u4F20 emoji \u5B57\u7B26\u4E32\u3001\u56FE\u7247 URL\u3001null\u3002\u6536\u5230 ${p.raw}\u3002`,
+  // raw ← describeValue(raw)
+  /** icon 必须是 emoji 字符串、http(s) 图片 URL、已构好的 Notion icon 对象，或 null（清除）… */
+  normalizeIcon_6: (p) => `icon \u5FC5\u987B\u662F emoji \u5B57\u7B26\u4E32\u3001http(s) \u56FE\u7247 URL\u3001\u5DF2\u6784\u597D\u7684 Notion icon \u5BF9\u8C61\uFF0C\u6216 null\uFF08\u6E05\u9664\uFF09\uFF1B\u6536\u5230 ${p.raw}\u3002`,
+  // raw ← describeValue(raw)
+  /* ---------- normalizeBody ---------- */
+  /** body_content 必须是 Markdown 字符串，不能是 null。" */
+  normalizeBody_1: "body_content \u5FC5\u987B\u662F Markdown \u5B57\u7B26\u4E32\uFF0C\u4E0D\u80FD\u662F null\u3002",
+  /** body_content 必须是 Markdown 字符串（页面正文），收到 …。 */
+  normalizeBody_2: (p) => `body_content \u5FC5\u987B\u662F Markdown \u5B57\u7B26\u4E32\uFF08\u9875\u9762\u6B63\u6587\uFF09\uFF0C\u6536\u5230 ${p.raw}\u3002`,
+  // raw ← describeValue(raw)
+  /* ---------- normalizeProps ---------- */
+  /** props 必须是对象 map（{属性名: 值}），不是数组。例如 {\"Status\":\"进行中\",\"标签\":[\"… */
+  normalizeProps_1: 'props \u5FC5\u987B\u662F\u5BF9\u8C61 map\uFF08{\u5C5E\u6027\u540D: \u503C}\uFF09\uFF0C\u4E0D\u662F\u6570\u7EC4\u3002\u4F8B\u5982 {"Status":"\u8FDB\u884C\u4E2D","\u6807\u7B7E":["a","b"]}\u3002',
+  /** props 必须是对象 map（{属性名: 值}），收到 …。 */
+  normalizeProps_2: (p) => `props \u5FC5\u987B\u662F\u5BF9\u8C61 map\uFF08{\u5C5E\u6027\u540D: \u503C}\uFF09\uFF0C\u6536\u5230 ${p.raw}\u3002`,
+  // raw ← describeValue(raw)
+  /* ---------- normalizeTitle ---------- */
+  /** title 必须是字符串。" */
+  normalizeTitle_1: "title \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\u3002",
+  /* ---------- parseParentSpec ---------- */
+  /** … 需要 parent：…。 */
+  parseParentSpec_1: (p) => `${p.create} \u9700\u8981 parent\uFF1A${p.usage}\u3002`,
+  // create ← op === "move" ? "移动页面（parent）" : "create"
+  // usage ← usage
+  /** parent 格式无效：…。用法：…。 + "接受 Notion id（32 位 hex / UUID）或该对象的 Notion… */
+  parseParentSpec_2: (p) => `parent \u683C\u5F0F\u65E0\u6548\uFF1A${p.raw}\u3002\u7528\u6CD5\uFF1A${p.usage}\u3002\u63A5\u53D7 Notion id\uFF0832 \u4F4D hex / UUID\uFF09\u6216\u8BE5\u5BF9\u8C61\u7684 Notion URL\u3002`,
+  // raw ← describeValue(raw)
+  // usage ← usage
+  /** parent 里的 id 无效：…。接受 Notion id（32 位 hex / UUID）或 URL， + "例如 data… */
+  parseParentSpec_3: (p) => `parent \u91CC\u7684 id \u65E0\u6548\uFF1A${p.match}\u3002\u63A5\u53D7 Notion id\uFF0832 \u4F4D hex / UUID\uFF09\u6216 URL\uFF0C\u4F8B\u5982 data-source:716f546f-1824-45f0-b73a-481bf8b5f5db\u3002`,
+  // match ← describeValue(match[2])
+  /* ---------- requireId ---------- */
+  /** … 需要 id：页面 id（32 位 hex 或带连字符的 UUID）或该页面的 Notion URL。 */
+  requireId_1: (p) => `${p.op} \u9700\u8981 id\uFF1A\u9875\u9762 id\uFF0832 \u4F4D hex \u6216\u5E26\u8FDE\u5B57\u7B26\u7684 UUID\uFF09\u6216\u8BE5\u9875\u9762\u7684 Notion URL\u3002`,
+  // op ← op
+  /** id 无效：…。只接受 Notion 页面 id（32 位 hex / UUID）或该页面的 Notion URL。 */
+  requireId_2: (p) => `id \u65E0\u6548\uFF1A${p.raw}\u3002\u53EA\u63A5\u53D7 Notion \u9875\u9762 id\uFF0832 \u4F4D hex / UUID\uFF09\u6216\u8BE5\u9875\u9762\u7684 Notion URL\u3002`,
+  // raw ← describeValue(raw)
+  /* ---------- ntnFailure ---------- */
+  /** …； : ""}… 失败…… : ""} + (hint ? \n… : "") */
+  ntnFailure_1: (p) => `${p.note}${p.label} \u5931\u8D25${p.status}${p.detail}` + (p.hint ? `
+${p.hint}` : ""),
+  // note ← note ? `${note}；` : ""
+  // label ← label
+  // status ← status
+  // detail ← detail ? `：${truncate(detail)}` : ""
+  // hint ← hint
+  /* ---------- fetchDataSourceSchema ---------- */
+  /** 无法从 … 读取属性列表：请确认 id 正确、Integration 已被邀请到该数据库，并且 parent 类型匹配（新版数据… */
+  fetchDataSourceSchema_1: (p) => `\u65E0\u6CD5\u4ECE ${p.path} \u8BFB\u53D6\u5C5E\u6027\u5217\u8868\uFF1A\u8BF7\u786E\u8BA4 id \u6B63\u786E\u3001Integration \u5DF2\u88AB\u9080\u8BF7\u5230\u8BE5\u6570\u636E\u5E93\uFF0C\u5E76\u4E14 parent \u7C7B\u578B\u5339\u914D\uFF08\u65B0\u7248\u6570\u636E\u5E93\u7528 data-source:<id>\uFF09\u3002`,
+  // path ← path
+  /* ---------- resolveDatabaseDataSource ---------- */
+  /** database … 没有返回任何 data source id。请确认 Integration 已被邀请，并改用 data-s… */
+  resolveDatabaseDataSource_1: (p) => `database ${p.databaseId} \u6CA1\u6709\u8FD4\u56DE\u4EFB\u4F55 data source id\u3002\u8BF7\u786E\u8BA4 Integration \u5DF2\u88AB\u9080\u8BF7\uFF0C\u5E76\u6539\u7528 data-source:<id> \u6307\u5B9A\u3002`,
+  // databaseId ← databaseId
+  /** database … 有 … 个 data source，需要唯一一个才能确定 schema。 + 请改用 parent: da… */
+  resolveDatabaseDataSource_2: (p) => `database ${p.databaseId} \u6709 ${p.length} \u4E2A data source\uFF0C\u9700\u8981\u552F\u4E00\u4E00\u4E2A\u624D\u80FD\u786E\u5B9A schema\u3002\u8BF7\u6539\u7528 parent: data-source:<id>\uFF0C\u53EF\u9009\uFF1A
+${p.n}`,
+  // databaseId ← databaseId
+  // length ← refs.length
+  // n ← lines.join("\n")
+  /* ---------- assertNoRowCycle ---------- */
+  /** Parent-item 祖先链超过 … 层，无法确认不会形成环；已停止，未写入。 */
+  assertNoRowCycle_1: (p) => `Parent-item \u7956\u5148\u94FE\u8D85\u8FC7 ${p.MAX_ANCESTOR_WALK} \u5C42\uFF0C\u65E0\u6CD5\u786E\u8BA4\u4E0D\u4F1A\u5F62\u6210\u73AF\uFF1B\u5DF2\u505C\u6B62\uFF0C\u672A\u5199\u5165\u3002`,
+  // MAX_ANCESTOR_WALK ← MAX_ANCESTOR_WALK
+  /** 行 … 不能挂到 … 下：那会形成 Parent-item 环（… 的祖先里有 …）。 */
+  assertNoRowCycle_2: (p) => `\u884C ${p.childId} \u4E0D\u80FD\u6302\u5230 ${p.parentId} \u4E0B\uFF1A\u90A3\u4F1A\u5F62\u6210 Parent-item \u73AF\uFF08${p.parentId2} \u7684\u7956\u5148\u91CC\u6709 ${p.childId2}\uFF09\u3002`,
+  // childId ← childId
+  // parentId ← parentId
+  // parentId2 ← parentId
+  // childId2 ← childId
+  /** 无法读取祖先行 …，因此无法确认把 … 挂到 … 下不会形成环；已在写入前停止。 */
+  assertNoRowCycle_3: (p) => `\u65E0\u6CD5\u8BFB\u53D6\u7956\u5148\u884C ${p.current}\uFF0C\u56E0\u6B64\u65E0\u6CD5\u786E\u8BA4\u628A ${p.childId} \u6302\u5230 ${p.parentId} \u4E0B\u4E0D\u4F1A\u5F62\u6210\u73AF\uFF1B\u5DF2\u5728\u5199\u5165\u524D\u505C\u6B62\u3002`,
+  // current ← current
+  // childId ← childId
+  // parentId ← parentId
+  /** 无法确认祖先行 … 所属的 data source，因此无法确认把 … 挂到 … 下不会形成环；已在写入前停止。 */
+  assertNoRowCycle_4: (p) => `\u65E0\u6CD5\u786E\u8BA4\u7956\u5148\u884C ${p.current} \u6240\u5C5E\u7684 data source\uFF0C\u56E0\u6B64\u65E0\u6CD5\u786E\u8BA4\u628A ${p.childId} \u6302\u5230 ${p.parentId} \u4E0B\u4E0D\u4F1A\u5F62\u6210\u73AF\uFF1B\u5DF2\u5728\u5199\u5165\u524D\u505C\u6B62\u3002`,
+  // current ← current
+  // childId ← childId
+  // parentId ← parentId
+  /* ---------- classifyBareParent ---------- */
+  /** 无法把 … 当作 parent：读取它作为页面失败…） : ""}。 + … 的裸 id 必须是页面或数据库行；如果它是 dat… */
+  classifyBareParent_1: (p) => `\u65E0\u6CD5\u628A ${p.id} \u5F53\u4F5C parent\uFF1A\u8BFB\u53D6\u5B83\u4F5C\u4E3A\u9875\u9762\u5931\u8D25${p.detail}\u3002${p.create} \u7684\u88F8 id \u5FC5\u987B\u662F\u9875\u9762\u6216\u6570\u636E\u5E93\u884C\uFF1B\u5982\u679C\u5B83\u662F database \u6216 data source\uFF0C\u8BF7\u5199\u6210 database:<id> / data-source:<id>\u3002`,
+  // id ← id
+  // detail ← detail ? `（${truncate(detail, 300)}）` : ""
+  // create ← op === "create" ? "create" : "移动页面"
+  /** 无法把 … 当作 parent：GET v1/pages 没有返回 parent。 + … 的裸 id 必须是页面或数据库行；如… */
+  classifyBareParent_2: (p) => `\u65E0\u6CD5\u628A ${p.id} \u5F53\u4F5C parent\uFF1AGET v1/pages \u6CA1\u6709\u8FD4\u56DE parent\u3002${p.create} \u7684\u88F8 id \u5FC5\u987B\u662F\u9875\u9762\u6216\u6570\u636E\u5E93\u884C\uFF1B\u5982\u679C\u5B83\u662F database \u6216 data source\uFF0C\u8BF7\u5199\u6210 database:<id> / data-source:<id>\u3002`,
+  // id ← id
+  // create ← op === "create" ? "create" : "移动页面"
+  /* ---------- requireString ---------- */
+  /** 属性 "…" (…) 需要字符串，收到 …。 */
+  requireString_1: (p) => `\u5C5E\u6027 "${p.name}" (${p.type}) \u9700\u8981\u5B57\u7B26\u4E32\uFF0C\u6536\u5230 ${p.value}\u3002`,
+  // name ← prop.name
+  // type ← prop.type
+  // value ← describeValue(value)
+  /* ---------- stringList ---------- */
+  /** 属性 "…" (…) 需要 string[]，收到 …。 */
+  stringList_1: (p) => `\u5C5E\u6027 "${p.name}" (${p.type}) \u9700\u8981 string[]\uFF0C\u6536\u5230 ${p.value}\u3002`,
+  // name ← prop.name
+  // type ← prop.type
+  // value ← describeValue(value)
+  /* ---------- buildPropertyValue ---------- */
+  /** 属性 "…" 是标题，不能设为 null。 */
+  buildPropertyValue_1: (p) => `\u5C5E\u6027 "${p.name}" \u662F\u6807\u9898\uFF0C\u4E0D\u80FD\u8BBE\u4E3A null\u3002`,
+  // name ← prop.name
+  /** 属性 "…" (…) 不支持用 null 清空。 */
+  buildPropertyValue_2: (p) => `\u5C5E\u6027 "${p.name}" (${p.type}) \u4E0D\u652F\u6301\u7528 null \u6E05\u7A7A\u3002`,
+  // name ← prop.name
+  // type ← prop.type
+  /** 标题属性 "…" 不能为空。 */
+  buildPropertyValue_3: (p) => `\u6807\u9898\u5C5E\u6027 "${p.name}" \u4E0D\u80FD\u4E3A\u7A7A\u3002`,
+  // name ← prop.name
+  /** 属性 "…" (rich_text) 需要字符串，收到 …。 */
+  buildPropertyValue_4: (p) => `\u5C5E\u6027 "${p.name}" (rich_text) \u9700\u8981\u5B57\u7B26\u4E32\uFF0C\u6536\u5230 ${p.value}\u3002`,
+  // name ← prop.name
+  // value ← describeValue(value)
+  /** 属性 "…" (number) 需要数字，收到 …。 */
+  buildPropertyValue_5: (p) => `\u5C5E\u6027 "${p.name}" (number) \u9700\u8981\u6570\u5B57\uFF0C\u6536\u5230 ${p.value}\u3002`,
+  // name ← prop.name
+  // value ← describeValue(value)
+  /** 属性 "…" (…) 需要选项名字符串，收到 …。 */
+  buildPropertyValue_6: (p) => `\u5C5E\u6027 "${p.name}" (${p.type}) \u9700\u8981\u9009\u9879\u540D\u5B57\u7B26\u4E32\uFF0C\u6536\u5230 ${p.value}\u3002`,
+  // name ← prop.name
+  // type ← prop.type
+  // value ← describeValue(value)
+  /** 属性 "…" (date) 需要日期字符串或 {start,end}，收到 …。 */
+  buildPropertyValue_7: (p) => `\u5C5E\u6027 "${p.name}" (date) \u9700\u8981\u65E5\u671F\u5B57\u7B26\u4E32\u6216 {start,end}\uFF0C\u6536\u5230 ${p.value}\u3002`,
+  // name ← prop.name
+  // value ← describeValue(value)
+  /** 属性 "…" (checkbox) 需要 true/false，收到 …。 */
+  buildPropertyValue_8: (p) => `\u5C5E\u6027 "${p.name}" (checkbox) \u9700\u8981 true/false\uFF0C\u6536\u5230 ${p.value}\u3002`,
+  // name ← prop.name
+  // value ← describeValue(value)
+  /** 属性 "…" 的类型 … 暂不支持通过简化值写入；可改用 props 里直接给 Notion 原生 payload，例如 {"…… */
+  buildPropertyValue_9: (p) => `\u5C5E\u6027 "${p.name}" \u7684\u7C7B\u578B ${p.type} \u6682\u4E0D\u652F\u6301\u901A\u8FC7\u7B80\u5316\u503C\u5199\u5165\uFF1B\u53EF\u6539\u7528 props \u91CC\u76F4\u63A5\u7ED9 Notion \u539F\u751F payload\uFF0C\u4F8B\u5982 {"${p.name2}": {"${p.type2}": ...}}\u3002`,
+  // name ← prop.name
+  // type ← prop.type
+  // name2 ← prop.name
+  // type2 ← prop.type
+  /* ---------- resolveProperty ---------- */
+  /** 未知属性 "…"。可用可写属性：…。 */
+  resolveProperty_1: (p) => `\u672A\u77E5\u5C5E\u6027 "${p.name}"\u3002\u53EF\u7528\u53EF\u5199\u5C5E\u6027\uFF1A${p.hints}\u3002`,
+  // name ← name
+  // hints ← formatHints(hints)
+  /** 属性 "…" 的类型是 …（只读），不能写入。可写属性：…。 */
+  resolveProperty_2: (p) => `\u5C5E\u6027 "${p.name}" \u7684\u7C7B\u578B\u662F ${p.type}\uFF08\u53EA\u8BFB\uFF09\uFF0C\u4E0D\u80FD\u5199\u5165\u3002\u53EF\u5199\u5C5E\u6027\uFF1A${p.hints}\u3002`,
+  // name ← name
+  // type ← prop.type
+  // hints ← formatHints(hints)
+  /* ---------- readContentEdit ---------- */
+  /** … 必须是 { old_str, new_str, replace_all_matches? }，收到 …。 */
+  readContentEdit_1: (p) => `${p.path} \u5FC5\u987B\u662F { old_str, new_str, replace_all_matches? }\uFF0C\u6536\u5230 ${p.raw}\u3002`,
+  // path ← path
+  // raw ← describeValue(raw)
+  /** … 只接受 old_str / new_str / replace_all_matches，多余字段：…。 */
+  readContentEdit_2: (p) => `${p.path} \u53EA\u63A5\u53D7 old_str / new_str / replace_all_matches\uFF0C\u591A\u4F59\u5B57\u6BB5\uFF1A${p.join}\u3002`,
+  // path ← path
+  // join ← unexpected.join(", ")
+  /** ….old_str 必须是字符串（要查找的原文），收到 …。 */
+  readContentEdit_3: (p) => `${p.path}.old_str \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\uFF08\u8981\u67E5\u627E\u7684\u539F\u6587\uFF09\uFF0C\u6536\u5230 ${p.old_str}\u3002`,
+  // path ← path
+  // old_str ← describeValue(raw.old_str)
+  /** ….old_str 不能是空字符串：Notion 会拒绝空 old_str。要追加内容请用 body_content 且不传 e… */
+  readContentEdit_4: (p) => `${p.path}.old_str \u4E0D\u80FD\u662F\u7A7A\u5B57\u7B26\u4E32\uFF1ANotion \u4F1A\u62D2\u7EDD\u7A7A old_str\u3002\u8981\u8FFD\u52A0\u5185\u5BB9\u8BF7\u7528 body_content \u4E14\u4E0D\u4F20 edits\u3002`,
+  // path ← path
+  /** ….new_str 是必填的：替换成什么就写什么，想删除这段文字请传 ""（空字符串）。 */
+  readContentEdit_5: (p) => `${p.path}.new_str \u662F\u5FC5\u586B\u7684\uFF1A\u66FF\u6362\u6210\u4EC0\u4E48\u5C31\u5199\u4EC0\u4E48\uFF0C\u60F3\u5220\u9664\u8FD9\u6BB5\u6587\u5B57\u8BF7\u4F20 ""\uFF08\u7A7A\u5B57\u7B26\u4E32\uFF09\u3002`,
+  // path ← path
+  /** ….new_str 必须是字符串，收到 …。 */
+  readContentEdit_6: (p) => `${p.path}.new_str \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\uFF0C\u6536\u5230 ${p.new_str}\u3002`,
+  // path ← path
+  // new_str ← describeValue(raw.new_str)
+  /* ---------- readContentEdits ---------- */
+  /** edits 必须是数组：[{ old_str, new_str, replace_all_matches? }, ...]，收到… */
+  readContentEdits_1: (p) => `edits \u5FC5\u987B\u662F\u6570\u7EC4\uFF1A[{ old_str, new_str, replace_all_matches? }, ...]\uFF0C\u6536\u5230 ${p.raw}\u3002\u8981\u8FFD\u52A0\u5185\u5BB9\u8BF7\u6539\u7528 body_content\uFF08\u4E0D\u4F20 edits\uFF09\u3002`,
+  // raw ← describeValue(raw)
+  /** edits 最多 … 条（Notion 限制），收到 … 条。请拆成多次 notion_page_edit 调用。 */
+  readContentEdits_2: (p) => `edits \u6700\u591A ${p.MAX_CONTENT_UPDATES} \u6761\uFF08Notion \u9650\u5236\uFF09\uFF0C\u6536\u5230 ${p.length} \u6761\u3002\u8BF7\u62C6\u6210\u591A\u6B21 notion_page_edit \u8C03\u7528\u3002`,
+  // MAX_CONTENT_UPDATES ← MAX_CONTENT_UPDATES
+  // length ← raw.length
+  /* ---------- withEditAlias ---------- */
+  /** edits 和 props.block_update 是同一个东西（查找替换列表），不要同时传；请统一用 edits。本次没有写… */
+  withEditAlias_1: "edits \u548C props.block_update \u662F\u540C\u4E00\u4E2A\u4E1C\u897F\uFF08\u67E5\u627E\u66FF\u6362\u5217\u8868\uFF09\uFF0C\u4E0D\u8981\u540C\u65F6\u4F20\uFF1B\u8BF7\u7EDF\u4E00\u7528 edits\u3002\u672C\u6B21\u6CA1\u6709\u5199\u5165\u4EFB\u4F55\u5185\u5BB9\u3002",
+  /* ---------- markdownFailure ---------- */
+  /** 这次编辑会删除页面 … 里的子页面或子数据库，Notion 因此拒绝执行（本次没有写入任何内容）。 + "old_str 匹配的… */
+  markdownFailure_1: (p) => `\u8FD9\u6B21\u7F16\u8F91\u4F1A\u5220\u9664\u9875\u9762 ${p.pageId} \u91CC\u7684\u5B50\u9875\u9762\u6216\u5B50\u6570\u636E\u5E93\uFF0CNotion \u56E0\u6B64\u62D2\u7EDD\u6267\u884C\uFF08\u672C\u6B21\u6CA1\u6709\u5199\u5165\u4EFB\u4F55\u5185\u5BB9\uFF09\u3002old_str \u5339\u914D\u7684\u662F\u6574\u6BB5\u6587\u672C\uFF0C\u5F88\u5BB9\u6613\u8FDE\u5E26\u8986\u76D6 \`<page url="...">\u2026</page>\` \u6216 \`<database ...>\` \u8FD9\u7C7B\u5757\u3002\u8BF7\u628A old_str \u7F29\u5C0F\u5230\u90A3\u6BB5\u6587\u5B57\u672C\u8EAB\uFF08\u4E0D\u8981\u5305\u542B\u5B50\u9875\u9762/\u5B50\u6570\u636E\u5E93\u5757\uFF09\uFF0C\u6216\u5148\u5728 Notion \u91CC\u628A\u5B50\u9875\u9762\u79FB\u8D70\u518D\u6539\u3002ntn \u8F93\u51FA\uFF1A${p.detail}`,
+  // pageId ← pageId
+  // detail ← truncate(detail, 600)
+  /* ---------- buildPropertyWrite ---------- */
+  /** context.pageId ? 无法确定页面 … 的标题属性，不能用 title 改标题；请改用 props 并指定标题属性名… */
+  buildPropertyWrite_1: (p) => p.pageId ? `\u65E0\u6CD5\u786E\u5B9A\u9875\u9762 ${p.pageId} \u7684\u6807\u9898\u5C5E\u6027\uFF0C\u4E0D\u80FD\u7528 title \u6539\u6807\u9898\uFF1B\u8BF7\u6539\u7528 props \u5E76\u6307\u5B9A\u6807\u9898\u5C5E\u6027\u540D\u3002` : `\u65E0\u6CD5\u786E\u5B9A ${p.source} \u7684\u6807\u9898\u5C5E\u6027\uFF0C\u4E0D\u80FD\u7528 title \u6307\u5B9A\u6807\u9898\uFF1B\u8BF7\u6539\u7528 props \u5E76\u6307\u5B9A\u6807\u9898\u5C5E\u6027\u540D\u3002`,
+  // pageId ← context.pageId            （有页面 id 时说的是「页面 …」，否则说容器类型）
+  // source ← context.source
+  /* ---------- parentItemError ---------- */
+  /** data source … 没有可用的 Parent-item / 自关联 relation 列，无法把行挂到父行下（…）。 +… */
+  parentItemError_1: (p) => `data source ${p.dataSourceId} \u6CA1\u6709\u53EF\u7528\u7684 Parent-item / \u81EA\u5173\u8054 relation \u5217\uFF0C\u65E0\u6CD5\u628A\u884C\u6302\u5230\u7236\u884C\u4E0B\uFF08${p.detail}\uFF09\u3002\u8BF7\u5728 Notion \u91CC\u4E3A\u8FD9\u4E2A\u5E93\u52A0\u4E00\u4E2A\u6307\u5411\u81EA\u8EAB\u7684 relation \u5C5E\u6027\uFF08\u9ED8\u8BA4\u540D Parent-item\uFF09\uFF0C\u6216\u7528 notion_get \u67E5\u770B\u73B0\u6709\u5217\u540E\u91CD\u8BD5\u3002`,
+  // dataSourceId ← dataSourceId
+  // detail ← detail
+  /* ---------- rollbackCreatedPage ---------- */
+  /** …… */
+  rollbackCreatedPage_1: (p) => `${p.detail}${p.rollbackLine}`,
+  // detail ← cause.detail
+  // rollbackLine ← rollbackLine
+  /* ---------- createPage ---------- */
+  /** 在 … 所在 data source : container.kind} 中创建页面需要标题： + 请传 title、在 pro… */
+  createPage_1: (p) => `\u5728 ${p.kind} \u4E2D\u521B\u5EFA\u9875\u9762\u9700\u8981\u6807\u9898\uFF1A\u8BF7\u4F20 title\u3001\u5728 props \u91CC\u5199\u6807\u9898\u5C5E\u6027\uFF08${p.title}\uFF09\uFF0C\u6216\u8BA9 body_content \u4EE5 "# \u6807\u9898" \u5F00\u5934\u3002\u53EF\u5199\u5C5E\u6027\uFF1A${p.hints}\u3002`,
+  // kind ← container.kind === "row" ? `行 ${container.rowParentId} 所在 data source` : contain
+  // title ← titlePropertyName(container.schema) ?? "title"
+  // hints ← formatHints(hints)
+  /** create 需要 body_content 或 title：ntn pages create 不接受空 Markdown，只有… */
+  createPage_2: "create \u9700\u8981 body_content \u6216 title\uFF1Antn pages create \u4E0D\u63A5\u53D7\u7A7A Markdown\uFF0C\u53EA\u6709 parent \u65E0\u6CD5\u521B\u5EFA\u7A7A\u767D\u9875\u9762\u3002",
+  /** 页面已创建（parent …），但没有从 ntn 的结构化输出里取到页面 id， + …未写入。 + 没有可信 id 就不自动 … */
+  createPage_3: (p) => `\u9875\u9762\u5DF2\u521B\u5EFA\uFF08parent ${p.workspace}\uFF09\uFF0C\u4F46\u6CA1\u6709\u4ECE ntn \u7684\u7ED3\u6784\u5316\u8F93\u51FA\u91CC\u53D6\u5230\u9875\u9762 id\uFF0C${p.what}\u672A\u5199\u5165\u3002\u6CA1\u6709\u53EF\u4FE1 id \u5C31\u4E0D\u81EA\u52A8 trash\uFF08\u907F\u514D\u8BEF\u5220\uFF09\uFF0C\u8BF7\u7528 notion_search/notion_get \u627E\u5230\u8BE5\u9875\u9762\u540E\uFF0C\u7528 notion_page_edit \u5199\u5165\uFF0C\u6216 notion_page_trash \u5220\u9664\uFF08partial: true\uFF0Crollback: unknown_id\uFF09\u3002`,
+  // workspace ← parentLabel ?? "workspace"
+  // what ← what
+  /* ---------- editWithFailures ---------- */
+  /** 部分成功。已经生效的部分：…（已写入，不会回滚）。\n + 失败的部分：\n…\n + 这些步骤互不依赖，所以其余步骤照常执行了… */
+  editWithFailures_1: (p) => `\u90E8\u5206\u6210\u529F\u3002\u5DF2\u7ECF\u751F\u6548\u7684\u90E8\u5206\uFF1A${p.join}\uFF08\u5DF2\u5199\u5165\uFF0C\u4E0D\u4F1A\u56DE\u6EDA\uFF09\u3002
+\u5931\u8D25\u7684\u90E8\u5206\uFF1A
+${p.reported}
+\u8FD9\u4E9B\u6B65\u9AA4\u4E92\u4E0D\u4F9D\u8D56\uFF0C\u6240\u4EE5\u5176\u4F59\u6B65\u9AA4\u7167\u5E38\u6267\u884C\u4E86\u3002\u91CD\u8BD5\u65F6\u8BF7\u53EA\u91CD\u53D1\u5931\u8D25\u7684\u90E8\u5206\uFF1B\u91CD\u53D1\u5168\u90E8\u4F1A\u628A\u5DF2\u751F\u6548\u7684\u90E8\u5206\u91CD\u590D\u5E94\u7528\u4E00\u904D\u3002`,
+  // join ← applied.join("、")
+  // reported ← reported
+  /* ---------- movePage ---------- */
+  /** edit 的 parent（移动页面）只支持 page:<id> 或（裸）行 id：页面挂到页面下用 POST /v1/page… */
+  movePage_1: "edit \u7684 parent\uFF08\u79FB\u52A8\u9875\u9762\uFF09\u53EA\u652F\u6301 page:<id> \u6216\uFF08\u88F8\uFF09\u884C id\uFF1A\u9875\u9762\u6302\u5230\u9875\u9762\u4E0B\u7528 POST /v1/pages/{id}/move\uFF0C\u884C\u6302\u5230\u884C\u4E0B\u7528 Parent-item relation\u3002\u8981\u628A\u9875\u9762\u653E\u8FDB\u67D0\u4E2A data source\uFF0C\u8BF7\u7528 notion_page_create\u3002",
+  /** 无法确定页面 … 的当前父级（GET v1/pages 未返回 parent）。移动页面不会在没有确认的情况下执行。 */
+  movePage_2: (p) => `\u65E0\u6CD5\u786E\u5B9A\u9875\u9762 ${p.id} \u7684\u5F53\u524D\u7236\u7EA7\uFF08GET v1/pages \u672A\u8FD4\u56DE parent\uFF09\u3002\u79FB\u52A8\u9875\u9762\u4E0D\u4F1A\u5728\u6CA1\u6709\u786E\u8BA4\u7684\u60C5\u51B5\u4E0B\u6267\u884C\u3002`,
+  // id ← id
+  /** 页面 … 不能挂到自己下面。 */
+  movePage_3: (p) => `\u9875\u9762 ${p.id} \u4E0D\u80FD\u6302\u5230\u81EA\u5DF1\u4E0B\u9762\u3002`,
+  // id ← id
+  /** 页面 … 已经是 … 的子页面，无需移动。 */
+  movePage_4: (p) => `\u9875\u9762 ${p.id} \u5DF2\u7ECF\u662F ${p.targetParentId} \u7684\u5B50\u9875\u9762\uFF0C\u65E0\u9700\u79FB\u52A8\u3002`,
+  // id ← id
+  // targetParentId ← targetParentId
+  /** 页面 … 不能挂到页面 … 下：会形成环（…）。 */
+  movePage_5: (p) => `\u9875\u9762 ${p.id} \u4E0D\u80FD\u6302\u5230\u9875\u9762 ${p.targetParentId} \u4E0B\uFF1A\u4F1A\u5F62\u6210\u73AF\uFF08${p.join}\uFF09\u3002`,
+  // id ← id
+  // targetParentId ← targetParentId
+  // join ← cycle.cycle.join(" → ")
+  /** 无法把页面挂到 data source 容器下；请改用 notion_page_create。" */
+  movePage_6: "\u65E0\u6CD5\u628A\u9875\u9762\u6302\u5230 data source \u5BB9\u5668\u4E0B\uFF1B\u8BF7\u6539\u7528 notion_page_create\u3002",
+  /** 页面 … 不在数据库里（父级是页面… : ""}）， + 不能用 Parent-item relation 挂到行 … 下；行→… */
+  movePage_7: (p) => `\u9875\u9762 ${p.id} \u4E0D\u5728\u6570\u636E\u5E93\u91CC\uFF08\u7236\u7EA7\u662F\u9875\u9762${p.id2}\uFF09\uFF0C\u4E0D\u80FD\u7528 Parent-item relation \u6302\u5230\u884C ${p.rowParentId} \u4E0B\uFF1B\u884C\u2192\u884C\u7684\u79FB\u52A8\u53EA\u9002\u7528\u4E8E\u540C\u4E00\u5E93\u5185\u7684\u884C\u3002`,
+  // id ← id
+  // id2 ← childParent.id ? ` ${childParent.id}` : ""
+  // rowParentId ← container.rowParentId
+  /** 行 … 不能挂到自己下面。 */
+  movePage_8: (p) => `\u884C ${p.id} \u4E0D\u80FD\u6302\u5230\u81EA\u5DF1\u4E0B\u9762\u3002`,
+  // id ← id
+  /** 行 … 属于 data source …，父行 … 属于 …； + "自关联 Parent-item 只能在同一 data so… */
+  movePage_9: (p) => `\u884C ${p.id} \u5C5E\u4E8E data source ${p.childDataSourceId}\uFF0C\u7236\u884C ${p.rowParentId} \u5C5E\u4E8E ${p.dataSourceId}\uFF1B\u81EA\u5173\u8054 Parent-item \u53EA\u80FD\u5728\u540C\u4E00 data source \u5185\u4F7F\u7528\uFF0C\u8DE8\u5E93\u8BF7\u6539\u7528 page \u7236\u7EA7\u6216 notion_page_create\u3002`,
+  // id ← id
+  // childDataSourceId ← childDataSourceId
+  // rowParentId ← container.rowParentId
+  // dataSourceId ← container.dataSourceId
+  /** 行 … 的 …（Parent-item）已经指向 …， + 移到 … 下会覆盖这个链接。确认要改父级请传 yes: true；本… */
+  movePage_10: (p) => `\u884C ${p.id} \u7684 ${p.name}\uFF08Parent-item\uFF09\u5DF2\u7ECF\u6307\u5411 ${p.join}\uFF0C\u79FB\u5230 ${p.rowParentId} \u4E0B\u4F1A\u8986\u76D6\u8FD9\u4E2A\u94FE\u63A5\u3002\u786E\u8BA4\u8981\u6539\u7236\u7EA7\u8BF7\u4F20 yes: true\uFF1B\u672C\u6B21\u6CA1\u6709\u5199\u5165\u3002`,
+  // id ← id
+  // name ← relation.name
+  // join ← currentParents.join(", ")
+  // rowParentId ← container.rowParentId
+  /* ---------- listChildPages ---------- */
+  /** 页面 … 的子块列表无法解析，不能确认它有多少子页面，因此拒绝删除。 + ntn 输出：… */
+  listChildPages_1: (p) => `\u9875\u9762 ${p.pageId} \u7684\u5B50\u5757\u5217\u8868\u65E0\u6CD5\u89E3\u6790\uFF0C\u4E0D\u80FD\u786E\u8BA4\u5B83\u6709\u591A\u5C11\u5B50\u9875\u9762\uFF0C\u56E0\u6B64\u62D2\u7EDD\u5220\u9664\u3002ntn \u8F93\u51FA\uFF1A${p.trim}`,
+  // pageId ← pageId
+  // trim ← truncate((result.stdout || "").trim(), 200)
+  /** 页面 … 的子块报告 has_more=true 却没有 next_cursor，无法读完子页面列表，因此拒绝删除。 */
+  listChildPages_2: (p) => `\u9875\u9762 ${p.pageId} \u7684\u5B50\u5757\u62A5\u544A has_more=true \u5374\u6CA1\u6709 next_cursor\uFF0C\u65E0\u6CD5\u8BFB\u5B8C\u5B50\u9875\u9762\u5217\u8868\uFF0C\u56E0\u6B64\u62D2\u7EDD\u5220\u9664\u3002`,
+  // pageId ← pageId
+  /** 页面 … 的子块超过 … 页仍未列完，无法确认它有多少子页面，因此拒绝删除。 + "请在 Notion 里手动确认并删除。" */
+  listChildPages_3: (p) => `\u9875\u9762 ${p.pageId} \u7684\u5B50\u5757\u8D85\u8FC7 ${p.MAX_BLOCK_PAGES} \u9875\u4ECD\u672A\u5217\u5B8C\uFF0C\u65E0\u6CD5\u786E\u8BA4\u5B83\u6709\u591A\u5C11\u5B50\u9875\u9762\uFF0C\u56E0\u6B64\u62D2\u7EDD\u5220\u9664\u3002\u8BF7\u5728 Notion \u91CC\u624B\u52A8\u786E\u8BA4\u5E76\u5220\u9664\u3002`,
+  // pageId ← pageId
+  // MAX_BLOCK_PAGES ← MAX_BLOCK_PAGES
+  /* ---------- trashPage ---------- */
+  /** 页面 … 不存在，或没有被当前的 Notion integration 共享（••• → Connections），因此无法删除… */
+  trashPage_1: (p) => `\u9875\u9762 ${p.id} \u4E0D\u5B58\u5728\uFF0C\u6216\u6CA1\u6709\u88AB\u5F53\u524D\u7684 Notion integration \u5171\u4EAB\uFF08\u2022\u2022\u2022 \u2192 Connections\uFF09\uFF0C\u56E0\u6B64\u65E0\u6CD5\u5220\u9664\u3002\u8BF7\u5148\u7528 notion_search \u786E\u8BA4 id \u6B63\u786E\u3002`,
+  // id ← id
+  /** notion_page_trash cannot delete a database (id …). Removing a da… */
+  trashPage_2: (p) => `notion_page_trash cannot delete a database (id ${p.id}). Removing a database, its data sources and every row in them is far more destructive than deleting a page, so this tool refuses even with yes: true. Ask the user to delete it in Notion (\u2022\u2022\u2022 \u2192 Delete) if that is really intended.`,
+  // id ← id
+  /** 页面 … 有 … 个子页面/嵌套容器：\n……\n + "Notion 会连带归档整棵子树，所以默认拒绝。确认要一起删除请加 r… */
+  trashPage_3: (p) => `\u9875\u9762 ${p.id} \u6709 ${p.length} \u4E2A\u5B50\u9875\u9762/\u5D4C\u5957\u5BB9\u5668\uFF1A
+${p.listed}${p.overflow}
+Notion \u4F1A\u8FDE\u5E26\u5F52\u6863\u6574\u68F5\u5B50\u6811\uFF0C\u6240\u4EE5\u9ED8\u8BA4\u62D2\u7EDD\u3002\u786E\u8BA4\u8981\u4E00\u8D77\u5220\u9664\u8BF7\u52A0 recursive: true\uFF1B\u53EA\u60F3\u5220\u7236\u9875\u9762\u8BF7\u5148\u5728 Notion \u91CC\u79FB\u8D70\u8FD9\u4E9B\u5B50\u9875\u9762\u3002`,
+  // id ← id
+  // length ← children.length
+  // listed ← listed
+  // overflow ← overflow
+  /* ---------- createNotionPageEditTool ---------- */
+  /** yes 只用于「行→行移动时覆盖已有 Parent-item 链接」，没有 parent 时传 yes 没有意义；请去掉 yes… */
+  createNotionPageEditTool_1: "yes \u53EA\u7528\u4E8E\u300C\u884C\u2192\u884C\u79FB\u52A8\u65F6\u8986\u76D6\u5DF2\u6709 Parent-item \u94FE\u63A5\u300D\uFF0C\u6CA1\u6709 parent \u65F6\u4F20 yes \u6CA1\u6709\u610F\u4E49\uFF1B\u8BF7\u53BB\u6389 yes\u3002\u672C\u6B21\u6CA1\u6709\u5199\u5165\u3002",
+  /** edits（查找替换）和 body_content（追加到末尾）不能同时传：二选一。" + "需要既改又追加时请分两次调用 no… */
+  createNotionPageEditTool_2: "edits\uFF08\u67E5\u627E\u66FF\u6362\uFF09\u548C body_content\uFF08\u8FFD\u52A0\u5230\u672B\u5C3E\uFF09\u4E0D\u80FD\u540C\u65F6\u4F20\uFF1A\u4E8C\u9009\u4E00\u3002\u9700\u8981\u65E2\u6539\u53C8\u8FFD\u52A0\u65F6\u8BF7\u5206\u4E24\u6B21\u8C03\u7528 notion_page_edit\u3002\u672C\u6B21\u6CA1\u6709\u5199\u5165\u3002",
+  /** notion_page_edit 需要 edits、body_content、props、title、icon、parent 至… */
+  createNotionPageEditTool_3: (p) => "notion_page_edit \u9700\u8981 edits\u3001body_content\u3001props\u3001title\u3001icon\u3001parent \u81F3\u5C11\u4E00\u9879\uFF1B\u7A7A\u8C03\u7528\u4E0D\u4F1A\u4FEE\u6539\u9875\u9762\u3002" + (p.bodyProvided ? "body_content \u662F\u7A7A\u767D\uFF1A\u8FFD\u52A0\u7A7A\u767D\u5185\u5BB9\u4E0D\u4F1A\u4FEE\u6539\u9875\u9762\u3002" : "\u8981\u8FFD\u52A0\u5185\u5BB9\u8BF7\u4F20 body_content\uFF08\u4E0D\u4F20 edits\uFF09\u3002"),
+  // bodyProvided ← body !== undefined
+  /* ---------- createNotionPageTrashTool ---------- */
+  /** notion_page_trash 会删除（移入回收站）页面，必须显式传 yes: true（或 "true" / "yes" … */
+  createNotionPageTrashTool_1: 'notion_page_trash \u4F1A\u5220\u9664\uFF08\u79FB\u5165\u56DE\u6536\u7AD9\uFF09\u9875\u9762\uFF0C\u5FC5\u987B\u663E\u5F0F\u4F20 yes: true\uFF08\u6216 "true" / "yes" / 1\uFF09\u624D\u4F1A\u8C03\u7528 ntn\uFF1B\u672C\u6B21\u6CA1\u6709\u8C03\u7528 ntn\u3002'
+};
+
+// src/text/params.ts
+var SEARCH_PARAMS = {
+  /** `query` */
+  query: "Keyword matched against object TITLES only (never body text). See the tool description for how matching works: it is token-OR, and an exact title in double quotes is the precise lookup.",
+  /**
+   * `limit` — a function because the numbers are behaviour constants that live with the
+   * tool (they are also what the code clamps against), and a text module must not import
+   * from the tool that imports it.
+   */
+  limit: (p) => `Max results (default ${p.fallback}). Values above ${p.max} are clamped to ${p.max}.`,
+  /** `filter_object` */
+  filter_object: "Restrict hits to pages or databases (data sources). Omit to search both."
+};
+var GET_PARAMS = {
+  /** `id_or_url` */
+  id_or_url: "Notion page or database ID (dashed UUID or 32-character id) or a notion.so / app.notion.com URL.",
+  /** `format` */
+  format: "Page output. 'md' (default) returns the Markdown body with properties as frontmatter; 'json' returns the structured page payload (markdown plus url/title/truncation metadata). Databases are always returned as schema, regardless of format."
+};
+var QUERY_PARAMS = {
+  /** `database_or_data_source` */
+  database_or_data_source: "Notion data source id, database id, or Notion URL. If the database has multiple data sources, pass one data source id explicitly.",
+  /** `limit` — see the note on SEARCH_PARAMS.limit. */
+  limit: (p) => `Max rows per page (default ${p.fallback}, clamped to ${p.max}).`,
+  /** `start_cursor` */
+  start_cursor: "Pagination cursor from a previous response's next_cursor. Omit for the first page.",
+  /** `filter` */
+  filter: "Raw Notion filter JSON object, passed through verbatim.",
+  /** `sort` */
+  sort: "Only rows linked to this parent row (id or Notion URL), filtered through the data source's Parent-item / self-relation column. Combined with filter via AND; refuses when filter already targets that same relation column.",
+  /** `under` */
+  under: 'Sort spec "Property asc|desc", or an ordered array of specs for multiple sorts.',
+  /** `include_content` */
+  include_content: "Also fetch each row's Markdown with ntn pages get (default false; one extra call per row)."
+};
+var PROPS_DESCRIPTION = `Object map of database column NAME \u2192 simplified value (e.g. {"Status":"\u8FDB\u884C\u4E2D","\u6807\u7B7E":["a","b"],"\u622A\u6B62\u65E5\u671F":"2025-01-31","Done":true}); {} = no property write. The value is converted by the column TYPE from the parent data source's schema: title/rich_text string; number number|numeric string; select/status string or {name} (""/null clears); multi_select string[]; date "YYYY-MM-DD" | ISO string | {start,end?,time_zone?}; checkbox boolean; url/email/phone string (""/null clears); people/relation string[] of ids. null clears a property where Notion allows it, and an object carrying its own type key (e.g. {"select":{"name":"Done"}}) is sent as-is. Unknown names and read-only columns (formula/rollup/created_time/\u2026) are rejected with hint_properties. COLUMNS ONLY: the page icon is the top-level icon parameter and the page body is the top-level body_content parameter, not props keys. No default property values are invented.`;
+var ICON_TEXT = {
+  /** 分支 `string` */
+  string: 'An emoji ("\u{1F3AF}") or an http(s) image URL.',
+  /** 分支 `object` */
+  object: 'An already-typed Notion icon object, e.g. {"type":"emoji","emoji":"\u{1F3AF}"} or {"type":"external","external":{"url":"https://\u2026/a.png"}}.',
+  /** 分支 `null` */
+  null: "null clears the icon."
+};
+var EDIT_ITEM_TEXT = {
+  /** `old_str` */
+  old_str: "Required, non-empty. The existing text to find. Substring matching: one word, one sentence or several blocks all work \u2014 you do not have to resend the whole paragraph. COPY WHAT notion_get SHOWED YOU, MARKERS AND ALL \u2014 that always matches, at any length. A marker-free plain fragment also works, but only if it sits inside ONE formatting run: on `Alpha **bold** omega`, `bold` and `Alpha ` match, `Alpha bold` does not (it crosses the bold boundary). So the one way to fail is a plain fragment spanning a formatting change \u2014 when unsure, copy the markers. Adjacent blocks join with \\n, which merges them on replace. A `$` may be bare or escaped.",
+  /** `new_str` */
+  new_str: 'Required. The replacement text. "" DELETES old_str. It is markdown, so **bold**, `code`, [link](url), ## headings and - list items all render as that formatting; a new_str containing \\n\\n creates separate blocks and a single \\n is a line break inside one block. A `$` may be written bare or escaped \u2014 this tool removes the escape before sending, so pasting the \\\\$ that notion_get renders is safe.',
+  /** `replace_all_matches` */
+  replace_all_matches: "Default false: if old_str matches more than one place the whole call fails and NOTHING is written. Set true to replace every occurrence. This is detected by Notion, not locally, so the tool cannot say which of your edits was ambiguous in advance \u2014 narrow the old_str or set this flag."
+};
+var CREATE_PARAMS = {
+  /** `parent` */
+  parent: "Where the page goes. OMIT it to create the page at the WORKSPACE ROOT (Notion's default when no parent is given; such a page only has a title, so props cannot carry columns). Otherwise: page:<id> (child page), database:<id> | data-source:<id> (a row in that database), or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / self-relation column). A Notion URL is accepted anywhere an id is: the id is extracted from it.",
+  /** `title` */
+  title: 'Page title. A row in a database needs one (here, or as the title property in props, or as a leading "# Heading" in body_content).',
+  /** `icon` */
+  icon: "The page icon.",
+  /** `body_content` */
+  body_content: 'The page body as Markdown. A leading "# Heading" becomes the title when title is absent.'
+};
+var EDIT_PARAMS = {
+  /** `id` */
+  id: "Required. The page id (32 hex or dashed UUID) or its Notion URL.",
+  /** `edits` */
+  edits: "Find-and-replace operations, applied in order (edit[i+1] sees edit[i]'s result). Max 100. replace_all_matches belongs on the INDIVIDUAL edit object, not on the call. Notion does the matching, so a call can end three ways: all match -> success; SOME match -> success, with the misses in `warnings` (nothing is rolled back, so do not assume the page now equals what you sent); NONE match -> the call fails and nothing is written, which means the old_str were stale: re-read with notion_get instead of retrying the same string. An old_str matching MORE THAN ONE place is a separate hard error: nothing is written unless that edit sets replace_all_matches:true. Omit `edits` and pass body_content to APPEND instead.",
+  /** `body_content` */
+  body_content: "Markdown to APPEND at the end of the page. Only used when `edits` is empty or absent \u2014 this is the ONLY way to add new content, and edit never replaces the whole page. Passing body_content TOGETHER with a non-empty edits is an INVALID_INPUT error (nothing is written): append and find-replace cannot be combined in one call.",
+  /** `title` */
+  title: "New page title (writes the title property).",
+  /** `icon` */
+  icon: "New page icon; null clears it.",
+  /** `parent` */
+  parent: "Move the page: page:<id> (under that page), or a bare PAGE id, or a bare ROW id (re-link the Parent-item relation of that row). A Notion URL is accepted anywhere an id is. Database/data source parents are not accepted \u2014 use notion_page_create to add a row.",
+  /** `yes` */
+  yes: "Only for a row\u2192row move: consent to REPLACE the row's existing Parent-item link, which otherwise refuses with the current parent ids. Ignored nowhere else \u2014 passing it without parent is an error."
+};
+var TRASH_PARAMS = {
+  /** `id` */
+  id: "Required. The page id (32 hex or dashed UUID) or its Notion URL.",
+  /** `yes` */
+  yes: "Required true. Without it the tool refuses without calling ntn, so a trash is never a guess.",
+  /** `recursive` */
+  recursive: "Consent to delete the page together with its child pages (Notion archives the whole subtree). Without it a page that has child pages is refused with the child ids."
+};
+var ICON_PARAMETER_TEXT_CREATE = "The page icon.";
+var ICON_PARAMETER_TEXT_EDIT = "New page icon; null clears it.";
+
+// src/text/tools.ts
+var TOOL_DESCRIPTIONS = {
+  /** `notion_search` */
+  search: 'Search Notion by TITLE; returns id, title, URL and object type (page|database). MATCHING IS TOKEN-OR, NOT SUBSTRING: the query is split into words and any title containing ANY ONE of them comes back, ranked \u2014 so a long query yields loosely-related hits, not just the one you meant. Wrap a known EXACT title in double quotes ("PRD \xB7 notion_page") to get exactly that hit. TITLES only: body text is never searched, and a 0-hit result does NOT prove absence (a fresh page may not be indexed for a second or two; retry once). A hit is not proof it is the right object: verify with notion_get. Use filter_object or limit to narrow; prefer refining the query over raising limit.',
+  /** `notion_get` */
+  get: "Read one Notion page or inspect one database. A page returns Markdown (format='md', default) with its properties as frontmatter, or a structured payload (format='json') that also carries url, title, truncated and unknown_block_ids. A database returns every data source id plus each property's name, type, writable flag and Parent-item / self-relation candidates; rows are never fetched here, so read them with notion_query. If a page comes back truncated (rare), format='json' shows unknown_block_ids; the truncated Markdown lists the next steps.",
+  /** `notion_query` */
+  query: `Query the rows of a known Notion data source (or database) with a Notion filter, sort specs and cursor pagination; returns rows, next_cursor and has_more. This is not keyword search: find the data source with notion_search first when you only know a title, and read its schema with notion_get. Pass filter as a raw Notion filter JSON object and sort as "Property asc|desc" or an array of those. Use under to list only the child rows of one parent row; it filters the data source's Parent-item column and is ANDed with filter, so do not also filter that column in filter. When has_more is true, call again with next_cursor as start_cursor instead of raising limit, which is capped at 100. include_content defaults to false and costs one extra ntn pages get call per row.`,
+  /** `notion_page_create` */
+  pageCreate: 'Create one Notion page or database row. This tool never modifies an existing page \u2014 use notion_page_edit for that. `parent` is OPTIONAL: omit it to create the page at the WORKSPACE ROOT (Notion\'s own default; such a page has only a title, so props cannot carry columns). A page created inside a database needs a title: the `title` parameter, the title property in props, or a leading "# Heading" in body_content. Creating takes a SECOND request for the columns and icon. If that request fails the new page is trashed so no half-made page is left behind, and the error reports whether the cleanup worked (`rollback`) \u2014 partial:true means something was left behind. A successful result reports the title, the body it wrote, the columns and the icon separately.',
+  /** `notion_page_edit` */
+  pageEdit: 'Change an existing Notion page: find-and-replace its text, append Markdown, update title/columns/icon, and/or move it. A single call may combine all of these. THE STEPS ARE INDEPENDENT: they run in this order \u2014 (1) body content, (2) title/props/icon, (3) parent move \u2014 and a failure in one does NOT cancel the others. A failed old_str is a bad argument, not a broken page, so a valid title change or move still happens. The result then reports \u90E8\u5206\u6210\u529F with exactly what landed and what did not: retry ONLY the failed part, because resending the whole call re-applies the parts that already succeeded. `changed` lists what actually happened. There is NO whole-page replace in this tool: to rewrite everything, delete the old text with edits (new_str "") and append the new text in a second call. When the returned body was truncated the result says so \u2014 truncated markdown is not the full page, so do not derive the next old_str from it.',
+  /** `notion_page_trash` */
+  pageTrash: "Move one Notion page or database row to the trash. yes:true is required, otherwise nothing is called. Three guards a bare delete does not give you: a database or data source is refused even with yes:true (deleting one destroys its rows too \u2014 ask the user to do it in Notion); a page that is already in the trash returns success with already_archived:true instead of an error; and a page with child pages is refused unless recursive:true, because Notion archives the whole subtree \u2014 the error lists the child ids so you can show the user exactly what else would go. Trash is idempotent: calling it twice is safe."
+};
+
 // src/lib/failures.ts
 var SNIPPET_LIMIT = 300;
 var FAILURE_HINTS = [
@@ -344,12 +814,12 @@ var GET_PARAMETERS = {
   properties: {
     id_or_url: {
       type: "string",
-      description: "Notion page or database ID (dashed UUID or 32-character id) or a notion.so / app.notion.com URL."
+      description: GET_PARAMS.id_or_url
     },
     format: {
       type: "string",
       enum: ["md", "json"],
-      description: "Page output. 'md' (default) returns the Markdown body with properties as frontmatter; 'json' returns the structured page payload (markdown plus url/title/truncation metadata). Databases are always returned as schema, regardless of format."
+      description: GET_PARAMS.format
     }
   },
   required: ["id_or_url"],
@@ -397,7 +867,7 @@ function renderGetResult(value) {
 function createNotionGetTool(run = runNtn) {
   return defineNotionTool({
     name: "notion_get",
-    description: "Read one Notion page or inspect one database. A page returns Markdown (format='md', default) with its properties as frontmatter, or a structured payload (format='json') that also carries url, title, truncated and unknown_block_ids. A database returns every data source id plus each property's name, type, writable flag and Parent-item / self-relation candidates; rows are never fetched here, so read them with notion_query. If a page comes back truncated (rare), format='json' shows unknown_block_ids; the truncated Markdown lists the next steps.",
+    description: TOOL_DESCRIPTIONS.get,
     timeoutMs: TOOL_TIMEOUTS.get,
     // Read-only: safe to run alongside sibling calls.
     isConcurrencySafe: () => true,
@@ -428,7 +898,7 @@ async function executeNotionGet(params, run = runNtn) {
   const id = extractNotionId(raw);
   if (!id) {
     throw inputError(
-      `Could not find a Notion ID in "${raw}". Pass a 32-character id (with or without dashes) or a notion.so / app.notion.com URL.`,
+      GET_ERRORS.noIdInInput({ raw }),
       { id_or_url: raw }
     );
   }
@@ -719,7 +1189,9 @@ function renderDatabaseText(result) {
   }
   if (result.parent_item_candidates && result.parent_item_candidates.length > 0) {
     lines.push(
-      "Parent-item candidates (use one with notion_page_edit parent / a child-row create): " + result.parent_item_candidates.map((candidate) => `${candidate.property} (data source ${candidate.data_source_id})`).join(", ")
+      GET_RESULT_TEXT.parentItemCandidates({
+        list: result.parent_item_candidates.map((candidate) => `${candidate.property} (data source ${candidate.data_source_id})`).join(", ")
+      })
     );
   }
   if (result.data_sources.length > 1) {
@@ -734,7 +1206,7 @@ function renderDatabaseText(result) {
     for (const warning of result.warnings) lines.push(`- ${warning}`);
   }
   lines.push("");
-  lines.push("Schema only \u2014 no rows. Use notion_query with a data_source_id to read pages.");
+  lines.push(GET_RESULT_TEXT.schemaOnly);
   return lines.join("\n");
 }
 function formatProperty(property) {
@@ -886,7 +1358,7 @@ function rejectUnexpectedParams(params, allowed, usage) {
     (key) => params[key] !== void 0 && !allowed.includes(key)
   );
   if (unexpected.length > 0) {
-    throw new InputError(`${usage} \u591A\u4F59\u7684\u53C2\u6570\uFF1A${unexpected.join(", ")}\u3002`, {
+    throw new InputError(PAGE_ERRORS.rejectUnexpectedParams_1({ usage, join: unexpected.join(", ") }), {
       unexpected_params: unexpected
     });
   }
@@ -925,7 +1397,7 @@ function normalizeIcon(raw) {
     const value = raw.trim();
     if (!value) {
       throw new InputError(
-        "icon \u4E0D\u80FD\u662F\u7A7A\u5B57\u7B26\u4E32\uFF1A\u4E0D\u8BBE\u7F6E icon \u5C31\u7701\u7565\u8FD9\u4E2A\u53C2\u6570\uFF0C\u6E05\u9664\u5DF2\u6709 icon \u8BF7\u4F20 null\u3002",
+        PAGE_ERRORS.normalizeIcon_1,
         { field: "icon" }
       );
     }
@@ -934,7 +1406,7 @@ function normalizeIcon(raw) {
     }
     if ([...value].length > MAX_EMOJI_LENGTH) {
       throw new InputError(
-        `icon \u770B\u8D77\u6765\u65E2\u4E0D\u662F emoji \u4E5F\u4E0D\u662F\u56FE\u7247 URL\uFF08\u957F\u5EA6 ${[...value].length}\uFF09\uFF1A${describeValue(value)}\u3002\u8BF7\u4F20\u5355\u4E2A emoji\uFF08\u5982 "\u{1F3AF}"\uFF09\u3001http(s) \u56FE\u7247 URL\uFF0C\u6216 null \u6E05\u9664\u3002`,
+        PAGE_ERRORS.normalizeIcon_2({ length: [...value].length, value: describeValue(value) }),
         { field: "icon", value }
       );
     }
@@ -946,7 +1418,7 @@ function normalizeIcon(raw) {
       const emoji = typeof raw.emoji === "string" ? raw.emoji.trim() : "";
       if (!emoji) {
         throw new InputError(
-          'icon \u7684 emoji \u5BF9\u8C61\u7F3A\u5C11 emoji \u6587\u672C\uFF1A\u9700\u8981 { "type": "emoji", "emoji": "\u{1F3AF}" }\u3002',
+          PAGE_ERRORS.normalizeIcon_3,
           { field: "icon" }
         );
       }
@@ -956,7 +1428,7 @@ function normalizeIcon(raw) {
       const url = isPlainObject(raw.external) ? raw.external.url : void 0;
       if (typeof url !== "string" || !HTTP_URL_RE.test(url.trim())) {
         throw new InputError(
-          'icon \u7684 external \u5BF9\u8C61\u9700\u8981\u4E00\u4E2A http(s) url\uFF1A{ "type": "external", "external": { "url": "https://\u2026/a.png" } }\u3002',
+          PAGE_ERRORS.normalizeIcon_4,
           { field: "icon" }
         );
       }
@@ -966,26 +1438,26 @@ function normalizeIcon(raw) {
       return { payload: raw, display: `${String(type)} icon` };
     }
     throw new InputError(
-      `icon \u7684\u5BF9\u8C61\u5F62\u5F0F\u5FC5\u987B\u5E26 type\uFF1A\u63A5\u53D7 "emoji" / "external" / "custom_emoji" / "file"\uFF0C\u6216\u76F4\u63A5\u4F20 emoji \u5B57\u7B26\u4E32\u3001\u56FE\u7247 URL\u3001null\u3002\u6536\u5230 ${describeValue(raw)}\u3002`,
+      PAGE_ERRORS.normalizeIcon_5({ raw: describeValue(raw) }),
       { field: "icon", value: raw }
     );
   }
   throw new InputError(
-    `icon \u5FC5\u987B\u662F emoji \u5B57\u7B26\u4E32\u3001http(s) \u56FE\u7247 URL\u3001\u5DF2\u6784\u597D\u7684 Notion icon \u5BF9\u8C61\uFF0C\u6216 null\uFF08\u6E05\u9664\uFF09\uFF1B\u6536\u5230 ${describeValue(raw)}\u3002`,
+    PAGE_ERRORS.normalizeIcon_6({ raw: describeValue(raw) }),
     { field: "icon", value: raw }
   );
 }
 function normalizeBody(raw, required) {
   if (raw === void 0 || raw === null) {
     if (required) {
-      throw new InputError("body_content \u5FC5\u987B\u662F Markdown \u5B57\u7B26\u4E32\uFF0C\u4E0D\u80FD\u662F null\u3002", {
+      throw new InputError(PAGE_ERRORS.normalizeBody_1, {
         field: "body_content"
       });
     }
     return void 0;
   }
   if (typeof raw !== "string") {
-    throw new InputError(`body_content \u5FC5\u987B\u662F Markdown \u5B57\u7B26\u4E32\uFF08\u9875\u9762\u6B63\u6587\uFF09\uFF0C\u6536\u5230 ${describeValue(raw)}\u3002`, {
+    throw new InputError(PAGE_ERRORS.normalizeBody_2({ raw: describeValue(raw) }), {
       field: "body_content"
     });
   }
@@ -994,35 +1466,31 @@ function normalizeBody(raw, required) {
 function normalizeProps(raw) {
   if (raw === void 0 || raw === null) return void 0;
   if (Array.isArray(raw)) {
-    throw new InputError(
-      'props \u5FC5\u987B\u662F\u5BF9\u8C61 map\uFF08{\u5C5E\u6027\u540D: \u503C}\uFF09\uFF0C\u4E0D\u662F\u6570\u7EC4\u3002\u4F8B\u5982 {"Status":"\u8FDB\u884C\u4E2D","\u6807\u7B7E":["a","b"]}\u3002'
-    );
+    throw new InputError(PAGE_ERRORS.normalizeProps_1);
   }
   if (!isPlainObject(raw)) {
-    throw new InputError(`props \u5FC5\u987B\u662F\u5BF9\u8C61 map\uFF08{\u5C5E\u6027\u540D: \u503C}\uFF09\uFF0C\u6536\u5230 ${describeValue(raw)}\u3002`);
+    throw new InputError(PAGE_ERRORS.normalizeProps_2({ raw: describeValue(raw) }));
   }
   const entries = Object.entries(raw).filter(([, value]) => value !== void 0);
   return entries.length ? Object.fromEntries(entries) : void 0;
 }
 function normalizeTitle(raw) {
   if (raw === void 0 || raw === null) return void 0;
-  if (typeof raw !== "string") throw new InputError("title \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\u3002");
+  if (typeof raw !== "string") throw new InputError(PAGE_ERRORS.normalizeTitle_1);
   const title = raw.trim();
   return title || void 0;
 }
 function parseParentSpec(raw, op) {
   const usage = op === "move" ? "page:<id>\uFF08\u628A\u9875\u9762\u6302\u5230\u8BE5\u9875\u9762\u4E0B\uFF09\u6216\u7236\u884C id\uFF08\u628A\u884C\u6302\u5230\u7236\u884C\u4E0B\uFF09" : "page:<id>\u3001database:<id>\u3001data-source:<id>\uFF0C\u6216\u6570\u636E\u5E93\u884C id\uFF08\u4F5C\u4E3A\u5B50\u884C\u7236\u7EA7\uFF09";
   if (typeof raw !== "string" || !raw.trim()) {
-    throw new InputError(`${op === "move" ? "\u79FB\u52A8\u9875\u9762\uFF08parent\uFF09" : "create"} \u9700\u8981 parent\uFF1A${usage}\u3002`);
+    throw new InputError(PAGE_ERRORS.parseParentSpec_1({ create: op === "move" ? "\u79FB\u52A8\u9875\u9762\uFF08parent\uFF09" : "create", usage }));
   }
   const value = raw.trim();
   const match = /^(page|database|data[_-]?source)\s*:\s*(.+)$/i.exec(value);
   if (!match) {
     const bare = isNotionId(value) ? value : extractNotionId(value);
     if (!bare) {
-      throw new InputError(
-        `parent \u683C\u5F0F\u65E0\u6548\uFF1A${describeValue(raw)}\u3002\u7528\u6CD5\uFF1A${usage}\u3002\u63A5\u53D7 Notion id\uFF0832 \u4F4D hex / UUID\uFF09\u6216\u8BE5\u5BF9\u8C61\u7684 Notion URL\u3002`
-      );
+      throw new InputError(PAGE_ERRORS.parseParentSpec_2({ raw: describeValue(raw), usage }));
     }
     return { bare: true, id: bare };
   }
@@ -1031,25 +1499,19 @@ function parseParentSpec(raw, op) {
   const rawId = match[2].trim();
   const id = isNotionId(rawId) ? rawId : extractNotionId(rawId);
   if (!id) {
-    throw new InputError(
-      `parent \u91CC\u7684 id \u65E0\u6548\uFF1A${describeValue(match[2])}\u3002\u63A5\u53D7 Notion id\uFF0832 \u4F4D hex / UUID\uFF09\u6216 URL\uFF0C\u4F8B\u5982 data-source:716f546f-1824-45f0-b73a-481bf8b5f5db\u3002`
-    );
+    throw new InputError(PAGE_ERRORS.parseParentSpec_3({ match: describeValue(match[2]) }));
   }
   return { bare: false, kind, id };
 }
 function requireId(raw, op) {
   if (typeof raw !== "string" || !raw.trim()) {
-    throw new InputError(
-      `${op} \u9700\u8981 id\uFF1A\u9875\u9762 id\uFF0832 \u4F4D hex \u6216\u5E26\u8FDE\u5B57\u7B26\u7684 UUID\uFF09\u6216\u8BE5\u9875\u9762\u7684 Notion URL\u3002`
-    );
+    throw new InputError(PAGE_ERRORS.requireId_1({ op }));
   }
   const text2 = raw.trim();
   if (isNotionId(text2)) return text2;
   const extracted = extractNotionId(text2);
   if (extracted) return extracted;
-  throw new InputError(
-    `id \u65E0\u6548\uFF1A${describeValue(raw)}\u3002\u53EA\u63A5\u53D7 Notion \u9875\u9762 id\uFF0832 \u4F4D hex / UUID\uFF09\u6216\u8BE5\u9875\u9762\u7684 Notion URL\u3002`
-  );
+  throw new InputError(PAGE_ERRORS.requireId_2({ raw: describeValue(raw) }));
 }
 function parseJsonMaybe(stdout) {
   try {
@@ -1064,8 +1526,7 @@ function ntnFailure(label, result, note) {
   const hint = failureHint(result);
   const status = result.code === null && !detail ? `\uFF08${failureStatus(result)}\uFF09` : exit;
   return new NotionToolError(
-    `${note ? `${note}\uFF1B` : ""}${label} \u5931\u8D25${status}${detail ? `\uFF1A${truncate(detail)}` : ""}` + (hint ? `
-${hint}` : ""),
+    PAGE_ERRORS.ntnFailure_1({ note: note ? `${note}\uFF1B` : "", label, status, detail: detail ? `\uFF1A${truncate(detail)}` : "", hint }),
     {
       code: NOTION_ERROR_CODES.ntnFailed,
       details: {
@@ -1085,7 +1546,7 @@ async function fetchDataSourceSchema(runner, dataSourceId) {
   const properties = extractSchemaProperties(parsed);
   if (!properties) {
     throw new InputError(
-      `\u65E0\u6CD5\u4ECE ${path} \u8BFB\u53D6\u5C5E\u6027\u5217\u8868\uFF1A\u8BF7\u786E\u8BA4 id \u6B63\u786E\u3001Integration \u5DF2\u88AB\u9080\u8BF7\u5230\u8BE5\u6570\u636E\u5E93\uFF0C\u5E76\u4E14 parent \u7C7B\u578B\u5339\u914D\uFF08\u65B0\u7248\u6570\u636E\u5E93\u7528 data-source:<id>\uFF09\u3002`,
+      PAGE_ERRORS.fetchDataSourceSchema_1({ path }),
       { endpoint: path }
     );
   }
@@ -1103,15 +1564,14 @@ async function resolveDatabaseDataSource(runner, databaseId) {
   const refs = parseResolveDataSources(parseJsonMaybe(result.stdout));
   if (refs.length === 0) {
     throw new InputError(
-      `database ${databaseId} \u6CA1\u6709\u8FD4\u56DE\u4EFB\u4F55 data source id\u3002\u8BF7\u786E\u8BA4 Integration \u5DF2\u88AB\u9080\u8BF7\uFF0C\u5E76\u6539\u7528 data-source:<id> \u6307\u5B9A\u3002`,
+      PAGE_ERRORS.resolveDatabaseDataSource_1({ databaseId }),
       { databaseId }
     );
   }
   if (refs.length > 1) {
     const lines = refs.map((ref) => `- ${ref.id}${ref.name ? ` (${ref.name})` : ""}`);
     throw new InputError(
-      `database ${databaseId} \u6709 ${refs.length} \u4E2A data source\uFF0C\u9700\u8981\u552F\u4E00\u4E00\u4E2A\u624D\u80FD\u786E\u5B9A schema\u3002\u8BF7\u6539\u7528 parent: data-source:<id>\uFF0C\u53EF\u9009\uFF1A
-${lines.join("\n")}`,
+      PAGE_ERRORS.resolveDatabaseDataSource_2({ databaseId, length: refs.length, n: lines.join("\n") }),
       { databaseId, data_source_ids: refs.map((ref) => ref.id) }
     );
   }
@@ -1183,7 +1643,7 @@ async function assertNoRowCycle(runner, readPage, options) {
   while (queue.length > 0) {
     if (visited.size > MAX_ANCESTOR_WALK) {
       throw new InputError(
-        `Parent-item \u7956\u5148\u94FE\u8D85\u8FC7 ${MAX_ANCESTOR_WALK} \u5C42\uFF0C\u65E0\u6CD5\u786E\u8BA4\u4E0D\u4F1A\u5F62\u6210\u73AF\uFF1B\u5DF2\u505C\u6B62\uFF0C\u672A\u5199\u5165\u3002`,
+        PAGE_ERRORS.assertNoRowCycle_1({ MAX_ANCESTOR_WALK }),
         { id: childId, parent: parentId, cycle_check: "too_deep" }
       );
     }
@@ -1193,7 +1653,7 @@ async function assertNoRowCycle(runner, readPage, options) {
     visited.add(key);
     if (sameNotionId(current, childId)) {
       throw new InputError(
-        `\u884C ${childId} \u4E0D\u80FD\u6302\u5230 ${parentId} \u4E0B\uFF1A\u90A3\u4F1A\u5F62\u6210 Parent-item \u73AF\uFF08${parentId} \u7684\u7956\u5148\u91CC\u6709 ${childId}\uFF09\u3002`,
+        PAGE_ERRORS.assertNoRowCycle_2({ childId, parentId, parentId2: parentId, childId2: childId }),
         {
           id: childId,
           parent: parentId,
@@ -1208,7 +1668,7 @@ async function assertNoRowCycle(runner, readPage, options) {
       page = await readPage(current);
     } catch (error) {
       throw new InputError(
-        `\u65E0\u6CD5\u8BFB\u53D6\u7956\u5148\u884C ${current}\uFF0C\u56E0\u6B64\u65E0\u6CD5\u786E\u8BA4\u628A ${childId} \u6302\u5230 ${parentId} \u4E0B\u4E0D\u4F1A\u5F62\u6210\u73AF\uFF1B\u5DF2\u5728\u5199\u5165\u524D\u505C\u6B62\u3002`,
+        PAGE_ERRORS.assertNoRowCycle_3({ current, childId, parentId }),
         {
           id: childId,
           parent: parentId,
@@ -1231,7 +1691,7 @@ async function assertNoRowCycle(runner, readPage, options) {
           ancestorDataSourceId = await resolveDatabaseDataSource(runner, ancestorParent.id);
         } catch (error) {
           throw new InputError(
-            `\u65E0\u6CD5\u786E\u8BA4\u7956\u5148\u884C ${current} \u6240\u5C5E\u7684 data source\uFF0C\u56E0\u6B64\u65E0\u6CD5\u786E\u8BA4\u628A ${childId} \u6302\u5230 ${parentId} \u4E0B\u4E0D\u4F1A\u5F62\u6210\u73AF\uFF1B\u5DF2\u5728\u5199\u5165\u524D\u505C\u6B62\u3002`,
+            PAGE_ERRORS.assertNoRowCycle_4({ current, childId, parentId }),
             {
               id: childId,
               parent: parentId,
@@ -1288,14 +1748,14 @@ async function classifyBareParent(runner, id, op, readPage) {
     if (error instanceof NotionToolError) throw error;
     const detail = error instanceof Error ? error.message : String(error);
     throw new InputError(
-      `\u65E0\u6CD5\u628A ${id} \u5F53\u4F5C parent\uFF1A\u8BFB\u53D6\u5B83\u4F5C\u4E3A\u9875\u9762\u5931\u8D25${detail ? `\uFF08${truncate(detail, 300)}\uFF09` : ""}\u3002${op === "create" ? "create" : "\u79FB\u52A8\u9875\u9762"} \u7684\u88F8 id \u5FC5\u987B\u662F\u9875\u9762\u6216\u6570\u636E\u5E93\u884C\uFF1B\u5982\u679C\u5B83\u662F database \u6216 data source\uFF0C\u8BF7\u5199\u6210 database:<id> / data-source:<id>\u3002`,
+      PAGE_ERRORS.classifyBareParent_1({ id, detail: detail ? `\uFF08${truncate(detail, 300)}\uFF09` : "", create: op === "create" ? "create" : "\u79FB\u52A8\u9875\u9762" }),
       { parent: id }
     );
   }
   const parent = page.parent;
   if (!parent) {
     throw new InputError(
-      `\u65E0\u6CD5\u628A ${id} \u5F53\u4F5C parent\uFF1AGET v1/pages \u6CA1\u6709\u8FD4\u56DE parent\u3002${op === "create" ? "create" : "\u79FB\u52A8\u9875\u9762"} \u7684\u88F8 id \u5FC5\u987B\u662F\u9875\u9762\u6216\u6570\u636E\u5E93\u884C\uFF1B\u5982\u679C\u5B83\u662F database \u6216 data source\uFF0C\u8BF7\u5199\u6210 database:<id> / data-source:<id>\u3002`,
+      PAGE_ERRORS.classifyBareParent_2({ id, create: op === "create" ? "create" : "\u79FB\u52A8\u9875\u9762" }),
       { parent: id }
     );
   }
@@ -1335,7 +1795,7 @@ function richText(content) {
 function requireString(prop, value) {
   if (typeof value !== "string") {
     throw new InputError(
-      `\u5C5E\u6027 "${prop.name}" (${prop.type}) \u9700\u8981\u5B57\u7B26\u4E32\uFF0C\u6536\u5230 ${describeValue(value)}\u3002`,
+      PAGE_ERRORS.requireString_1({ name: prop.name, type: prop.type, value: describeValue(value) }),
       { property: prop.name, expected: prop.type }
     );
   }
@@ -1347,7 +1807,7 @@ function stringList(prop, value) {
     return value.filter((item) => item.trim() !== "");
   }
   throw new InputError(
-    `\u5C5E\u6027 "${prop.name}" (${prop.type}) \u9700\u8981 string[]\uFF0C\u6536\u5230 ${describeValue(value)}\u3002`,
+    PAGE_ERRORS.stringList_1({ name: prop.name, type: prop.type, value: describeValue(value) }),
     { property: prop.name, expected: "string[]" }
   );
 }
@@ -1389,9 +1849,9 @@ function buildPropertyValue(prop, value) {
       case "relation":
         return { relation: [] };
       case "title":
-        throw new InputError(`\u5C5E\u6027 "${prop.name}" \u662F\u6807\u9898\uFF0C\u4E0D\u80FD\u8BBE\u4E3A null\u3002`, { property: prop.name });
+        throw new InputError(PAGE_ERRORS.buildPropertyValue_1({ name: prop.name }), { property: prop.name });
       default:
-        throw new InputError(`\u5C5E\u6027 "${prop.name}" (${prop.type}) \u4E0D\u652F\u6301\u7528 null \u6E05\u7A7A\u3002`, {
+        throw new InputError(PAGE_ERRORS.buildPropertyValue_2({ name: prop.name, type: prop.type }), {
           property: prop.name,
           expected: prop.type
         });
@@ -1403,7 +1863,7 @@ function buildPropertyValue(prop, value) {
   switch (prop.type) {
     case "title": {
       const text2 = requireString(prop, value);
-      if (!text2.trim()) throw new InputError(`\u6807\u9898\u5C5E\u6027 "${prop.name}" \u4E0D\u80FD\u4E3A\u7A7A\u3002`, { property: prop.name });
+      if (!text2.trim()) throw new InputError(PAGE_ERRORS.buildPropertyValue_3({ name: prop.name }), { property: prop.name });
       return { title: richText(text2) };
     }
     case "rich_text": {
@@ -1414,7 +1874,7 @@ function buildPropertyValue(prop, value) {
         text2 = value.join("\n");
       } else {
         throw new InputError(
-          `\u5C5E\u6027 "${prop.name}" (rich_text) \u9700\u8981\u5B57\u7B26\u4E32\uFF0C\u6536\u5230 ${describeValue(value)}\u3002`,
+          PAGE_ERRORS.buildPropertyValue_4({ name: prop.name, value: describeValue(value) }),
           { property: prop.name, expected: "string" }
         );
       }
@@ -1426,7 +1886,7 @@ function buildPropertyValue(prop, value) {
         return { number: Number(value) };
       }
       throw new InputError(
-        `\u5C5E\u6027 "${prop.name}" (number) \u9700\u8981\u6570\u5B57\uFF0C\u6536\u5230 ${describeValue(value)}\u3002`,
+        PAGE_ERRORS.buildPropertyValue_5({ name: prop.name, value: describeValue(value) }),
         { property: prop.name, expected: "number" }
       );
     }
@@ -1435,7 +1895,7 @@ function buildPropertyValue(prop, value) {
       const name2 = typeof value === "string" ? value : isPlainObject(value) && typeof value.name === "string" ? value.name : void 0;
       if (name2 === void 0) {
         throw new InputError(
-          `\u5C5E\u6027 "${prop.name}" (${prop.type}) \u9700\u8981\u9009\u9879\u540D\u5B57\u7B26\u4E32\uFF0C\u6536\u5230 ${describeValue(value)}\u3002`,
+          PAGE_ERRORS.buildPropertyValue_6({ name: prop.name, type: prop.type, value: describeValue(value) }),
           { property: prop.name, expected: "string" }
         );
       }
@@ -1458,14 +1918,14 @@ function buildPropertyValue(prop, value) {
         return { date };
       }
       throw new InputError(
-        `\u5C5E\u6027 "${prop.name}" (date) \u9700\u8981\u65E5\u671F\u5B57\u7B26\u4E32\u6216 {start,end}\uFF0C\u6536\u5230 ${describeValue(value)}\u3002`,
+        PAGE_ERRORS.buildPropertyValue_7({ name: prop.name, value: describeValue(value) }),
         { property: prop.name, expected: "string | {start,end}" }
       );
     }
     case "checkbox": {
       if (typeof value !== "boolean") {
         throw new InputError(
-          `\u5C5E\u6027 "${prop.name}" (checkbox) \u9700\u8981 true/false\uFF0C\u6536\u5230 ${describeValue(value)}\u3002`,
+          PAGE_ERRORS.buildPropertyValue_8({ name: prop.name, value: describeValue(value) }),
           { property: prop.name, expected: "boolean" }
         );
       }
@@ -1484,7 +1944,7 @@ function buildPropertyValue(prop, value) {
     }
     default:
       throw new InputError(
-        `\u5C5E\u6027 "${prop.name}" \u7684\u7C7B\u578B ${prop.type} \u6682\u4E0D\u652F\u6301\u901A\u8FC7\u7B80\u5316\u503C\u5199\u5165\uFF1B\u53EF\u6539\u7528 props \u91CC\u76F4\u63A5\u7ED9 Notion \u539F\u751F payload\uFF0C\u4F8B\u5982 {"${prop.name}": {"${prop.type}": ...}}\u3002`,
+        PAGE_ERRORS.buildPropertyValue_9({ name: prop.name, type: prop.type, name2: prop.name, type2: prop.type }),
         { property: prop.name, type: prop.type }
       );
   }
@@ -1494,13 +1954,13 @@ function resolveProperty(schema, name2) {
   const hints = writableProperties(schema);
   if (!prop) {
     throw new InputError(
-      `\u672A\u77E5\u5C5E\u6027 "${name2}"\u3002\u53EF\u7528\u53EF\u5199\u5C5E\u6027\uFF1A${formatHints(hints)}\u3002`,
+      PAGE_ERRORS.resolveProperty_1({ name: name2, hints: formatHints(hints) }),
       { property: name2, hint_properties: hints }
     );
   }
   if (READ_ONLY_PROPERTY_TYPES.has(prop.type)) {
     throw new InputError(
-      `\u5C5E\u6027 "${name2}" \u7684\u7C7B\u578B\u662F ${prop.type}\uFF08\u53EA\u8BFB\uFF09\uFF0C\u4E0D\u80FD\u5199\u5165\u3002\u53EF\u5199\u5C5E\u6027\uFF1A${formatHints(hints)}\u3002`,
+      PAGE_ERRORS.resolveProperty_2({ name: name2, type: prop.type, hints: formatHints(hints) }),
       { property: name2, type: prop.type, hint_properties: hints }
     );
   }
@@ -1630,7 +2090,19 @@ function describePageValue(value) {
   }
   if (value.already_linked) {
     lines.push(
-      value.parent_item_property ? `\u884C ${value.id} \u5DF2\u7ECF\u5728\u7236\u884C ${value.parent_item_row_id} \u4E0B\uFF08Parent-item \u5217\uFF1A${value.parent_item_property}\uFF09\uFF0C\u65E0\u9700\u6539\u52A8` : `\u9875\u9762 ${value.id} \u5DF2\u7ECF\u6302\u5728 ${value.parent} \u4E0B\uFF0C\u65E0\u9700\u6539\u52A8`
+      value.parent_item_property ? PAGE_RESULT_TEXT.alreadyLinked({
+        hasParentItem: true,
+        id: value.id,
+        parentItemRowId: value.parent_item_row_id,
+        parentItemProperty: value.parent_item_property,
+        parent: value.parent
+      }) : PAGE_RESULT_TEXT.alreadyLinked({
+        hasParentItem: false,
+        id: value.id,
+        parentItemRowId: "",
+        parentItemProperty: "",
+        parent: value.parent
+      })
     );
     if (value.url) lines.push(`URL: ${value.url}`);
     lines.push("changed: (none)");
@@ -1652,29 +2124,33 @@ function describePageValue(value) {
     lines.push(`\u66FF\u6362\u4E86\u539F\u6765\u7684\u7236\u7EA7\uFF1A${value.replaced_parent_ids.join(", ")}`);
   }
   if (value.cycle_check === "partial") {
-    lines.push("\u6CE8\u610F\uFF1A\u9875\u9762\u7956\u5148\u94FE\u672A\u80FD\u5B8C\u6574\u8BFB\u53D6\uFF0C\u6DF1\u5C42\u73AF\u68C0\u67E5\u4E3A best-effort\uFF08cycle_check: partial\uFF09");
+    lines.push(PAGE_RESULT_TEXT.cycleCheckPartial);
   }
   if (value.created) {
     if (value.title) lines.push(`\u6807\u9898\uFF1A${value.title}`);
     lines.push(
-      value.body_chars ? `\u6B63\u6587\uFF1A\u5DF2\u5199\u5165 ${value.body_chars} \u5B57` : "\u6B63\u6587\uFF1A\u672A\u63D0\u4EA4\u6B63\u6587\u5185\u5BB9\uFF08\u672C\u6B21\u53EA\u6709\u6807\u9898/\u5C5E\u6027\uFF09"
+      value.body_chars ? PAGE_RESULT_TEXT.bodyWritten({ chars: value.body_chars }) : PAGE_RESULT_TEXT.bodyNotProvided
     );
   }
   if (value.properties.length) lines.push(`\u5DF2\u5199\u5165\u5217\uFF1A${value.properties.join(", ")}`);
   if (value.icon !== void 0) lines.push(`icon: ${value.icon ?? "\uFF08\u5DF2\u6E05\u9664\uFF09"}`);
   if (value.edits_sent !== void 0) {
     lines.push(
-      `edits: ${value.edits_applied ?? 0}/${value.edits_sent} \u6761\u5DF2\u5E94\u7528` + ((value.edits_missed ?? 0) > 0 ? `\uFF0C${value.edits_missed} \u6761 old_str \u6CA1\u6709\u5339\u914D\uFF08\u9875\u9762\u5176\u4F59\u90E8\u5206\u672A\u6539\u52A8\uFF0C\u89C1 warnings\uFF09` : "\uFF0C\u5168\u90E8\u5339\u914D")
+      PAGE_RESULT_TEXT.editTally({
+        applied: value.edits_applied ?? 0,
+        sent: value.edits_sent,
+        missed: value.edits_missed ?? 0
+      })
     );
   } else if (value.appended) {
-    lines.push("\u6B63\u6587\u5DF2\u8FFD\u52A0\u5230\u9875\u9762\u672B\u5C3E\uFF08edits \u4E3A\u7A7A + body_content\uFF09");
+    lines.push(PAGE_RESULT_TEXT.appended);
   }
   if (value.warnings) {
     for (const warning of value.warnings) lines.push(`warning [${warning.code}]: ${warning.message}`);
   }
   if (value.truncated) {
     lines.push(
-      "\u6CE8\u610F\uFF1ANotion \u8FD4\u56DE\u7684 markdown \u88AB\u622A\u65AD\uFF08truncated: true\uFF09\uFF0C\u5B83\u4E0D\u662F\u5B8C\u6574\u9875\u9762\uFF1B\u4E0B\u4E00\u6B21 old_str \u4E0D\u8981\u4EE5\u5B83\u4E3A\u51C6\u3002"
+      PAGE_RESULT_TEXT.truncated
     );
   }
   return lines.join("\n");
@@ -1703,7 +2179,7 @@ function readContentEdit(raw, index) {
   const path = `edits[${index}]`;
   if (!isPlainObject(raw)) {
     throw new InputError(
-      `${path} \u5FC5\u987B\u662F { old_str, new_str, replace_all_matches? }\uFF0C\u6536\u5230 ${describeValue(raw)}\u3002`,
+      PAGE_ERRORS.readContentEdit_1({ path, raw: describeValue(raw) }),
       { field: path, value: raw }
     );
   }
@@ -1712,31 +2188,31 @@ function readContentEdit(raw, index) {
   );
   if (unexpected.length > 0) {
     throw new InputError(
-      `${path} \u53EA\u63A5\u53D7 old_str / new_str / replace_all_matches\uFF0C\u591A\u4F59\u5B57\u6BB5\uFF1A${unexpected.join(", ")}\u3002`,
+      PAGE_ERRORS.readContentEdit_2({ path, join: unexpected.join(", ") }),
       { field: path, unexpected_params: unexpected }
     );
   }
   if (typeof raw.old_str !== "string") {
     throw new InputError(
-      `${path}.old_str \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\uFF08\u8981\u67E5\u627E\u7684\u539F\u6587\uFF09\uFF0C\u6536\u5230 ${describeValue(raw.old_str)}\u3002`,
+      PAGE_ERRORS.readContentEdit_3({ path, old_str: describeValue(raw.old_str) }),
       { field: `${path}.old_str`, value: raw.old_str }
     );
   }
   if (raw.old_str === "") {
     throw new InputError(
-      `${path}.old_str \u4E0D\u80FD\u662F\u7A7A\u5B57\u7B26\u4E32\uFF1ANotion \u4F1A\u62D2\u7EDD\u7A7A old_str\u3002\u8981\u8FFD\u52A0\u5185\u5BB9\u8BF7\u7528 body_content \u4E14\u4E0D\u4F20 edits\u3002`,
+      PAGE_ERRORS.readContentEdit_4({ path }),
       { field: `${path}.old_str` }
     );
   }
   if (raw.new_str === void 0) {
     throw new InputError(
-      `${path}.new_str \u662F\u5FC5\u586B\u7684\uFF1A\u66FF\u6362\u6210\u4EC0\u4E48\u5C31\u5199\u4EC0\u4E48\uFF0C\u60F3\u5220\u9664\u8FD9\u6BB5\u6587\u5B57\u8BF7\u4F20 ""\uFF08\u7A7A\u5B57\u7B26\u4E32\uFF09\u3002`,
+      PAGE_ERRORS.readContentEdit_5({ path }),
       { field: `${path}.new_str`, value: raw.new_str }
     );
   }
   if (typeof raw.new_str !== "string") {
     throw new InputError(
-      `${path}.new_str \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\uFF0C\u6536\u5230 ${describeValue(raw.new_str)}\u3002`,
+      PAGE_ERRORS.readContentEdit_6({ path, new_str: describeValue(raw.new_str) }),
       { field: `${path}.new_str`, value: raw.new_str }
     );
   }
@@ -1753,13 +2229,13 @@ function readContentEdits(raw) {
   if (raw === void 0 || raw === null) return [];
   if (!Array.isArray(raw)) {
     throw new InputError(
-      `edits \u5FC5\u987B\u662F\u6570\u7EC4\uFF1A[{ old_str, new_str, replace_all_matches? }, ...]\uFF0C\u6536\u5230 ${describeValue(raw)}\u3002\u8981\u8FFD\u52A0\u5185\u5BB9\u8BF7\u6539\u7528 body_content\uFF08\u4E0D\u4F20 edits\uFF09\u3002`,
+      PAGE_ERRORS.readContentEdits_1({ raw: describeValue(raw) }),
       { field: "edits", value: raw }
     );
   }
   if (raw.length > MAX_CONTENT_UPDATES) {
     throw new InputError(
-      `edits \u6700\u591A ${MAX_CONTENT_UPDATES} \u6761\uFF08Notion \u9650\u5236\uFF09\uFF0C\u6536\u5230 ${raw.length} \u6761\u3002\u8BF7\u62C6\u6210\u591A\u6B21 notion_page_edit \u8C03\u7528\u3002`,
+      PAGE_ERRORS.readContentEdits_2({ MAX_CONTENT_UPDATES, length: raw.length }),
       { field: "edits", count: raw.length, max: MAX_CONTENT_UPDATES }
     );
   }
@@ -1769,7 +2245,7 @@ function withEditAlias(edits, props) {
   if (!props || !("block_update" in props)) return { edits, props };
   if (edits.length > 0) {
     throw new InputError(
-      "edits \u548C props.block_update \u662F\u540C\u4E00\u4E2A\u4E1C\u897F\uFF08\u67E5\u627E\u66FF\u6362\u5217\u8868\uFF09\uFF0C\u4E0D\u8981\u540C\u65F6\u4F20\uFF1B\u8BF7\u7EDF\u4E00\u7528 edits\u3002\u672C\u6B21\u6CA1\u6709\u5199\u5165\u4EFB\u4F55\u5185\u5BB9\u3002",
+      PAGE_ERRORS.withEditAlias_1,
       { conflict: true, fields: ["edits", "props.block_update"] }
     );
   }
@@ -1803,7 +2279,7 @@ function markdownFailure(pageId, result) {
   const detail = (result.stderr || result.stdout || "").trim();
   if (DELETION_REFUSAL_RE.test(detail)) {
     return new NotionToolError(
-      `\u8FD9\u6B21\u7F16\u8F91\u4F1A\u5220\u9664\u9875\u9762 ${pageId} \u91CC\u7684\u5B50\u9875\u9762\u6216\u5B50\u6570\u636E\u5E93\uFF0CNotion \u56E0\u6B64\u62D2\u7EDD\u6267\u884C\uFF08\u672C\u6B21\u6CA1\u6709\u5199\u5165\u4EFB\u4F55\u5185\u5BB9\uFF09\u3002old_str \u5339\u914D\u7684\u662F\u6574\u6BB5\u6587\u672C\uFF0C\u5F88\u5BB9\u6613\u8FDE\u5E26\u8986\u76D6 \`<page url="...">\u2026</page>\` \u6216 \`<database ...>\` \u8FD9\u7C7B\u5757\u3002\u8BF7\u628A old_str \u7F29\u5C0F\u5230\u90A3\u6BB5\u6587\u5B57\u672C\u8EAB\uFF08\u4E0D\u8981\u5305\u542B\u5B50\u9875\u9762/\u5B50\u6570\u636E\u5E93\u5757\uFF09\uFF0C\u6216\u5148\u5728 Notion \u91CC\u628A\u5B50\u9875\u9762\u79FB\u8D70\u518D\u6539\u3002ntn \u8F93\u51FA\uFF1A${truncate(detail, 600)}`,
+      PAGE_ERRORS.markdownFailure_1({ pageId, detail: truncate(detail, 600) }),
       {
         code: NOTION_ERROR_CODES.ntnFailed,
         details: {
@@ -1871,9 +2347,7 @@ function buildPropertyWrite(schema, props, title, context) {
   if (title) {
     const titleName = titlePropertyName(schema);
     if (!titleName) {
-      throw new InputError(
-        context.pageId ? `\u65E0\u6CD5\u786E\u5B9A\u9875\u9762 ${context.pageId} \u7684\u6807\u9898\u5C5E\u6027\uFF0C\u4E0D\u80FD\u7528 title \u6539\u6807\u9898\uFF1B\u8BF7\u6539\u7528 props \u5E76\u6307\u5B9A\u6807\u9898\u5C5E\u6027\u540D\u3002` : `\u65E0\u6CD5\u786E\u5B9A ${context.source} \u7684\u6807\u9898\u5C5E\u6027\uFF0C\u4E0D\u80FD\u7528 title \u6307\u5B9A\u6807\u9898\uFF1B\u8BF7\u6539\u7528 props \u5E76\u6307\u5B9A\u6807\u9898\u5C5E\u6027\u540D\u3002`
-      );
+      throw new InputError(PAGE_ERRORS.buildPropertyWrite_1({ pageId: context.pageId, source: context.source }));
     }
     properties[titleName] = { title: richText(title) };
     if (!names.includes(titleName)) names.push(titleName);
@@ -1896,7 +2370,7 @@ function parentItemError(schema, dataSourceId) {
     (prop) => prop.relationDataSourceId ? `${prop.name} \u2192 ${prop.relationDataSourceId}` : prop.name
   ).join(", ")}` : "\u8BE5 data source \u6CA1\u6709\u4EFB\u4F55 relation \u5217";
   return new InputError(
-    `data source ${dataSourceId} \u6CA1\u6709\u53EF\u7528\u7684 Parent-item / \u81EA\u5173\u8054 relation \u5217\uFF0C\u65E0\u6CD5\u628A\u884C\u6302\u5230\u7236\u884C\u4E0B\uFF08${detail}\uFF09\u3002\u8BF7\u5728 Notion \u91CC\u4E3A\u8FD9\u4E2A\u5E93\u52A0\u4E00\u4E2A\u6307\u5411\u81EA\u8EAB\u7684 relation \u5C5E\u6027\uFF08\u9ED8\u8BA4\u540D Parent-item\uFF09\uFF0C\u6216\u7528 notion_get \u67E5\u770B\u73B0\u6709\u5217\u540E\u91CD\u8BD5\u3002`,
+    PAGE_ERRORS.parentItemError_1({ dataSourceId, detail }),
     {
       dataSourceId,
       hint_properties: hints,
@@ -1935,7 +2409,7 @@ async function rollbackCreatedPage(runner, pageId, cause) {
     rollback_code: trash.code,
     ...detail ? { rollback_error: truncate(detail, 600) } : {}
   };
-  return new NotionToolError(`${cause.detail}${rollbackLine}`, {
+  return new NotionToolError(PAGE_ERRORS.rollbackCreatedPage_1({ detail: cause.detail, rollbackLine }), {
     code: partial ? NOTION_ERROR_CODES.partialWrite : cause.code,
     details
   });
@@ -1960,14 +2434,12 @@ async function createPage(params, runner) {
   if (container.kind !== "page" && container.kind !== "workspace" && !title) {
     const hints = writableProperties(container.schema);
     throw new InputError(
-      `\u5728 ${container.kind === "row" ? `\u884C ${container.rowParentId} \u6240\u5728 data source` : container.kind} \u4E2D\u521B\u5EFA\u9875\u9762\u9700\u8981\u6807\u9898\uFF1A\u8BF7\u4F20 title\u3001\u5728 props \u91CC\u5199\u6807\u9898\u5C5E\u6027\uFF08${titlePropertyName(container.schema) ?? "title"}\uFF09\uFF0C\u6216\u8BA9 body_content \u4EE5 "# \u6807\u9898" \u5F00\u5934\u3002\u53EF\u5199\u5C5E\u6027\uFF1A${formatHints(hints)}\u3002`,
+      PAGE_ERRORS.createPage_1({ kind: container.kind === "row" ? `\u884C ${container.rowParentId} \u6240\u5728 data source` : container.kind, title: titlePropertyName(container.schema) ?? "title", hints: formatHints(hints) }),
       { ...parentLabel ? { parent: parentLabel } : { parent: "workspace" }, hint_properties: hints }
     );
   }
   if (!draft.body.trim()) {
-    throw new InputError(
-      "create \u9700\u8981 body_content \u6216 title\uFF1Antn pages create \u4E0D\u63A5\u53D7\u7A7A Markdown\uFF0C\u53EA\u6709 parent \u65E0\u6CD5\u521B\u5EFA\u7A7A\u767D\u9875\u9762\u3002"
-    );
+    throw new InputError(PAGE_ERRORS.createPage_2);
   }
   let rowRelationName;
   if (container.kind === "row") {
@@ -1996,7 +2468,7 @@ async function createPage(params, runner) {
   const requireTrustedId = (what) => {
     if (structuredId) return structuredId;
     throw new InputError(
-      `\u9875\u9762\u5DF2\u521B\u5EFA\uFF08parent ${parentLabel ?? "workspace"}\uFF09\uFF0C\u4F46\u6CA1\u6709\u4ECE ntn \u7684\u7ED3\u6784\u5316\u8F93\u51FA\u91CC\u53D6\u5230\u9875\u9762 id\uFF0C${what}\u672A\u5199\u5165\u3002\u6CA1\u6709\u53EF\u4FE1 id \u5C31\u4E0D\u81EA\u52A8 trash\uFF08\u907F\u514D\u8BEF\u5220\uFF09\uFF0C\u8BF7\u7528 notion_search/notion_get \u627E\u5230\u8BE5\u9875\u9762\u540E\uFF0C\u7528 notion_page_edit \u5199\u5165\uFF0C\u6216 notion_page_trash \u5220\u9664\uFF08partial: true\uFF0Crollback: unknown_id\uFF09\u3002`,
+      PAGE_ERRORS.createPage_3({ workspace: parentLabel ?? "workspace", what }),
       {
         parent: parentLabel ?? "workspace",
         partial: true,
@@ -2063,10 +2535,7 @@ function editWithFailures(failed, applied, result) {
   }
   const reported = causes.map((entry) => `  - ${entry.step}\uFF1A${entry.cause.detail}`).join("\n");
   return new NotionToolError(
-    `\u90E8\u5206\u6210\u529F\u3002\u5DF2\u7ECF\u751F\u6548\u7684\u90E8\u5206\uFF1A${applied.join("\u3001")}\uFF08\u5DF2\u5199\u5165\uFF0C\u4E0D\u4F1A\u56DE\u6EDA\uFF09\u3002
-\u5931\u8D25\u7684\u90E8\u5206\uFF1A
-${reported}
-\u8FD9\u4E9B\u6B65\u9AA4\u4E92\u4E0D\u4F9D\u8D56\uFF0C\u6240\u4EE5\u5176\u4F59\u6B65\u9AA4\u7167\u5E38\u6267\u884C\u4E86\u3002\u91CD\u8BD5\u65F6\u8BF7\u53EA\u91CD\u53D1\u5931\u8D25\u7684\u90E8\u5206\uFF1B\u91CD\u53D1\u5168\u90E8\u4F1A\u628A\u5DF2\u751F\u6548\u7684\u90E8\u5206\u91CD\u590D\u5E94\u7528\u4E00\u904D\u3002`,
+    PAGE_ERRORS.editWithFailures_1({ join: applied.join("\u3001"), reported }),
     {
       code: causes[0].cause.code,
       details: {
@@ -2169,9 +2638,7 @@ async function movePage(runner, options) {
   const { id } = options;
   const spec = parseParentSpec(options.parent, "move");
   if (!spec.bare && spec.kind !== "page") {
-    throw new InputError(
-      "edit \u7684 parent\uFF08\u79FB\u52A8\u9875\u9762\uFF09\u53EA\u652F\u6301 page:<id> \u6216\uFF08\u88F8\uFF09\u884C id\uFF1A\u9875\u9762\u6302\u5230\u9875\u9762\u4E0B\u7528 POST /v1/pages/{id}/move\uFF0C\u884C\u6302\u5230\u884C\u4E0B\u7528 Parent-item relation\u3002\u8981\u628A\u9875\u9762\u653E\u8FDB\u67D0\u4E2A data source\uFF0C\u8BF7\u7528 notion_page_create\u3002"
-    );
+    throw new InputError(PAGE_ERRORS.movePage_1);
   }
   const readPage = makePageReader(runner);
   const container = await resolveContainer(runner, options.parent, "move", readPage);
@@ -2179,22 +2646,22 @@ async function movePage(runner, options) {
   const childParent = childPage.parent;
   if (!childParent) {
     throw new InputError(
-      `\u65E0\u6CD5\u786E\u5B9A\u9875\u9762 ${id} \u7684\u5F53\u524D\u7236\u7EA7\uFF08GET v1/pages \u672A\u8FD4\u56DE parent\uFF09\u3002\u79FB\u52A8\u9875\u9762\u4E0D\u4F1A\u5728\u6CA1\u6709\u786E\u8BA4\u7684\u60C5\u51B5\u4E0B\u6267\u884C\u3002`,
+      PAGE_ERRORS.movePage_2({ id }),
       { id }
     );
   }
   if (container.kind === "page") {
     const targetParentId = container.createParent.id;
     if (sameNotionId(id, targetParentId)) {
-      throw new InputError(`\u9875\u9762 ${id} \u4E0D\u80FD\u6302\u5230\u81EA\u5DF1\u4E0B\u9762\u3002`, { id, parent: targetParentId });
+      throw new InputError(PAGE_ERRORS.movePage_3({ id }), { id, parent: targetParentId });
     }
     if (childParent.kind === "page" && sameNotionId(childParent.id, targetParentId)) {
-      throw new InputError(`\u9875\u9762 ${id} \u5DF2\u7ECF\u662F ${targetParentId} \u7684\u5B50\u9875\u9762\uFF0C\u65E0\u9700\u79FB\u52A8\u3002`, { id });
+      throw new InputError(PAGE_ERRORS.movePage_4({ id, targetParentId }), { id });
     }
     const cycle = await walkPageAncestors(readPage, { childId: id, parentId: targetParentId });
     if (cycle.cycle) {
       throw new InputError(
-        `\u9875\u9762 ${id} \u4E0D\u80FD\u6302\u5230\u9875\u9762 ${targetParentId} \u4E0B\uFF1A\u4F1A\u5F62\u6210\u73AF\uFF08${cycle.cycle.join(" \u2192 ")}\uFF09\u3002`,
+        PAGE_ERRORS.movePage_5({ id, targetParentId, join: cycle.cycle.join(" \u2192 ") }),
         { id, parent: targetParentId, cycle: true, cycle_path: cycle.cycle, cycle_check: "cycle" }
       );
     }
@@ -2218,21 +2685,21 @@ async function movePage(runner, options) {
     };
   }
   if (container.kind !== "row") {
-    throw new InputError("\u65E0\u6CD5\u628A\u9875\u9762\u6302\u5230 data source \u5BB9\u5668\u4E0B\uFF1B\u8BF7\u6539\u7528 notion_page_create\u3002");
+    throw new InputError(PAGE_ERRORS.movePage_6);
   }
   if (childParent.kind === "page") {
     throw new InputError(
-      `\u9875\u9762 ${id} \u4E0D\u5728\u6570\u636E\u5E93\u91CC\uFF08\u7236\u7EA7\u662F\u9875\u9762${childParent.id ? ` ${childParent.id}` : ""}\uFF09\uFF0C\u4E0D\u80FD\u7528 Parent-item relation \u6302\u5230\u884C ${container.rowParentId} \u4E0B\uFF1B\u884C\u2192\u884C\u7684\u79FB\u52A8\u53EA\u9002\u7528\u4E8E\u540C\u4E00\u5E93\u5185\u7684\u884C\u3002`,
+      PAGE_ERRORS.movePage_7({ id, id2: childParent.id ? ` ${childParent.id}` : "", rowParentId: container.rowParentId }),
       { id, parentRowId: container.rowParentId }
     );
   }
   if (sameNotionId(id, container.rowParentId)) {
-    throw new InputError(`\u884C ${id} \u4E0D\u80FD\u6302\u5230\u81EA\u5DF1\u4E0B\u9762\u3002`, { id });
+    throw new InputError(PAGE_ERRORS.movePage_8({ id }), { id });
   }
   const childDataSourceId = await dataSourceIdForParent(runner, childParent);
   if (!sameNotionId(childDataSourceId, container.dataSourceId)) {
     throw new InputError(
-      `\u884C ${id} \u5C5E\u4E8E data source ${childDataSourceId}\uFF0C\u7236\u884C ${container.rowParentId} \u5C5E\u4E8E ${container.dataSourceId}\uFF1B\u81EA\u5173\u8054 Parent-item \u53EA\u80FD\u5728\u540C\u4E00 data source \u5185\u4F7F\u7528\uFF0C\u8DE8\u5E93\u8BF7\u6539\u7528 page \u7236\u7EA7\u6216 notion_page_create\u3002`,
+      PAGE_ERRORS.movePage_9({ id, childDataSourceId, rowParentId: container.rowParentId, dataSourceId: container.dataSourceId }),
       { id, childDataSourceId, parentDataSourceId: container.dataSourceId }
     );
   }
@@ -2253,7 +2720,7 @@ async function movePage(runner, options) {
   }
   if (currentParents.length > 0 && options.yes !== true) {
     throw new InputError(
-      `\u884C ${id} \u7684 ${relation.name}\uFF08Parent-item\uFF09\u5DF2\u7ECF\u6307\u5411 ${currentParents.join(", ")}\uFF0C\u79FB\u5230 ${container.rowParentId} \u4E0B\u4F1A\u8986\u76D6\u8FD9\u4E2A\u94FE\u63A5\u3002\u786E\u8BA4\u8981\u6539\u7236\u7EA7\u8BF7\u4F20 yes: true\uFF1B\u672C\u6B21\u6CA1\u6709\u5199\u5165\u3002`,
+      PAGE_ERRORS.movePage_10({ id, name: relation.name, join: currentParents.join(", "), rowParentId: container.rowParentId }),
       {
         id,
         parent: formatParent(container.createParent),
@@ -2336,7 +2803,7 @@ async function listChildPages(runner, pageId, options) {
     if (!isPlainObject(parsed)) {
       if (!options.failOnUnreadable && children.length > 0) return children;
       throw inputError(
-        `\u9875\u9762 ${pageId} \u7684\u5B50\u5757\u5217\u8868\u65E0\u6CD5\u89E3\u6790\uFF0C\u4E0D\u80FD\u786E\u8BA4\u5B83\u6709\u591A\u5C11\u5B50\u9875\u9762\uFF0C\u56E0\u6B64\u62D2\u7EDD\u5220\u9664\u3002ntn \u8F93\u51FA\uFF1A${truncate((result.stdout || "").trim(), 200)}`,
+        PAGE_ERRORS.listChildPages_1({ pageId, trim: truncate((result.stdout || "").trim(), 200) }),
         { id: pageId, enumerable: false }
       );
     }
@@ -2367,7 +2834,7 @@ async function listChildPages(runner, pageId, options) {
     if (!next) {
       if (!options.failOnUnreadable && children.length > 0) return children;
       throw inputError(
-        `\u9875\u9762 ${pageId} \u7684\u5B50\u5757\u62A5\u544A has_more=true \u5374\u6CA1\u6709 next_cursor\uFF0C\u65E0\u6CD5\u8BFB\u5B8C\u5B50\u9875\u9762\u5217\u8868\uFF0C\u56E0\u6B64\u62D2\u7EDD\u5220\u9664\u3002`,
+        PAGE_ERRORS.listChildPages_2({ pageId }),
         { id: pageId, enumerable: false }
       );
     }
@@ -2375,7 +2842,7 @@ async function listChildPages(runner, pageId, options) {
     if (page === MAX_BLOCK_PAGES - 1) {
       if (!options.failOnUnreadable && children.length > 0) return children;
       throw inputError(
-        `\u9875\u9762 ${pageId} \u7684\u5B50\u5757\u8D85\u8FC7 ${MAX_BLOCK_PAGES} \u9875\u4ECD\u672A\u5217\u5B8C\uFF0C\u65E0\u6CD5\u786E\u8BA4\u5B83\u6709\u591A\u5C11\u5B50\u9875\u9762\uFF0C\u56E0\u6B64\u62D2\u7EDD\u5220\u9664\u3002\u8BF7\u5728 Notion \u91CC\u624B\u52A8\u786E\u8BA4\u5E76\u5220\u9664\u3002`,
+        PAGE_ERRORS.listChildPages_3({ pageId, MAX_BLOCK_PAGES }),
         { id: pageId, children_enumerated: children.length, enumerable: false }
       );
     }
@@ -2395,13 +2862,13 @@ async function trashPage(params, runner) {
   }
   if (target.kind === "missing") {
     throw new InputError(
-      `\u9875\u9762 ${id} \u4E0D\u5B58\u5728\uFF0C\u6216\u6CA1\u6709\u88AB\u5F53\u524D\u7684 Notion integration \u5171\u4EAB\uFF08\u2022\u2022\u2022 \u2192 Connections\uFF09\uFF0C\u56E0\u6B64\u65E0\u6CD5\u5220\u9664\u3002\u8BF7\u5148\u7528 notion_search \u786E\u8BA4 id \u6B63\u786E\u3002`,
+      PAGE_ERRORS.trashPage_1({ id }),
       { id, target: "missing" }
     );
   }
   if (target.kind === "database") {
     throw new InputError(
-      `notion_page_trash cannot delete a database (id ${id}). Removing a database, its data sources and every row in them is far more destructive than deleting a page, so this tool refuses even with yes: true. Ask the user to delete it in Notion (\u2022\u2022\u2022 \u2192 Delete) if that is really intended.`,
+      PAGE_ERRORS.trashPage_2({ id }),
       { id, target: "database", refused: "database_delete" }
     );
   }
@@ -2425,9 +2892,7 @@ async function trashPage(params, runner) {
       const overflow = children.length > MAX_LISTED_CHILDREN ? `
   \u2026\u53E6\u6709 ${children.length - MAX_LISTED_CHILDREN} \u4E2A\u672A\u5217\u51FA\uFF08\u5171 ${children.length} \u4E2A\uFF0C\u5B8C\u6574\u5217\u8868\u89C1 Notion\uFF09\u3002` : "";
       throw new InputError(
-        `\u9875\u9762 ${id} \u6709 ${children.length} \u4E2A\u5B50\u9875\u9762/\u5D4C\u5957\u5BB9\u5668\uFF1A
-${listed}${overflow}
-Notion \u4F1A\u8FDE\u5E26\u5F52\u6863\u6574\u68F5\u5B50\u6811\uFF0C\u6240\u4EE5\u9ED8\u8BA4\u62D2\u7EDD\u3002\u786E\u8BA4\u8981\u4E00\u8D77\u5220\u9664\u8BF7\u52A0 recursive: true\uFF1B\u53EA\u60F3\u5220\u7236\u9875\u9762\u8BF7\u5148\u5728 Notion \u91CC\u79FB\u8D70\u8FD9\u4E9B\u5B50\u9875\u9762\u3002`,
+        PAGE_ERRORS.trashPage_3({ id, length: children.length, listed, overflow }),
         {
           id,
           children: children.map((child) => child.id),
@@ -2441,26 +2906,25 @@ Notion \u4F1A\u8FDE\u5E26\u5F52\u6863\u6574\u68F5\u5B50\u6811\uFF0C\u6240\u4EE5\
   if (!result.ok) throw ntnFailure("ntn pages trash", result);
   return pageValue({ id, url: pageUrl(id), properties: [], changed: ["trashed"] });
 }
-var PROPS_DESCRIPTION = `Object map of database column NAME \u2192 simplified value (e.g. {"Status":"\u8FDB\u884C\u4E2D","\u6807\u7B7E":["a","b"],"\u622A\u6B62\u65E5\u671F":"2025-01-31","Done":true}); {} = no property write. The value is converted by the column TYPE from the parent data source's schema: title/rich_text string; number number|numeric string; select/status string or {name} (""/null clears); multi_select string[]; date "YYYY-MM-DD" | ISO string | {start,end?,time_zone?}; checkbox boolean; url/email/phone string (""/null clears); people/relation string[] of ids. null clears a property where Notion allows it, and an object carrying its own type key (e.g. {"select":{"name":"Done"}}) is sent as-is. Unknown names and read-only columns (formula/rollup/created_time/\u2026) are rejected with hint_properties. COLUMNS ONLY: the page icon is the top-level icon parameter and the page body is the top-level body_content parameter, not props keys. No default property values are invented.`;
 var ICON_PARAMETERS = [
-  { type: "string", description: 'An emoji ("\u{1F3AF}") or an http(s) image URL.' },
-  { type: "object", additionalProperties: true, description: 'An already-typed Notion icon object, e.g. {"type":"emoji","emoji":"\u{1F3AF}"} or {"type":"external","external":{"url":"https://\u2026/a.png"}}.' },
-  { type: "null", description: "null clears the icon." }
+  { type: "string", description: ICON_TEXT.string },
+  { type: "object", additionalProperties: true, description: ICON_TEXT.object },
+  { type: "null", description: ICON_TEXT.null }
 ];
 var EDIT_ITEM_SCHEMA = {
   type: "object",
   properties: {
     old_str: {
       type: "string",
-      description: "Required, non-empty. The existing text to find. Substring matching: one word, one sentence or several blocks all work \u2014 you do not have to resend the whole paragraph. COPY WHAT notion_get SHOWED YOU, MARKERS AND ALL \u2014 that always matches, at any length. A marker-free plain fragment also works, but only if it sits inside ONE formatting run: on `Alpha **bold** omega`, `bold` and `Alpha ` match, `Alpha bold` does not (it crosses the bold boundary). So the one way to fail is a plain fragment spanning a formatting change \u2014 when unsure, copy the markers. Adjacent blocks join with \\n, which merges them on replace. A `$` may be bare or escaped."
+      description: EDIT_ITEM_TEXT.old_str
     },
     new_str: {
       type: "string",
-      description: 'Required. The replacement text. "" DELETES old_str. It is markdown, so **bold**, `code`, [link](url), ## headings and - list items all render as that formatting; a new_str containing \\n\\n creates separate blocks and a single \\n is a line break inside one block. A `$` may be written bare or escaped \u2014 this tool removes the escape before sending, so pasting the \\\\$ that notion_get renders is safe.'
+      description: EDIT_ITEM_TEXT.new_str
     },
     replace_all_matches: {
       type: "boolean",
-      description: "Default false: if old_str matches more than one place the whole call fails and NOTHING is written. Set true to replace every occurrence. This is detected by Notion, not locally, so the tool cannot say which of your edits was ambiguous in advance \u2014 narrow the old_str or set this flag."
+      description: EDIT_ITEM_TEXT.replace_all_matches
     }
   },
   required: ["old_str", "new_str"],
@@ -2471,17 +2935,17 @@ var CREATE_PARAMETERS = {
   properties: {
     parent: {
       type: "string",
-      description: "Where the page goes. OMIT it to create the page at the WORKSPACE ROOT (Notion's default when no parent is given; such a page only has a title, so props cannot carry columns). Otherwise: page:<id> (child page), database:<id> | data-source:<id> (a row in that database), or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / self-relation column). A Notion URL is accepted anywhere an id is: the id is extracted from it."
+      description: CREATE_PARAMS.parent
     },
     title: {
       type: "string",
-      description: 'Page title. A row in a database needs one (here, or as the title property in props, or as a leading "# Heading" in body_content).'
+      description: CREATE_PARAMS.title
     },
     props: { type: "object", additionalProperties: true, description: PROPS_DESCRIPTION },
-    icon: { oneOf: ICON_PARAMETERS, description: "The page icon." },
+    icon: { oneOf: ICON_PARAMETERS, description: ICON_PARAMETER_TEXT_CREATE },
     body_content: {
       type: "string",
-      description: 'The page body as Markdown. A leading "# Heading" becomes the title when title is absent.'
+      description: CREATE_PARAMS.body_content
     }
   },
   // `parent` is NOT required: omitting it creates the page at the WORKSPACE ROOT, which
@@ -2494,27 +2958,27 @@ var EDIT_PARAMETERS = {
   properties: {
     id: {
       type: "string",
-      description: "Required. The page id (32 hex or dashed UUID) or its Notion URL."
+      description: EDIT_PARAMS.id
     },
     edits: {
       type: "array",
       items: EDIT_ITEM_SCHEMA,
-      description: "Find-and-replace operations, applied in order (edit[i+1] sees edit[i]'s result). Max 100. replace_all_matches belongs on the INDIVIDUAL edit object, not on the call. Notion does the matching, so a call can end three ways: all match -> success; SOME match -> success, with the misses in `warnings` (nothing is rolled back, so do not assume the page now equals what you sent); NONE match -> the call fails and nothing is written, which means the old_str were stale: re-read with notion_get instead of retrying the same string. An old_str matching MORE THAN ONE place is a separate hard error: nothing is written unless that edit sets replace_all_matches:true. Omit `edits` and pass body_content to APPEND instead."
+      description: EDIT_PARAMS.edits
     },
     body_content: {
       type: "string",
-      description: "Markdown to APPEND at the end of the page. Only used when `edits` is empty or absent \u2014 this is the ONLY way to add new content, and edit never replaces the whole page. Passing body_content TOGETHER with a non-empty edits is an INVALID_INPUT error (nothing is written): append and find-replace cannot be combined in one call."
+      description: EDIT_PARAMS.body_content
     },
     props: { type: "object", additionalProperties: true, description: PROPS_DESCRIPTION },
-    title: { type: "string", description: "New page title (writes the title property)." },
-    icon: { oneOf: ICON_PARAMETERS, description: "New page icon; null clears it." },
+    title: { type: "string", description: EDIT_PARAMS.title },
+    icon: { oneOf: ICON_PARAMETERS, description: ICON_PARAMETER_TEXT_EDIT },
     parent: {
       type: "string",
-      description: "Move the page: page:<id> (under that page), or a bare PAGE id, or a bare ROW id (re-link the Parent-item relation of that row). A Notion URL is accepted anywhere an id is. Database/data source parents are not accepted \u2014 use notion_page_create to add a row."
+      description: EDIT_PARAMS.parent
     },
     yes: {
       type: "boolean",
-      description: "Only for a row\u2192row move: consent to REPLACE the row's existing Parent-item link, which otherwise refuses with the current parent ids. Ignored nowhere else \u2014 passing it without parent is an error."
+      description: EDIT_PARAMS.yes
     }
   },
   required: ["id"],
@@ -2525,15 +2989,15 @@ var TRASH_PARAMETERS = {
   properties: {
     id: {
       type: "string",
-      description: "Required. The page id (32 hex or dashed UUID) or its Notion URL."
+      description: TRASH_PARAMS.id
     },
     yes: {
       type: "boolean",
-      description: "Required true. Without it the tool refuses without calling ntn, so a trash is never a guess."
+      description: TRASH_PARAMS.yes
     },
     recursive: {
       type: "boolean",
-      description: "Consent to delete the page together with its child pages (Notion archives the whole subtree). Without it a page that has child pages is refused with the child ids."
+      description: TRASH_PARAMS.recursive
     }
   },
   required: ["id", "yes"],
@@ -2583,7 +3047,7 @@ function createNotionPageCreateTool(deps = {}) {
   const runner = deps.runNtn ?? runNtn;
   return defineNotionTool({
     name: "notion_page_create",
-    description: 'Create one Notion page or database row. This tool never modifies an existing page \u2014 use notion_page_edit for that. `parent` is OPTIONAL: omit it to create the page at the WORKSPACE ROOT (Notion\'s own default; such a page has only a title, so props cannot carry columns). A page created inside a database needs a title: the `title` parameter, the title property in props, or a leading "# Heading" in body_content. Creating takes a SECOND request for the columns and icon. If that request fails the new page is trashed so no half-made page is left behind, and the error reports whether the cleanup worked (`rollback`) \u2014 partial:true means something was left behind. A successful result reports the title, the body it wrote, the columns and the icon separately.',
+    description: TOOL_DESCRIPTIONS.pageCreate,
     timeoutMs: TOOL_TIMEOUTS.page,
     // Every operation here can write, so page calls stay exclusive: never overlap two.
     isConcurrencySafe: () => false,
@@ -2618,7 +3082,7 @@ function createNotionPageEditTool(deps = {}) {
   const runner = deps.runNtn ?? runNtn;
   return defineNotionTool({
     name: "notion_page_edit",
-    description: 'Change an existing Notion page: find-and-replace its text, append Markdown, update title/columns/icon, and/or move it. A single call may combine all of these. THE STEPS ARE INDEPENDENT: they run in this order \u2014 (1) body content, (2) title/props/icon, (3) parent move \u2014 and a failure in one does NOT cancel the others. A failed old_str is a bad argument, not a broken page, so a valid title change or move still happens. The result then reports \u90E8\u5206\u6210\u529F with exactly what landed and what did not: retry ONLY the failed part, because resending the whole call re-applies the parts that already succeeded. `changed` lists what actually happened. There is NO whole-page replace in this tool: to rewrite everything, delete the old text with edits (new_str "") and append the new text in a second call. When the returned body was truncated the result says so \u2014 truncated markdown is not the full page, so do not derive the next old_str from it.',
+    description: TOOL_DESCRIPTIONS.pageEdit,
     timeoutMs: TOOL_TIMEOUTS.page,
     isConcurrencySafe: () => false,
     parameters: EDIT_PARAMETERS,
@@ -2643,21 +3107,19 @@ function createNotionPageEditTool(deps = {}) {
       const yes = hasYes ? readBoolean(args.yes, "yes") : false;
       if (hasYes && args.parent === void 0) {
         throw new InputError(
-          "yes \u53EA\u7528\u4E8E\u300C\u884C\u2192\u884C\u79FB\u52A8\u65F6\u8986\u76D6\u5DF2\u6709 Parent-item \u94FE\u63A5\u300D\uFF0C\u6CA1\u6709 parent \u65F6\u4F20 yes \u6CA1\u6709\u610F\u4E49\uFF1B\u8BF7\u53BB\u6389 yes\u3002\u672C\u6B21\u6CA1\u6709\u5199\u5165\u3002",
+          PAGE_ERRORS.createNotionPageEditTool_1,
           { field: "yes" }
         );
       }
       const appends = body !== void 0 && body.trim() !== "";
       if (edits.length > 0 && body !== void 0) {
         throw new InputError(
-          "edits\uFF08\u67E5\u627E\u66FF\u6362\uFF09\u548C body_content\uFF08\u8FFD\u52A0\u5230\u672B\u5C3E\uFF09\u4E0D\u80FD\u540C\u65F6\u4F20\uFF1A\u4E8C\u9009\u4E00\u3002\u9700\u8981\u65E2\u6539\u53C8\u8FFD\u52A0\u65F6\u8BF7\u5206\u4E24\u6B21\u8C03\u7528 notion_page_edit\u3002\u672C\u6B21\u6CA1\u6709\u5199\u5165\u3002",
+          PAGE_ERRORS.createNotionPageEditTool_2,
           { conflict: true, fields: ["edits", "body_content"] }
         );
       }
       if (edits.length === 0 && !appends && props === void 0 && title === void 0 && icon === void 0 && args.parent === void 0) {
-        throw new InputError(
-          "notion_page_edit \u9700\u8981 edits\u3001body_content\u3001props\u3001title\u3001icon\u3001parent \u81F3\u5C11\u4E00\u9879\uFF1B\u7A7A\u8C03\u7528\u4E0D\u4F1A\u4FEE\u6539\u9875\u9762\u3002" + (body !== void 0 ? "body_content \u662F\u7A7A\u767D\uFF1A\u8FFD\u52A0\u7A7A\u767D\u5185\u5BB9\u4E0D\u4F1A\u4FEE\u6539\u9875\u9762\u3002" : "\u8981\u8FFD\u52A0\u5185\u5BB9\u8BF7\u4F20 body_content\uFF08\u4E0D\u4F20 edits\uFF09\u3002")
-        );
+        throw new InputError(PAGE_ERRORS.createNotionPageEditTool_3({ bodyProvided: body !== void 0 }));
       }
       const params = {
         id,
@@ -2677,7 +3139,7 @@ function createNotionPageTrashTool(deps = {}) {
   const runner = deps.runNtn ?? runNtn;
   return defineNotionTool({
     name: "notion_page_trash",
-    description: "Move one Notion page or database row to the trash. yes:true is required, otherwise nothing is called. Three guards a bare delete does not give you: a database or data source is refused even with yes:true (deleting one destroys its rows too \u2014 ask the user to do it in Notion); a page that is already in the trash returns success with already_archived:true instead of an error; and a page with child pages is refused unless recursive:true, because Notion archives the whole subtree \u2014 the error lists the child ids so you can show the user exactly what else would go. Trash is idempotent: calling it twice is safe.",
+    description: TOOL_DESCRIPTIONS.pageTrash,
     timeoutMs: TOOL_TIMEOUTS.page,
     isConcurrencySafe: () => false,
     parameters: TRASH_PARAMETERS,
@@ -2694,7 +3156,7 @@ function createNotionPageTrashTool(deps = {}) {
       if (exec.signal?.aborted) throw abortError();
       if (args.yes === void 0 || !readBoolean(args.yes, "yes")) {
         throw new InputError(
-          'notion_page_trash \u4F1A\u5220\u9664\uFF08\u79FB\u5165\u56DE\u6536\u7AD9\uFF09\u9875\u9762\uFF0C\u5FC5\u987B\u663E\u5F0F\u4F20 yes: true\uFF08\u6216 "true" / "yes" / 1\uFF09\u624D\u4F1A\u8C03\u7528 ntn\uFF1B\u672C\u6B21\u6CA1\u6709\u8C03\u7528 ntn\u3002',
+          PAGE_ERRORS.createNotionPageTrashTool_1,
           { yes: args.yes }
         );
       }
@@ -2736,13 +3198,13 @@ function normalizeSort(sort) {
   for (const item of raw) {
     if (typeof item !== "string") {
       throw inputError(
-        `sort entries must be "Property asc|desc" strings, got ${describe(item)}.`,
+        QUERY_ERRORS.sortEntryNotString({ got: describe(item) }),
         { sort: item }
       );
     }
     const spec = item.trim();
     if (!spec) {
-      throw inputError('sort entries must be non-empty "Property asc|desc" strings.');
+      throw inputError(QUERY_ERRORS.sortEntryEmpty);
     }
     specs.push(spec);
   }
@@ -2977,32 +3439,32 @@ var QUERY_PARAMETERS = {
       // then degrades this whole tool's argument type to `unknown`. The empty case
       // is guarded at execution instead.
       type: "string",
-      description: "Notion data source id, database id, or Notion URL. If the database has multiple data sources, pass one data source id explicitly."
+      description: QUERY_PARAMS.database_or_data_source
     },
     limit: {
       type: "integer",
-      description: `Max rows per page (default ${DEFAULT_QUERY_LIMIT}, clamped to ${MAX_QUERY_LIMIT}).`
+      description: QUERY_PARAMS.limit({ fallback: DEFAULT_QUERY_LIMIT, max: MAX_QUERY_LIMIT })
     },
     start_cursor: {
       oneOf: [{ type: "string" }, { type: "null" }],
-      description: "Pagination cursor from a previous response's next_cursor. Omit for the first page."
+      description: QUERY_PARAMS.start_cursor
     },
     filter: {
       type: "object",
       additionalProperties: true,
-      description: "Raw Notion filter JSON object, passed through verbatim."
+      description: QUERY_PARAMS.filter
     },
     under: {
       type: "string",
-      description: "Only rows linked to this parent row (id or Notion URL), filtered through the data source's Parent-item / self-relation column. Combined with filter via AND; refuses when filter already targets that same relation column."
+      description: QUERY_PARAMS.sort
     },
     sort: {
       oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }],
-      description: 'Sort spec "Property asc|desc", or an ordered array of specs for multiple sorts.'
+      description: QUERY_PARAMS.under
     },
     include_content: {
       type: "boolean",
-      description: "Also fetch each row's Markdown with ntn pages get (default false; one extra call per row)."
+      description: QUERY_PARAMS.include_content
     }
   },
   required: ["database_or_data_source"],
@@ -3040,7 +3502,7 @@ function createNotionQueryTool(deps = {}) {
   const runner = deps.runNtn ?? runNtn;
   return defineNotionTool({
     name: "notion_query",
-    description: `Query the rows of a known Notion data source (or database) with a Notion filter, sort specs and cursor pagination; returns rows, next_cursor and has_more. This is not keyword search: find the data source with notion_search first when you only know a title, and read its schema with notion_get. Pass filter as a raw Notion filter JSON object and sort as "Property asc|desc" or an array of those. Use under to list only the child rows of one parent row; it filters the data source's Parent-item column and is ANDed with filter, so do not also filter that column in filter. When has_more is true, call again with next_cursor as start_cursor instead of raising limit, which is capped at 100. include_content defaults to false and costs one extra ntn pages get call per row.`,
+    description: TOOL_DESCRIPTIONS.query,
     timeoutMs: TOOL_TIMEOUTS.query,
     // Read-only: safe to run alongside sibling calls.
     isConcurrencySafe: () => true,
@@ -3078,7 +3540,7 @@ function normalizeQuery(query) {
   const value = typeof query === "string" ? query.trim() : "";
   if (!value) {
     throw inputError(
-      "notion_search requires a non-empty query: pass a keyword. Notion search matches titles (page/database names), not page body text."
+      SEARCH_ERRORS.emptyQuery
     );
   }
   return value;
@@ -3194,7 +3656,7 @@ function createNotionSearchTool(deps = {}) {
   const runner = deps.run ?? defaultDeps.run;
   return defineNotionTool({
     name: "notion_search",
-    description: 'Search Notion by TITLE; returns id, title, URL and object type (page|database). MATCHING IS TOKEN-OR, NOT SUBSTRING: the query is split into words and any title containing ANY ONE of them comes back, ranked \u2014 so a long query yields loosely-related hits, not just the one you meant. Wrap a known EXACT title in double quotes ("PRD \xB7 notion_page") to get exactly that hit. TITLES only: body text is never searched, and a 0-hit result does NOT prove absence (a fresh page may not be indexed for a second or two; retry once). A hit is not proof it is the right object: verify with notion_get. Use filter_object or limit to narrow; prefer refining the query over raising limit.',
+    description: TOOL_DESCRIPTIONS.search,
     timeoutMs: TOOL_TIMEOUTS.search,
     // Read-only and independent of every other call: safe to run alongside siblings.
     isConcurrencySafe: () => true,
@@ -3203,16 +3665,16 @@ function createNotionSearchTool(deps = {}) {
       properties: {
         query: {
           type: "string",
-          description: "Keyword matched against object TITLES only (never body text). See the tool description for how matching works: it is token-OR, and an exact title in double quotes is the precise lookup."
+          description: SEARCH_PARAMS.query
         },
         limit: {
           type: "integer",
-          description: `Max results (default ${DEFAULT_LIMIT}). Values above ${MAX_LIMIT} are clamped to ${MAX_LIMIT}.`
+          description: SEARCH_PARAMS.limit({ fallback: DEFAULT_LIMIT, max: MAX_LIMIT })
         },
         filter_object: {
           type: "string",
           enum: ["page", "database"],
-          description: "Restrict hits to pages or databases (data sources). Omit to search both."
+          description: SEARCH_PARAMS.filter_object
         }
       },
       required: ["query"],
