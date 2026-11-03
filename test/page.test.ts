@@ -1960,3 +1960,65 @@ describe("notion_page_create: no parent means the WORKSPACE ROOT, not an error",
     assert.equal(ok.isError, false, text(ok));
   });
 });
+
+describe("arguments the API accepts must not be refused", () => {
+  /**
+   * Every restriction here was invented by the tool, not by Notion. Each was verified
+   * against the live API before being relaxed: a URL parent, a newline in a title, and a
+   * search limit above the old arbitrary 25 all work upstream.
+   */
+  function createOk(): (args: string[]) => RunNtnResult {
+    return (args) => {
+      if (args[0] === "pages" && args[1] === "create") {
+        return ntnOk({ object: "page", id: NEW_PAGE_ID, url: "https://app.notion.com/p/x" });
+      }
+      // A bare-id parent is classified by reading the page, so the fake must answer with
+      // a real parent — otherwise the "is it a page or a row?" probe has nothing to go on.
+      if (args[0] === "api" && args[1] === `v1/pages/${ACCEPTANCE.parentPageId}` && args[3] !== "PATCH") {
+        return pageWithParent({ type: "workspace", workspace: true });
+      }
+      if (args[0] === "api" && String(args[1] ?? "").startsWith("v1/pages/")) {
+        return ntnOk({ object: "page", id: NEW_PAGE_ID });
+      }
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    };
+  }
+
+  it("accepts a Notion URL as parent, extracting the id the way `id` already does", async () => {
+    const { tool, calls } = createHarness(createOk());
+    const url = `https://app.notion.com/p/Some-Title-${ACCEPTANCE.parentPageId.replace(/-/g, "")}`;
+    const result = await tool.execute("create-url-parent", {
+      parent: `page:${url}`,
+      title: "从 URL 建页",
+    });
+
+    assert.equal(result.isError, false, text(result));
+    const create = calls.find((a) => a[0] === "pages" && a[1] === "create");
+    assert.ok(create, "no pages create call");
+    const index = create.indexOf("--parent");
+    // The id must have been extracted; the URL itself would be rejected upstream.
+    assert.equal(create[index + 1], `page:${ACCEPTANCE.parentPageId}`);
+  });
+
+  it("accepts a bare Notion URL as parent too", async () => {
+    const { tool, calls } = createHarness(createOk());
+    const url = `https://www.notion.so/${ACCEPTANCE.parentPageId.replace(/-/g, "")}`;
+    const result = await tool.execute("create-bare-url-parent", { parent: url, title: "t" });
+
+    assert.equal(result.isError, false, text(result));
+    const create = calls.find((a) => a[0] === "pages" && a[1] === "create");
+    const index = create!.indexOf("--parent");
+    assert.equal(create![index + 1], `page:${ACCEPTANCE.parentPageId}`);
+  });
+
+  it("accepts a newline in title instead of rejecting it (Notion normalises it to a space)", async () => {
+    const { tool, calls } = createHarness(createOk());
+    const result = await tool.execute("create-newline-title", {
+      title: "第一行\n第二行",
+      body_content: "正文",
+    });
+
+    assert.equal(result.isError, false, text(result));
+    assert.ok(calls.length > 0, "ntn should have been called");
+  });
+});

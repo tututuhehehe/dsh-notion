@@ -210,7 +210,7 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
 | 写法 | `notion_page_create` | `notion_page_edit`（移动） |
 | --- | --- | --- |
 | **省略 `parent`** | **建在工作区根级**（Notion 的默认位置；这种页只有 title，`props` 不能带列） | —（移动必须给 `parent`） |
-| `page:<id>` | 该页面下的子页面 | 移到该页面下（`POST /v1/pages/{id}/move`） |
+| `page:<id>` 或 `page:<URL>` | 该页面下的子页面 | 移到该页面下（`POST /v1/pages/{id}/move`） |
 | `<裸 page id>` | 同上（先确认它确实不是数据库行） | 同上 |
 | `<裸 row id>` | 该行所在 data source 下的子行，并设好 Parent-item 关系 | 重新指向该行的 Parent-item 关系 |
 | `data-source:<id>` | 该 data source 里的同级行 | ❌ 不接受（加行请用 `create`） |

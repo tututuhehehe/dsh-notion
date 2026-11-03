@@ -89,9 +89,9 @@ describe("normalizeLimit", () => {
   it("defaults to 10", () => {
     assert.equal(normalizeLimit(undefined), DEFAULT_LIMIT);
   });
-  it("clamps above 25", () => {
-    assert.equal(normalizeLimit(25), 25);
-    assert.equal(normalizeLimit(26), MAX_LIMIT);
+  it("clamps above 50", () => {
+    assert.equal(normalizeLimit(50), 50);
+    assert.equal(normalizeLimit(51), MAX_LIMIT);
     assert.equal(normalizeLimit(1000), MAX_LIMIT);
   });
   it("rejects <= 0 and non-numeric values", () => {

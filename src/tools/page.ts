@@ -419,7 +419,8 @@ function normalizeProps(raw: unknown): Record<string, unknown> | undefined {
 function normalizeTitle(raw: unknown): string | undefined {
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw !== "string") throw new InputError("title 必须是字符串。");
-  if (/[\r\n]/.test(raw)) throw new InputError("title 不能包含换行。");
+  // A newline is NOT rejected: Notion accepts one in a title and normalises it to a space
+  // (verified live: "a\nb" is stored as "a b"). Refusing it would reject input the API takes.
   const title = raw.trim();
   return title || undefined;
 }
@@ -439,19 +440,25 @@ function parseParentSpec(raw: unknown, op: "create" | "move"): ParentSpec {
   const value = raw.trim();
   const match = /^(page|database|data[_-]?source)\s*:\s*(.+)$/i.exec(value);
   if (!match) {
-    if (!isNotionId(value)) {
+    // A caller holding a link hands over the link — same tolerance `id` already has
+    // (`requireId`), so the two cannot disagree about whether a URL is acceptable.
+    const bare = isNotionId(value) ? value : extractNotionId(value);
+    if (!bare) {
       throw new InputError(
-        `parent 格式无效：${describeValue(raw)}。用法：${usage}。只接受 Notion id（32 位 hex 或 UUID，不要贴整条 URL）。`
+        `parent 格式无效：${describeValue(raw)}。用法：${usage}。` +
+          "接受 Notion id（32 位 hex / UUID）或该对象的 Notion URL。"
       );
     }
-    return { bare: true, id: value };
+    return { bare: true, id: bare };
   }
   const kindRaw = match[1].toLowerCase().replace("_", "-");
   const kind: ParentKind = kindRaw === "data-source" ? "data_source" : (kindRaw as ParentKind);
-  const id = match[2].trim();
-  if (!isNotionId(id)) {
+  const rawId = match[2].trim();
+  const id = isNotionId(rawId) ? rawId : extractNotionId(rawId);
+  if (!id) {
     throw new InputError(
-      `parent 里的 id 无效：${describeValue(match[2])}。只接受 Notion id（32 位 hex 或 UUID，不要贴整条 URL），例如 data-source:716f546f-1824-45f0-b73a-481bf8b5f5db。`
+      `parent 里的 id 无效：${describeValue(match[2])}。接受 Notion id（32 位 hex / UUID）或 URL，` +
+        "例如 data-source:716f546f-1824-45f0-b73a-481bf8b5f5db。"
     );
   }
   return { bare: false, kind, id };
@@ -2671,7 +2678,7 @@ const CREATE_PARAMETERS = {
     parent: {
       type: "string",
       description:
-        "Where the page goes. OMIT it to create the page at the WORKSPACE ROOT (Notion's default when no parent is given; such a page only has a title, so props cannot carry columns). Otherwise: page:<id> (child page), database:<id> | data-source:<id> (a row in that database), or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / self-relation column).",
+        "Where the page goes. OMIT it to create the page at the WORKSPACE ROOT (Notion's default when no parent is given; such a page only has a title, so props cannot carry columns). Otherwise: page:<id> (child page), database:<id> | data-source:<id> (a row in that database), or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / self-relation column). A Notion URL is accepted anywhere an id is: the id is extracted from it.",
     },
     title: {
       type: "string",
@@ -2722,7 +2729,7 @@ const EDIT_PARAMETERS = {
     parent: {
       type: "string",
       description:
-        "Move the page: page:<id> (under that page), or a bare PAGE id, or a bare ROW id (re-link the Parent-item relation of that row). Database/data source parents are not accepted — use notion_page_create to add a row.",
+        "Move the page: page:<id> (under that page), or a bare PAGE id, or a bare ROW id (re-link the Parent-item relation of that row). A Notion URL is accepted anywhere an id is. Database/data source parents are not accepted — use notion_page_create to add a row.",
     },
     yes: {
       type: "boolean",

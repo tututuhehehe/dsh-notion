@@ -947,7 +947,6 @@ function normalizeProps(raw) {
 function normalizeTitle(raw) {
   if (raw === void 0 || raw === null) return void 0;
   if (typeof raw !== "string") throw new InputError("title \u5FC5\u987B\u662F\u5B57\u7B26\u4E32\u3002");
-  if (/[\r\n]/.test(raw)) throw new InputError("title \u4E0D\u80FD\u5305\u542B\u6362\u884C\u3002");
   const title = raw.trim();
   return title || void 0;
 }
@@ -959,19 +958,21 @@ function parseParentSpec(raw, op) {
   const value = raw.trim();
   const match = /^(page|database|data[_-]?source)\s*:\s*(.+)$/i.exec(value);
   if (!match) {
-    if (!isNotionId(value)) {
+    const bare = isNotionId(value) ? value : extractNotionId(value);
+    if (!bare) {
       throw new InputError(
-        `parent \u683C\u5F0F\u65E0\u6548\uFF1A${describeValue(raw)}\u3002\u7528\u6CD5\uFF1A${usage}\u3002\u53EA\u63A5\u53D7 Notion id\uFF0832 \u4F4D hex \u6216 UUID\uFF0C\u4E0D\u8981\u8D34\u6574\u6761 URL\uFF09\u3002`
+        `parent \u683C\u5F0F\u65E0\u6548\uFF1A${describeValue(raw)}\u3002\u7528\u6CD5\uFF1A${usage}\u3002\u63A5\u53D7 Notion id\uFF0832 \u4F4D hex / UUID\uFF09\u6216\u8BE5\u5BF9\u8C61\u7684 Notion URL\u3002`
       );
     }
-    return { bare: true, id: value };
+    return { bare: true, id: bare };
   }
   const kindRaw = match[1].toLowerCase().replace("_", "-");
   const kind = kindRaw === "data-source" ? "data_source" : kindRaw;
-  const id = match[2].trim();
-  if (!isNotionId(id)) {
+  const rawId = match[2].trim();
+  const id = isNotionId(rawId) ? rawId : extractNotionId(rawId);
+  if (!id) {
     throw new InputError(
-      `parent \u91CC\u7684 id \u65E0\u6548\uFF1A${describeValue(match[2])}\u3002\u53EA\u63A5\u53D7 Notion id\uFF0832 \u4F4D hex \u6216 UUID\uFF0C\u4E0D\u8981\u8D34\u6574\u6761 URL\uFF09\uFF0C\u4F8B\u5982 data-source:716f546f-1824-45f0-b73a-481bf8b5f5db\u3002`
+      `parent \u91CC\u7684 id \u65E0\u6548\uFF1A${describeValue(match[2])}\u3002\u63A5\u53D7 Notion id\uFF0832 \u4F4D hex / UUID\uFF09\u6216 URL\uFF0C\u4F8B\u5982 data-source:716f546f-1824-45f0-b73a-481bf8b5f5db\u3002`
     );
   }
   return { bare: false, kind, id };
@@ -2394,7 +2395,7 @@ var CREATE_PARAMETERS = {
   properties: {
     parent: {
       type: "string",
-      description: "Where the page goes. OMIT it to create the page at the WORKSPACE ROOT (Notion's default when no parent is given; such a page only has a title, so props cannot carry columns). Otherwise: page:<id> (child page), database:<id> | data-source:<id> (a row in that database), or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / self-relation column)."
+      description: "Where the page goes. OMIT it to create the page at the WORKSPACE ROOT (Notion's default when no parent is given; such a page only has a title, so props cannot carry columns). Otherwise: page:<id> (child page), database:<id> | data-source:<id> (a row in that database), or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / self-relation column). A Notion URL is accepted anywhere an id is: the id is extracted from it."
     },
     title: {
       type: "string",
@@ -2433,7 +2434,7 @@ var EDIT_PARAMETERS = {
     icon: { oneOf: ICON_PARAMETERS, description: "New page icon; null clears it." },
     parent: {
       type: "string",
-      description: "Move the page: page:<id> (under that page), or a bare PAGE id, or a bare ROW id (re-link the Parent-item relation of that row). Database/data source parents are not accepted \u2014 use notion_page_create to add a row."
+      description: "Move the page: page:<id> (under that page), or a bare PAGE id, or a bare ROW id (re-link the Parent-item relation of that row). A Notion URL is accepted anywhere an id is. Database/data source parents are not accepted \u2014 use notion_page_create to add a row."
     },
     yes: {
       type: "boolean",
@@ -2995,7 +2996,7 @@ function createNotionQueryTool(deps = {}) {
 
 // src/tools/search.ts
 var DEFAULT_LIMIT = 10;
-var MAX_LIMIT = 25;
+var MAX_LIMIT = 50;
 var SEARCH_PATH = "v1/search";
 var defaultDeps = { run: runNtn };
 function normalizeQuery(query) {
@@ -3141,14 +3142,14 @@ function formatOutcome(outcome) {
     return `${index + 1}. ${hit.object} \xB7 ${title}
    id: ${hit.id}${url}`;
   });
-  const footer = outcome.hasMore && outcome.results.length > 0 ? ["More results exist upstream: narrow the query or raise limit (max 25)."] : [];
+  const footer = outcome.hasMore && outcome.results.length > 0 ? [`More results exist upstream: narrow the query or raise limit (max ${MAX_LIMIT}).`] : [];
   return [header, ...body, ...footer].join("\n");
 }
 function createNotionSearchTool(deps = {}) {
   const runner = deps.run ?? defaultDeps.run;
   return defineNotionTool({
     name: "notion_search",
-    description: `Search the Notion workspace by TITLE and return hits with id, title, URL and object type (page|database|data_source). MATCHING IS TOKEN-OR, NOT SUBSTRING \u2014 this is the single most important thing to know: Notion splits the query into words and returns anything whose title contains ANY ONE of them, ranked. So a long query returns loosely-related pages that share one word, and hit #1 is often unrelated. Example from a real workspace: querying a page's full title returns 10 hits, only one of which is that page. TO LOOK UP ONE KNOWN PAGE, WRAP THE EXACT TITLE IN DOUBLE QUOTES (\\"PRD \xB7 notion_page\\") \u2014 that returns exactly that page. Do that FIRST whenever you already know the title. Titles only: page body text is never searched, so a term that appears only in the body finds nothing. An empty result does NOT prove the object is missing (a just-created page is not indexed for a second or two; retry once before concluding absence). Use filter_object to cut noise, and prefer refining the query over raising limit (capped at 25). Verify before you act: ids from here must be confirmed with notion_get, because a loosely related hit looks like a legitimate match. For a data_source hit, notion_get/notion_query need data-source:<id> or database:<id> to be unambiguous.`,
+    description: `Search the Notion workspace by TITLE and return hits with id, title, URL and object type (page|database|data_source). MATCHING IS TOKEN-OR, NOT SUBSTRING \u2014 this is the single most important thing to know: Notion splits the query into words and returns anything whose title contains ANY ONE of them, ranked. So a long query returns loosely-related pages that share one word, and hit #1 is often unrelated. Example from a real workspace: querying a page's full title returns 10 hits, only one of which is that page. TO LOOK UP ONE KNOWN PAGE, WRAP THE EXACT TITLE IN DOUBLE QUOTES (\\"PRD \xB7 notion_page\\") \u2014 that returns exactly that page. Do that FIRST whenever you already know the title. Titles only: page body text is never searched, so a term that appears only in the body finds nothing. An empty result does NOT prove the object is missing (a just-created page is not indexed for a second or two; retry once before concluding absence). Use filter_object to cut noise, and prefer refining the query over raising limit (capped at 50). Verify before you act: ids from here must be confirmed with notion_get, because a loosely related hit looks like a legitimate match. For a data_source hit, notion_get/notion_query need data-source:<id> or database:<id> to be unambiguous.`,
     timeoutMs: TOOL_TIMEOUTS.search,
     // Read-only and independent of every other call: safe to run alongside siblings.
     isConcurrencySafe: () => true,

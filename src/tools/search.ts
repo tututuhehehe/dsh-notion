@@ -6,7 +6,7 @@
  * 不用去啃 Notion 原始 page/data_source 对象（那玩意儿一条就上千 token）。
  *
  * 设计要点：
- * - limit 默认 10、上限 25（一次 `page_size` 就能覆盖，所以不做翻页；见 AGENTS「out of scope v1」）。
+ * - limit 默认 10、上限 50（Notion 的 `page_size` 硬上限是 100；50 是产品取舍）。
  * - `filter_object` 用 `page` / `database` 这套模型熟悉的词；Notion 新版 API 把 database 改叫
  *   data_source，所以只在**发请求时**翻译（`value: "data_source"`），返回里再翻回 `database`。
  * - 依赖注入 runner：单测拿假 runner 顶替 runNtn，不需要 PATH 上的 ntn、不需要真 Notion 账号。
@@ -27,8 +27,13 @@ import { parseJsonStdout, runNtn } from "../lib/runNtn.ts";
 import type { RunNtnOptions, RunNtnResult } from "../lib/runNtn.ts";
 
 export const DEFAULT_LIMIT = 10;
-/** Notion `v1/search` 的 `page_size` 上限是 100，我们的上限（25）在它之内，一次请求就够。 */
-export const MAX_LIMIT = 25;
+/**
+ * Notion `v1/search` accepts `page_size` up to 100. We expose 50: the API's own ceiling
+ * would let one call pour 100 hits into the context, and trimming that is a product
+ * choice the caller cannot override — so the number is stated in the description instead
+ * of being discovered by failing.
+ */
+export const MAX_LIMIT = 50;
 const SEARCH_PATH = "v1/search";
 
 export type FilterObject = "page" | "database";
@@ -94,7 +99,7 @@ export function normalizeQuery(query: unknown): string {
   return value;
 }
 
-/** limit：缺省 10，`<= 0` 直接拒绝，超过 25 夹到 25（不静默放大到 Notion 的 100） */
+/** limit：缺省 10，`<= 0` 拒绝，超过 50 夹到 50（Notion 的硬上限是 100） */
 export function normalizeLimit(limit: unknown): number {
   if (limit === undefined || limit === null) return DEFAULT_LIMIT;
   // Same tolerance as notion_query: a numeric string or a fraction is a phrasing
@@ -283,7 +288,7 @@ export function formatOutcome(outcome: SearchOutcome): string {
   // 0 条 + has_more 时不要同时说 "No matches" 和 "More results exist"，那是自相矛盾的
   const footer =
     outcome.hasMore && outcome.results.length > 0
-      ? ["More results exist upstream: narrow the query or raise limit (max 25)."]
+      ? [`More results exist upstream: narrow the query or raise limit (max ${MAX_LIMIT}).`]
       : [];
   return [header, ...body, ...footer].join("\n");
 }
@@ -309,7 +314,7 @@ export function createNotionSearchTool(deps: Partial<SearchDeps> = {}): NotionTo
       "Titles only: page body text is never searched, so a term that appears only in the body finds nothing. " +
       "An empty result does NOT prove the object is missing (a just-created page is not indexed for a " +
       "second or two; retry once before concluding absence). " +
-      "Use filter_object to cut noise, and prefer refining the query over raising limit (capped at 25). " +
+      "Use filter_object to cut noise, and prefer refining the query over raising limit (capped at 50). " +
       "Verify before you act: ids from here must be confirmed with notion_get, because a loosely related hit " +
       "looks like a legitimate match. For a data_source hit, notion_get/notion_query need " +
       "data-source:<id> or database:<id> to be unambiguous.",
