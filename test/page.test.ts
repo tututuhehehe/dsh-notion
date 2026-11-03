@@ -2022,3 +2022,57 @@ describe("arguments the API accepts must not be refused", () => {
     assert.ok(calls.length > 0, "ntn should have been called");
   });
 });
+
+describe("notion_page_edit: `$` escaping is handled by the tool, not the caller", () => {
+  /**
+   * notion_get renders a stored `$` as `\$`. A caller copying that into `new_str` used to
+   * store a LITERAL backslash-dollar and visibly corrupt the text (verified live). The
+   * escape is now removed before the request is sent, so nobody has to remember the
+   * asymmetry between reading and writing.
+   */
+  function capture(): { calls: string[][]; handler: (args: string[]) => RunNtnResult } {
+    const calls: string[][] = [];
+    return {
+      calls,
+      handler: (args) => {
+        calls.push(args);
+        if (String(args[1] ?? "").endsWith("/markdown")) return markdownOk("ok");
+        if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}` && args[3] !== "PATCH") {
+          return pageWithParent(DS_PARENT);
+        }
+        return ntnFail(`unexpected: ${args.join(" ")}`);
+      },
+    };
+  }
+
+  const sentNewStr = (calls: string[][]): string => {
+    const call = calls.find((a) => String(a[1] ?? "").endsWith("/markdown"));
+    assert.ok(call, "no markdown request");
+    // The argv is ["api", path, "-X", "PATCH", "--data", <json>] — the body is the element
+    // AFTER the flag, not a `--data=<json>` pair.
+    const index = call.indexOf("--data");
+    assert.notEqual(index, -1, "no --data argument");
+    const body = JSON.parse(call[index + 1]!);
+    return body.update_content.content_updates[0].new_str;
+  };
+
+  it("strips the escape from new_str before sending", async () => {
+    const { calls, handler } = capture();
+    const { tool } = editHarness(handler);
+    await tool.execute("dollar-escaped", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "x", new_str: "cost \\$5" }],
+    });
+    assert.equal(sentNewStr(calls), "cost $5", "the escape must not reach Notion as a literal");
+  });
+
+  it("leaves a bare $ alone", async () => {
+    const { calls, handler } = capture();
+    const { tool } = editHarness(handler);
+    await tool.execute("dollar-bare", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "x", new_str: "cost $5" }],
+    });
+    assert.equal(sentNewStr(calls), "cost $5");
+  });
+});

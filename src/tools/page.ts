@@ -2859,21 +2859,16 @@ export function createNotionPageCreateTool(deps: NotionPageDeps = {}): NotionToo
   return defineNotionTool<PageToolValue>({
     name: "notion_page_create",
     description:
-      "Create one Notion page or database row. " +
-      "parent says where it goes and may be OMITTED: without it the page is created at the WORKSPACE ROOT " +
-      "(a real location, not an error — that page only has a title, so props cannot carry columns). " +
-      "With it: page:<id> (child page), database:<id> | data-source:<id> (a row in that database), " +
-      "or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / " +
-      "self-relation column). " +
-      "body_content is the page Markdown and icon is the page icon — both are TOP-LEVEL parameters, not props keys. " +
-      "props carries database COLUMNS only (name → simplified value), converted by the parent's column types; " +
-      "unknown names and read-only columns are rejected with the writable ones in hint_properties. " +
-      "A page inside a database still needs a title (the title parameter, the title property in props, or a " +
-      "leading \"# Heading\" in body_content). " +
-      "The columns and icon are written by a second request; if that request fails the new page is trashed so no " +
-      "half-made page is left behind, and the error says whether cleanup worked (rollback: trashed | trash_failed | " +
-      "unknown_id; partial:true means something was left behind). " +
-      "To add content later use notion_page_edit (find-and-replace or append); this tool never edits an existing page.",
+      "Create one Notion page or database row. This tool never modifies an existing page — use " +
+      "notion_page_edit for that. " +
+      "`parent` is OPTIONAL: omit it to create the page at the WORKSPACE ROOT (Notion's own default; such a " +
+      "page has only a title, so props cannot carry columns). " +
+      "A page created inside a database needs a title: the `title` parameter, the title property in props, or " +
+      "a leading \"# Heading\" in body_content. " +
+      "Creating takes a SECOND request for the columns and icon. If that request fails the new page is trashed " +
+      "so no half-made page is left behind, and the error reports whether the cleanup worked (`rollback`) — " +
+      "partial:true means something was left behind. " +
+      "A successful result reports the title, the body it wrote, the columns and the icon separately.",
     timeoutMs: TOOL_TIMEOUTS.page,
     // Every operation here can write, so page calls stay exclusive: never overlap two.
     isConcurrencySafe: () => false,

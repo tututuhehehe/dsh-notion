@@ -133,6 +133,76 @@ function describe(value) {
   }
 }
 
+// src/lib/failures.ts
+var SNIPPET_LIMIT = 300;
+var FAILURE_HINTS = [
+  {
+    match: /not found on PATH|ENOENT/i,
+    hint: "Hint: the Notion CLI is not installed where this process can see it. Install it with `npm i -g ntn` (or `curl -fsSL https://ntn.dev | bash`), then run `ntn login`."
+  },
+  {
+    // The binary exists but the OS refused to execute it — a different fix from "missing".
+    match: /EACCES|EPERM/i,
+    hint: "Hint: `ntn` was found but the OS refused to execute it (EACCES/EPERM). Fix the file's permissions or its mount options; reinstalling will not help while the permission is wrong."
+  },
+  {
+    match: /api token is invalid|unauthorized|\b401\b|invalid_token/i,
+    hint: "Hint: the token was rejected. Set a valid NOTION_API_TOKEN (or run `ntn login`), and make sure the target pages/databases are shared with that integration."
+  },
+  {
+    match: /no workspace selected|not logged in|not authenticated/i,
+    hint: "Hint: not authenticated yet. Run `ntn login`, or set NOTION_API_TOKEN (plus NOTION_WORKSPACE_ID for multi-workspace tokens), then share the target pages/databases with the integration."
+  },
+  {
+    match: /restricted_resource|\b403\b|could not find (page|database)|object_not_found|\b404\b|does not have access|not shared/i,
+    hint: "Hint: the object exists but this integration cannot see it (or it does not exist). In Notion open the page/database, use \u2022\u2022\u2022 \u2192 Connections, and add the integration. A 404 and a missing permission look identical to the API."
+  },
+  {
+    match: /rate_limited|\b429\b|too many requests/i,
+    hint: "Hint: Notion rate-limited the request. Wait a moment and retry the same call; if it repeats, reduce how many calls you make in a burst (for example lower `limit`, or skip `include_content`)."
+  },
+  {
+    match: /\b5\d\d\b|internal_server_error|service_unavailable|gateway_timeout|service_overload/i,
+    hint: "Hint: Notion returned a server-side error. This is usually transient \u2014 retry once; if it keeps failing the request is probably too large or malformed rather than unlucky."
+  },
+  {
+    match: /ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|socket hang up|network/i,
+    hint: "Hint: the request could not reach Notion (network/DNS). Check connectivity and retry."
+  },
+  {
+    match: /timed out after \d+ms|no exit code/i,
+    hint: "Hint: the `ntn` process was killed by our own timeout. Narrow the request (lower `limit`, avoid `include_content`) or retry; a repeated timeout is not a credential problem."
+  },
+  {
+    // ntn's own wrapper message, with the underlying cause discarded. We cannot tell
+    // which of the above it was, so we say exactly that instead of guessing.
+    match: /failed to execute public API request/i,
+    hint: "Hint: `ntn` discarded the underlying cause here (its own wording), so the reason is genuinely unknown from this error. Retry once; if it persists, check the token, the workspace, and whether the target is shared with the integration, in that order."
+  }
+];
+function snippet(text2) {
+  const trimmed = text2.trim();
+  if (!trimmed) return "<empty>";
+  return trimmed.length > SNIPPET_LIMIT ? `${trimmed.slice(0, SNIPPET_LIMIT)}\u2026` : trimmed;
+}
+function failureHint(result) {
+  const text2 = `${result.stderr}
+${result.stdout}`;
+  if (!text2.trim()) return void 0;
+  return FAILURE_HINTS.find((entry) => entry.match.test(text2))?.hint;
+}
+function failureStatus(result) {
+  return result.code === null ? "no exit code (timed out or could not start)" : `exit ${result.code}`;
+}
+function describeFailure(result, label) {
+  const detail = result.stderr.trim() || result.stdout.trim();
+  return [
+    `${label ? `${label}: ` : ""}ntn ${failureStatus(result)}.`,
+    detail ? snippet(detail) : "ntn printed no error text.",
+    failureHint(result)
+  ].filter((part) => Boolean(part)).join("\n");
+}
+
 // src/lib/ids.ts
 var UUID_TOKEN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 var BARE_TOKEN = "[0-9a-f]{32}";
@@ -327,7 +397,7 @@ function renderGetResult(value) {
 function createNotionGetTool(run = runNtn) {
   return defineNotionTool({
     name: "notion_get",
-    description: "Read one Notion page or inspect one database. A page returns Markdown (format='md', default) with its properties as frontmatter, or a structured payload (format='json') that also carries url, title, truncated and unknown_block_ids. A database returns every data source id plus each property's name, type, writable flag and Parent-item / self-relation candidates; rows are never fetched here, so read them with notion_query. If a page comes back truncated, ask for format='json' to see unknown_block_ids or read a narrower page.",
+    description: "Read one Notion page or inspect one database. A page returns Markdown (format='md', default) with its properties as frontmatter, or a structured payload (format='json') that also carries url, title, truncated and unknown_block_ids. A database returns every data source id plus each property's name, type, writable flag and Parent-item / self-relation candidates; rows are never fetched here, so read them with notion_query. If a page comes back truncated (rare), format='json' shows unknown_block_ids; the truncated Markdown lists the next steps.",
     timeoutMs: TOOL_TIMEOUTS.get,
     // Read-only: safe to run alongside sibling calls.
     isConcurrencySafe: () => true,
@@ -364,24 +434,25 @@ async function executeNotionGet(params, run = runNtn) {
   }
   const page = await runPage(id, format, run);
   if (page.ok) return page.value;
-  if (isFatalCliError(page.res)) throw new Error(fatalCliMessage(page.res));
-  const pageError = errorSummary(page.res);
+  if (isFatalCliError(page.res)) throw new Error(describeFailure(page.res, "notion_get failed"));
   if (shouldTryDatabase(page.res)) {
     const database = await runDatabase(id, run);
     if (database.ok) return database.value;
-    if (isFatalCliError(database.res)) throw new Error(fatalCliMessage(database.res));
-    const databaseError = errorSummary(database.res);
+    if (isFatalCliError(database.res)) {
+      throw new Error(describeFailure(database.res, "notion_get failed"));
+    }
     const dataSource = await runDataSourceSchema(id, run);
     if (dataSource.ok) return dataSource.value;
+    const hint = failureHint(page.res) ?? failureHint(database.res) ?? "Make sure the target is shared with the Notion integration (in Notion: \u2022\u2022\u2022 \u2192 Connections).";
     throw new Error(
       `Could not read ${id} as a page, database or data source.
-- ntn pages get: ${pageError}
-- ntn datasources resolve: ${databaseError}
+- ntn pages get: ${errorSummary(page.res)}
+- ntn datasources resolve: ${errorSummary(database.res)}
 - ntn api v1/data_sources: ${dataSource.excerpt}
-Make sure the target is shared with the Notion integration (in Notion: \u2022\u2022\u2022 \u2192 Connections).`
+` + hint
     );
   }
-  throw new Error(`Could not read page ${id}: ${pageError}`);
+  throw new Error(describeFailure(page.res, `notion_get could not read ${id}`));
 }
 async function runDataSourceSchema(id, run) {
   let res;
@@ -621,7 +692,7 @@ function renderPageText(page) {
   const body = page.markdown.trim() ? page.markdown : "(This page has no readable content.)";
   return page.truncated ? `${body}
 
-[notion_get] ntn truncated this page; use format="json" to inspect unknown_block_ids, or read a narrower page.` : body;
+[notion_get] ntn truncated this page, so the text above is incomplete (rare: most pages, even very large ones, come back whole). Next: format="json" returns unknown_block_ids, child pages can be read by their own ids, notion_page_edit takes an exact old_str from the part above, and for a database notion_query reads its rows with limit / start_cursor.` : body;
 }
 function renderDatabaseText(result) {
   const lines = [];
@@ -692,17 +763,6 @@ function shouldTryDatabase(res) {
   const text2 = `${res.stderr}
 ${res.stdout}`;
   return !TRANSIENT_ERROR_RE.test(text2);
-}
-function fatalCliMessage(res) {
-  const summary = errorSummary(res);
-  if (res.code === null) {
-    if (/ntn not found on path/i.test(res.stderr)) return res.stderr.trim();
-    if (/timed out/i.test(res.stderr)) {
-      return `Notion CLI timed out: ${summary}. Retry, or read a smaller page.`;
-    }
-    return `Could not run \`ntn\`: ${summary}`;
-  }
-  return `Notion CLI is not authenticated or configured: ${summary}. Run \`ntn login\` or set NOTION_API_TOKEN.`;
 }
 function parseJsonOrThrow(stdout, what) {
   try {
@@ -1001,14 +1061,18 @@ function parseJsonMaybe(stdout) {
 function ntnFailure(label, result, note) {
   const detail = (result.stderr || result.stdout || "").trim();
   const exit = result.code === null ? "" : `\uFF08exit ${result.code}\uFF09`;
+  const hint = failureHint(result);
+  const status = result.code === null && !detail ? `\uFF08${failureStatus(result)}\uFF09` : exit;
   return new NotionToolError(
-    `${note ? `${note}\uFF1B` : ""}${label} \u5931\u8D25${exit}${detail ? `\uFF1A${truncate(detail)}` : ""}`,
+    `${note ? `${note}\uFF1B` : ""}${label} \u5931\u8D25${status}${detail ? `\uFF1A${truncate(detail)}` : ""}` + (hint ? `
+${hint}` : ""),
     {
       code: NOTION_ERROR_CODES.ntnFailed,
       details: {
-        stderr: result.stderr.trim(),
+        stderr: snippet(result.stderr),
         stdout: truncate(result.stdout.trim()),
-        code: result.code
+        code: result.code,
+        ...hint ? { hint } : {}
       }
     }
   );
@@ -1590,6 +1654,12 @@ function describePageValue(value) {
   if (value.cycle_check === "partial") {
     lines.push("\u6CE8\u610F\uFF1A\u9875\u9762\u7956\u5148\u94FE\u672A\u80FD\u5B8C\u6574\u8BFB\u53D6\uFF0C\u6DF1\u5C42\u73AF\u68C0\u67E5\u4E3A best-effort\uFF08cycle_check: partial\uFF09");
   }
+  if (value.created) {
+    if (value.title) lines.push(`\u6807\u9898\uFF1A${value.title}`);
+    lines.push(
+      value.body_chars ? `\u6B63\u6587\uFF1A\u5DF2\u5199\u5165 ${value.body_chars} \u5B57` : "\u6B63\u6587\uFF1A\u672A\u63D0\u4EA4\u6B63\u6587\u5185\u5BB9\uFF08\u672C\u6B21\u53EA\u6709\u6807\u9898/\u5C5E\u6027\uFF09"
+    );
+  }
   if (value.properties.length) lines.push(`\u5DF2\u5199\u5165\u5217\uFF1A${value.properties.join(", ")}`);
   if (value.icon !== void 0) lines.push(`icon: ${value.icon ?? "\uFF08\u5DF2\u6E05\u9664\uFF09"}`);
   if (value.edits_sent !== void 0) {
@@ -1672,9 +1742,12 @@ function readContentEdit(raw, index) {
   }
   return {
     old_str: raw.old_str,
-    new_str: raw.new_str,
+    new_str: unescapeDollar(raw.new_str),
     ...raw.replace_all_matches === void 0 ? {} : { replace_all_matches: readBoolean(raw.replace_all_matches, `${path}.replace_all_matches`) }
   };
+}
+function unescapeDollar(text2) {
+  return text2.replace(/\\\$/g, "$");
 }
 function readContentEdits(raw) {
   if (raw === void 0 || raw === null) return [];
@@ -1957,6 +2030,9 @@ async function createPage(params, runner) {
     ...url ? { url } : {},
     parent: parentLabel ?? "workspace",
     ...title ? { title } : {},
+    // The body is what `pages create --content` sent; its size is the only evidence the
+    // caller gets that the Markdown landed, without echoing the whole thing back.
+    body_chars: draft.body.length,
     ...container.kind === "row" ? {
       parent_item_row_id: container.rowParentId,
       ...rowRelationName ? { parent_item_property: rowRelationName } : {}
@@ -2376,11 +2452,11 @@ var EDIT_ITEM_SCHEMA = {
   properties: {
     old_str: {
       type: "string",
-      description: "Required, non-empty. The existing text to find. A SUBSTRING matches, so you may replace one word, one sentence, or several blocks \u2014 you do NOT have to resend the whole paragraph. SIMPLEST CORRECT RULE: COPY WHAT notion_get SHOWED YOU, MARKERS AND ALL. That always matches, at any length, across any formatting (verified live: on `A first **B bold** C middle` the values `**B bold**`, `A first **B bold** C middle`, and the whole paragraph all match). A MARKER-FREE PLAIN substring ALSO works, but ONLY if it lies entirely inside ONE formatting run: for `Alpha **bold** omega`, `bold` and `Alpha ` match, while `Alpha bold` does NOT (it crosses from plain text into the bold run). So the ONE way to fail is a plain substring that straddles a formatting boundary \u2014 e.g. stripping the ** of a phrase that spans plain and bold text. When unsure, copy the markers. Adjacent blocks can be matched together with \\n; that merges them into one block on replace, so only do it when you intend to merge. A `$` may be written EITHER bare or escaped here \u2014 both match (verified), so copying the \\\\$ that notion_get renders works."
+      description: "Required, non-empty. The existing text to find. Substring matching: one word, one sentence or several blocks all work \u2014 you do not have to resend the whole paragraph. COPY WHAT notion_get SHOWED YOU, MARKERS AND ALL \u2014 that always matches, at any length. A marker-free plain fragment also works, but only if it sits inside ONE formatting run: on `Alpha **bold** omega`, `bold` and `Alpha ` match, `Alpha bold` does not (it crosses the bold boundary). So the one way to fail is a plain fragment spanning a formatting change \u2014 when unsure, copy the markers. Adjacent blocks join with \\n, which merges them on replace. A `$` may be bare or escaped."
     },
     new_str: {
       type: "string",
-      description: 'Required. The replacement text. "" DELETES old_str. It is markdown, so **bold**, `code`, [link](url), ## headings and - list items all render as that formatting; a new_str containing \\n\\n creates separate blocks and a single \\n is a line break inside one block. Write a BARE $ here, never the escaped \\\\$ \u2014 an escaped \\\\$ in new_str is stored as a literal backslash-dollar and visibly corrupts the text (verified). notion_get renders a stored $ as \\\\$, so when reusing shown text as new_str, un-escape it first.'
+      description: 'Required. The replacement text. "" DELETES old_str. It is markdown, so **bold**, `code`, [link](url), ## headings and - list items all render as that formatting; a new_str containing \\n\\n creates separate blocks and a single \\n is a line break inside one block. A `$` may be written bare or escaped \u2014 this tool removes the escape before sending, so pasting the \\\\$ that notion_get renders is safe.'
     },
     replace_all_matches: {
       type: "boolean",
@@ -2423,7 +2499,7 @@ var EDIT_PARAMETERS = {
     edits: {
       type: "array",
       items: EDIT_ITEM_SCHEMA,
-      description: 'Find-and-replace operations, applied in order (edit[i+1] sees edit[i]\'s result). Max 100. replace_all_matches belongs on the INDIVIDUAL edit object, not on the call. THREE outcomes, do not conflate them: (a) every edit matches -> call succeeds, `warnings` absent; (b) SOME edit matches -> call SUCCEEDS (HTTP 200), the matched edits are applied, and each unmatched one comes back in `warnings` (code "no_match") with edits_applied/edits_missed carrying the tally \u2014 nothing is rolled back, so re-read the page before assuming what it contains; (c) NO edit matches -> the call FAILS with a validation_error from Notion and nothing is written (this is Notion\'s rule, not a local pre-check) \u2014 treat it as "my old_str were wrong", re-read the page with notion_get and build new ones from that. A MULTIPLE match is a different hard error: nothing is written at all unless that one edit sets replace_all_matches:true. Omit `edits` and pass body_content to APPEND instead.'
+      description: "Find-and-replace operations, applied in order (edit[i+1] sees edit[i]'s result). Max 100. replace_all_matches belongs on the INDIVIDUAL edit object, not on the call. Notion does the matching, so a call can end three ways: all match -> success; SOME match -> success, with the misses in `warnings` (nothing is rolled back, so do not assume the page now equals what you sent); NONE match -> the call fails and nothing is written, which means the old_str were stale: re-read with notion_get instead of retrying the same string. An old_str matching MORE THAN ONE place is a separate hard error: nothing is written unless that edit sets replace_all_matches:true. Omit `edits` and pass body_content to APPEND instead."
     },
     body_content: {
       type: "string",
@@ -2475,6 +2551,7 @@ var PAGE_OUTPUT_SCHEMA = {
     changed: { type: "array", items: { type: "string" } },
     icon: { oneOf: [{ type: "string" }, { type: "null" }] },
     created: { type: "boolean", const: true },
+    body_chars: { type: "integer" },
     parent_item_row_id: { type: "string" },
     parent_item_property: { type: "string" },
     already_linked: { type: "boolean" },
@@ -2506,7 +2583,7 @@ function createNotionPageCreateTool(deps = {}) {
   const runner = deps.runNtn ?? runNtn;
   return defineNotionTool({
     name: "notion_page_create",
-    description: `Create one Notion page or database row. parent says where it goes and may be OMITTED: without it the page is created at the WORKSPACE ROOT (a real location, not an error \u2014 that page only has a title, so props cannot carry columns). With it: page:<id> (child page), database:<id> | data-source:<id> (a row in that database), or a bare page/row id (a bare ROW id means a child row, linked through that data source's Parent-item / self-relation column). body_content is the page Markdown and icon is the page icon \u2014 both are TOP-LEVEL parameters, not props keys. props carries database COLUMNS only (name \u2192 simplified value), converted by the parent's column types; unknown names and read-only columns are rejected with the writable ones in hint_properties. A page inside a database still needs a title (the title parameter, the title property in props, or a leading "# Heading" in body_content). The columns and icon are written by a second request; if that request fails the new page is trashed so no half-made page is left behind, and the error says whether cleanup worked (rollback: trashed | trash_failed | unknown_id; partial:true means something was left behind). To add content later use notion_page_edit (find-and-replace or append); this tool never edits an existing page.`,
+    description: 'Create one Notion page or database row. This tool never modifies an existing page \u2014 use notion_page_edit for that. `parent` is OPTIONAL: omit it to create the page at the WORKSPACE ROOT (Notion\'s own default; such a page has only a title, so props cannot carry columns). A page created inside a database needs a title: the `title` parameter, the title property in props, or a leading "# Heading" in body_content. Creating takes a SECOND request for the columns and icon. If that request fails the new page is trashed so no half-made page is left behind, and the error reports whether the cleanup worked (`rollback`) \u2014 partial:true means something was left behind. A successful result reports the title, the body it wrote, the columns and the icon separately.',
     timeoutMs: TOOL_TIMEOUTS.page,
     // Every operation here can write, so page calls stay exclusive: never overlap two.
     isConcurrencySafe: () => false,
@@ -2541,7 +2618,7 @@ function createNotionPageEditTool(deps = {}) {
   const runner = deps.runNtn ?? runNtn;
   return defineNotionTool({
     name: "notion_page_edit",
-    description: 'Change an existing Notion page: find-and-replace its text, append Markdown, update title/columns/icon, and/or move it. A single call may combine all of these; they are applied in this fixed order \u2014 (1) body content, (2) title/props/icon, (3) parent move \u2014 and `changed` reports each one that happened. THE THREE STEPS ARE INDEPENDENT: if one fails, the others still run. A failed old_str does NOT stop a valid title change or a valid move, because those do not depend on it. The result then says \u90E8\u5206\u6210\u529F and lists what landed vs. what failed \u2014 retry ONLY the failed part, since resending everything re-applies the parts that already succeeded. CONTENT: `edits` is a list of {old_str, new_str} operations applied in order, so edit[i+1] sees edit[i]\'s result. old_str matches ANY SUBSTRING of the page text (one word, one sentence, several blocks) \u2014 not just a whole block. The match target is the MARKDOWN notion_get shows, so copy it as-is with markers (**bold**, `code`, [link](url), ## heading, - item); stripping them is the one way to break it (a paragraph shown as `Alpha **b** omega` does not match as `Alpha b omega`). Adjacent blocks join with \\n (and merge on replace). The one reversal: where notion_get shows \\\\$ use \\\\$ in old_str but a bare $ in new_str, or the page is corrupted. new_str "" DELETES the matched text. MATCH OUTCOMES, three distinct cases \u2014 do not conflate them. (a) EVERY edit matches: call succeeds, `warnings` is absent. (b) SOME edit matches: the call SUCCEEDS, the matching edits stay applied, the unmatched ones come back in `warnings` (code "no_match") and edits_applied/edits_missed give the tally \u2014 nothing is rolled back, so re-read the page before assuming what it now contains; `warnings` is ABSENT when nothing missed (it is never an empty array). (c) NO edit matches: the call FAILS with Notion\'s validation_error and nothing is written. That is Notion\'s rule, not a local pre-check \u2014 treat it as "my old_str were wrong": re-read the page with notion_get and build new old_str from what it actually says. SEPARATELY, an old_str matching MORE THAN ONE place is also a hard error with nothing written, unless THAT edit sets replace_all_matches:true. There is NO whole-page replace: when `edits` is empty or absent and body_content is present, body_content is APPENDED to the end of the page (passing both edits and body_content is an error \u2014 do it in two calls). FIELDS: icon and body_content are TOP-LEVEL parameters, not props keys; props carries database COLUMNS only (name \u2192 simplified value, converted by column type). MOVE: parent page:<id> (or a bare page id) re-parents the page via POST /v1/pages/{id}/move; a bare ROW id re-links that row\'s Parent-item relation. Re-linking a row that already has a different parent needs yes:true (otherwise it refuses and shows the current parent ids); cycle-forming moves are refused. If step (2) or (3) fails after content was already written, the error says exactly what already landed \u2014 read it before retrying. When the returned body was truncated the result says so: truncated markdown is NOT the full page, so do not derive the next old_str from it.',
+    description: 'Change an existing Notion page: find-and-replace its text, append Markdown, update title/columns/icon, and/or move it. A single call may combine all of these. THE STEPS ARE INDEPENDENT: they run in this order \u2014 (1) body content, (2) title/props/icon, (3) parent move \u2014 and a failure in one does NOT cancel the others. A failed old_str is a bad argument, not a broken page, so a valid title change or move still happens. The result then reports \u90E8\u5206\u6210\u529F with exactly what landed and what did not: retry ONLY the failed part, because resending the whole call re-applies the parts that already succeeded. `changed` lists what actually happened. There is NO whole-page replace in this tool: to rewrite everything, delete the old text with edits (new_str "") and append the new text in a second call. When the returned body was truncated the result says so \u2014 truncated markdown is not the full page, so do not derive the next old_str from it.',
     timeoutMs: TOOL_TIMEOUTS.page,
     isConcurrencySafe: () => false,
     parameters: EDIT_PARAMETERS,
@@ -2645,9 +2722,7 @@ function isRecord3(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function summarizeFailure(result, action) {
-  const detail = (result.stderr || result.stdout).trim();
-  const code = result.code === null ? "" : ` (exit ${result.code})`;
-  return `${action} failed${code}: ${detail || "no output from ntn"}`;
+  return describeFailure(result, `${action} failed`);
 }
 function readQueryLimit(raw) {
   if (raw === void 0 || raw === null) return DEFAULT_QUERY_LIMIT;
@@ -3073,11 +3148,6 @@ function normalizeHit(raw) {
     object: rawObject === "data_source" ? "database" : rawObject || "unknown"
   };
 }
-function snippet(text2) {
-  const trimmed = text2.trim();
-  if (!trimmed) return "<empty>";
-  return trimmed.length > 300 ? `${trimmed.slice(0, 300)}\u2026` : trimmed;
-}
 function parseSearchResponse(stdout) {
   let payload;
   try {
@@ -3096,44 +3166,19 @@ function parseSearchResponse(stdout) {
   const results = rawResults.map((item) => normalizeHit(item)).filter((hit) => hit !== null);
   return { results, hasMore: record.has_more === true };
 }
-var FAILURE_HINTS = [
-  {
-    match: /not found on PATH|ENOENT/i,
-    hint: "Hint: install the Notion CLI with `npm i -g ntn` (or `curl -fsSL https://ntn.dev | bash`), then run `ntn login`."
-  },
-  // token 那条必须排在 workspace 之前：ntn 的 token 错误文案里**也**带 "run `ntn login`"，
-  // 顺序反过来就会被 workspace 提示吞掉，而且 workspace 提示并不解决无效 token。
-  {
-    match: /api token is invalid|unauthorized|\b401\b/i,
-    hint: "Hint: the token was rejected \u2014 set a valid NOTION_API_TOKEN or run `ntn login`, and make sure the target pages/databases are shared with that integration."
-  },
-  {
-    match: /no workspace selected|not logged in|not authenticated/i,
-    hint: "Hint: authenticate first \u2014 run `ntn login`, or set NOTION_API_TOKEN (plus NOTION_WORKSPACE_ID). Then share the target pages/databases with that integration."
-  }
-];
-function describeFailure(result) {
-  const stderr = result.stderr.trim();
-  const status = result.code === null ? "no exit code (timed out or could not start)" : `exit ${result.code}`;
-  const hint = FAILURE_HINTS.find((entry) => entry.match.test(stderr))?.hint;
-  const detail = stderr ? snippet(stderr) : "ntn printed no error text.";
-  return [`notion_search failed: ntn ${status}.`, detail, hint].filter((part) => Boolean(part)).join("\n");
-}
 async function searchNotion(params, runner = defaultDeps.run) {
   const query = normalizeQuery(params.query);
   const limit = normalizeLimit(params.limit);
   const body = buildSearchBody({ query, limit, filter_object: params.filter_object });
   const result = await runner({ args: buildSearchArgs(body) });
-  if (!result.ok) throw new Error(describeFailure(result));
+  if (!result.ok) throw new Error(describeFailure(result, "notion_search failed"));
   const { results, hasMore } = parseSearchResponse(result.stdout);
   return { query, limit, results: results.slice(0, limit), hasMore };
 }
 function formatOutcome(outcome) {
   const header = `Notion search "${outcome.query}": ${outcome.results.length} result(s) (limit ${outcome.limit}).`;
   const body = outcome.results.length === 0 ? [
-    "No matches. Notion search scans TITLES only (never body text).",
-    'Next: retry the EXACT title in double quotes, e.g. "My Page Title" \u2014 that is the reliable lookup.',
-    "If it still misses, the page may be seconds old and not indexed yet: retry once, then search a distinctive single word.",
+    'No matches. Notion search scans TITLES only (never body text): retry the EXACT title in double quotes, e.g. "My Page Title".',
     "Do NOT simply shorten the query: matching is token-OR, so fewer words means MORE unrelated hits, not fewer."
   ] : outcome.results.map((hit, index) => {
     const title = hit.title || "(untitled)";
@@ -3149,7 +3194,7 @@ function createNotionSearchTool(deps = {}) {
   const runner = deps.run ?? defaultDeps.run;
   return defineNotionTool({
     name: "notion_search",
-    description: `Search the Notion workspace by TITLE and return hits with id, title, URL and object type (page|database|data_source). MATCHING IS TOKEN-OR, NOT SUBSTRING \u2014 this is the single most important thing to know: Notion splits the query into words and returns anything whose title contains ANY ONE of them, ranked. So a long query returns loosely-related pages that share one word, and hit #1 is often unrelated. Example from a real workspace: querying a page's full title returns 10 hits, only one of which is that page. TO LOOK UP ONE KNOWN PAGE, WRAP THE EXACT TITLE IN DOUBLE QUOTES (\\"PRD \xB7 notion_page\\") \u2014 that returns exactly that page. Do that FIRST whenever you already know the title. Titles only: page body text is never searched, so a term that appears only in the body finds nothing. An empty result does NOT prove the object is missing (a just-created page is not indexed for a second or two; retry once before concluding absence). Use filter_object to cut noise, and prefer refining the query over raising limit (capped at 50). Verify before you act: ids from here must be confirmed with notion_get, because a loosely related hit looks like a legitimate match. For a data_source hit, notion_get/notion_query need data-source:<id> or database:<id> to be unambiguous.`,
+    description: 'Search Notion by TITLE; returns id, title, URL and object type (page|database). MATCHING IS TOKEN-OR, NOT SUBSTRING: the query is split into words and any title containing ANY ONE of them comes back, ranked \u2014 so a long query yields loosely-related hits, not just the one you meant. Wrap a known EXACT title in double quotes ("PRD \xB7 notion_page") to get exactly that hit. TITLES only: body text is never searched, and a 0-hit result does NOT prove absence (a fresh page may not be indexed for a second or two; retry once). A hit is not proof it is the right object: verify with notion_get. Use filter_object or limit to narrow; prefer refining the query over raising limit.',
     timeoutMs: TOOL_TIMEOUTS.search,
     // Read-only and independent of every other call: safe to run alongside siblings.
     isConcurrencySafe: () => true,
@@ -3158,7 +3203,7 @@ function createNotionSearchTool(deps = {}) {
       properties: {
         query: {
           type: "string",
-          description: "Keyword to match against object titles. This is a FUZZY match: Notion matches words inside the title, case-insensitively, and returns related hits \u2014 so a miss does NOT prove the page is absent, and a hit may be only loosely related. It never searches page body text."
+          description: "Keyword matched against object TITLES only (never body text). See the tool description for how matching works: it is token-OR, and an exact title in double quotes is the precise lookup."
         },
         limit: {
           type: "integer",
