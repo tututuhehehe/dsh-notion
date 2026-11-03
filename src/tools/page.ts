@@ -90,6 +90,7 @@ import {
 } from "../dsh/tool.ts";
 import type { JsonObject, NotionTool } from "../dsh/tool.ts";
 import { parseResolveDataSources } from "../lib/datasources.ts";
+import { failureHint, failureStatus, snippet } from "../lib/failures.ts";
 import { extractNotionId } from "../lib/ids.ts";
 import {
   canonicalNotionId,
@@ -501,14 +502,24 @@ function parseJsonMaybe(stdout: string): unknown {
 function ntnFailure(label: string, result: RunNtnResult, note?: string): NotionToolError {
   const detail = (result.stderr || result.stdout || "").trim();
   const exit = result.code === null ? "" : `（exit ${result.code}）`;
+  // The hint is attached ONLY when the text identifies the cause (see lib/failures.ts);
+  // an unrecognised failure stays as ntn worded it rather than getting a confident guess.
+  // `no exit code` means the child never exited — our own timeout, or it could not start.
+  const hint = failureHint(result);
+  const status =
+    result.code === null && !detail
+      ? `（${failureStatus(result)}）`
+      : exit;
   return new NotionToolError(
-    `${note ? `${note}；` : ""}${label} 失败${exit}${detail ? `：${truncate(detail)}` : ""}`,
+    `${note ? `${note}；` : ""}${label} 失败${status}${detail ? `：${truncate(detail)}` : ""}` +
+      (hint ? `\n${hint}` : ""),
     {
       code: NOTION_ERROR_CODES.ntnFailed,
       details: {
-        stderr: result.stderr.trim(),
+        stderr: snippet(result.stderr),
         stdout: truncate(result.stdout.trim()),
         code: result.code,
+        ...(hint ? { hint } : {}),
       },
     }
   );
@@ -1241,6 +1252,14 @@ export type PageToolValue = {
   icon?: string | null;
   /** true on notion_page_create results; an edit never sets it. Drives the headline only. */
   created?: boolean;
+  /**
+   * create: how many characters of body this call actually wrote.
+   *
+   * A create always sends the body, but "已写入列：title" told a caller nothing about it —
+   * it could not tell whether the Markdown landed or only the columns did. Reporting the
+   * count answers that without echoing the whole body back into the context.
+   */
+  body_chars?: number;
   /** create when the parent was a database row. */
   parent_item_row_id?: string;
   parent_item_property?: string;
@@ -1329,6 +1348,16 @@ export function describePageValue(value: PageToolValue): string {
   }
   if (value.cycle_check === "partial") {
     lines.push("注意：页面祖先链未能完整读取，深层环检查为 best-effort（cycle_check: partial）");
+  }
+  // Report each kind of write separately. A create used to print only "已写入列：title",
+  // which left the caller unable to tell whether the Markdown body had landed too.
+  if (value.created) {
+    if (value.title) lines.push(`标题：${value.title}`);
+    lines.push(
+      value.body_chars
+        ? `正文：已写入 ${value.body_chars} 字`
+        : "正文：未提交正文内容（本次只有标题/属性）"
+    );
   }
   if (value.properties.length) lines.push(`已写入列：${value.properties.join(", ")}`);
   if (value.icon !== undefined) lines.push(`icon: ${value.icon ?? "（已清除）"}`);
@@ -1461,11 +1490,28 @@ function readContentEdit(raw: unknown, index: number): ContentEdit {
   }
   return {
     old_str: raw.old_str,
-    new_str: raw.new_str,
+    new_str: unescapeDollar(raw.new_str),
     ...(raw.replace_all_matches === undefined
       ? {}
       : { replace_all_matches: readBoolean(raw.replace_all_matches, `${path}.replace_all_matches`) }),
   };
+}
+
+/**
+ * Undo Notion's markdown escaping of `$` in `new_str`.
+ *
+ * `notion_get` renders a stored `$` as `\$`, so a caller that copies what it read sends
+ * `\$` — and Notion stores that escape LITERALLY, visibly corrupting the text (verified
+ * live: a page ended up containing a backslash that was never typed). `old_str` accepts
+ * either form, so only `new_str` needs normalising. Doing it here means the asymmetry
+ * never has to be remembered by the caller.
+ *
+ * A caller who genuinely wants a literal backslash-dollar cannot express it through this
+ * tool. That is the deliberate trade: the escape is overwhelmingly a copy-paste artefact,
+ * and silently corrupting a page is much worse than being unable to produce that byte.
+ */
+function unescapeDollar(text: string): string {
+  return text.replace(/\\\$/g, "$");
 }
 
 function readContentEdits(raw: unknown): ContentEdit[] {
@@ -1934,6 +1980,9 @@ async function createPage(params: CreateParams, runner: NtnRunner): Promise<Page
     ...(url ? { url } : {}),
     parent: parentLabel ?? "workspace",
     ...(title ? { title } : {}),
+    // The body is what `pages create --content` sent; its size is the only evidence the
+    // caller gets that the Markdown landed, without echoing the whole thing back.
+    body_chars: draft.body.length,
     ...(container.kind === "row"
       ? {
           parent_item_row_id: container.rowParentId,
@@ -2642,25 +2691,19 @@ const EDIT_ITEM_SCHEMA = {
     old_str: {
       type: "string",
       description:
-        "Required, non-empty. The existing text to find. A SUBSTRING matches, so you may replace one word, one " +
-        "sentence, or several blocks — you do NOT have to resend the whole paragraph. " +
-        "SIMPLEST CORRECT RULE: COPY WHAT notion_get SHOWED YOU, MARKERS AND ALL. That always matches, at any " +
-        "length, across any formatting (verified live: on `A first **B bold** C middle` the values " +
-        "`**B bold**`, `A first **B bold** C middle`, and the whole paragraph all match). " +
-        "A MARKER-FREE PLAIN substring ALSO works, but ONLY if it lies entirely inside ONE formatting run: for " +
-        "`Alpha **bold** omega`, `bold` and `Alpha ` match, while `Alpha bold` does NOT (it crosses from plain " +
-        "text into the bold run). " +
-        "So the ONE way to fail is a plain substring that straddles a formatting boundary — e.g. stripping the " +
-        "** of a phrase that spans plain and bold text. When unsure, copy the markers. " +
-        "Adjacent blocks can be matched together with \\n; that merges them into one block on replace, so only " +
-        "do it when you intend to merge. " +
-        "A `$` may be written EITHER bare or escaped here — both match (verified), so copying the \\\\$ that notion_get renders works.",
+        "Required, non-empty. The existing text to find. Substring matching: one word, one sentence or several " +
+        "blocks all work — you do not have to resend the whole paragraph. " +
+        "COPY WHAT notion_get SHOWED YOU, MARKERS AND ALL — that always matches, at any length. " +
+        "A marker-free plain fragment also works, but only if it sits inside ONE formatting run: on " +
+        "`Alpha **bold** omega`, `bold` and `Alpha ` match, `Alpha bold` does not (it crosses the bold boundary). " +
+        "So the one way to fail is a plain fragment spanning a formatting change — when unsure, copy the markers. " +
+        "Adjacent blocks join with \\n, which merges them on replace. A `$` may be bare or escaped.",
     },
     new_str: {
       type: "string",
       description:
         "Required. The replacement text. \"\" DELETES old_str. It is markdown, so **bold**, `code`, [link](url), ## headings and - list items all render as that formatting; a new_str containing \\n\\n creates separate blocks and a single \\n is a line break inside one block. " +
-        "Write a BARE $ here, never the escaped \\\\$ — an escaped \\\\$ in new_str is stored as a literal backslash-dollar and visibly corrupts the text (verified). notion_get renders a stored $ as \\\\$, so when reusing shown text as new_str, un-escape it first.",
+        "A `$` may be written bare or escaped — this tool removes the escape before sending, so pasting the \\\\$ that notion_get renders is safe.",
     },
     replace_all_matches: {
       type: "boolean",
@@ -2711,11 +2754,11 @@ const EDIT_PARAMETERS = {
       description:
         "Find-and-replace operations, applied in order (edit[i+1] sees edit[i]'s result). Max 100. " +
         "replace_all_matches belongs on the INDIVIDUAL edit object, not on the call. " +
-        "THREE outcomes, do not conflate them: " +
-        "(a) every edit matches -> call succeeds, `warnings` absent; " +
-        "(b) SOME edit matches -> call SUCCEEDS (HTTP 200), the matched edits are applied, and each unmatched one comes back in `warnings` (code \"no_match\") with edits_applied/edits_missed carrying the tally — nothing is rolled back, so re-read the page before assuming what it contains; " +
-        "(c) NO edit matches -> the call FAILS with a validation_error from Notion and nothing is written (this is Notion's rule, not a local pre-check) — treat it as \"my old_str were wrong\", re-read the page with notion_get and build new ones from that. " +
-        "A MULTIPLE match is a different hard error: nothing is written at all unless that one edit sets replace_all_matches:true. " +
+        "Notion does the matching, so a call can end three ways: " +
+        "all match -> success; " +
+        "SOME match -> success, with the misses in `warnings` (nothing is rolled back, so do not assume the page now equals what you sent); " +
+        "NONE match -> the call fails and nothing is written, which means the old_str were stale: re-read with notion_get instead of retrying the same string. " +
+        "An old_str matching MORE THAN ONE place is a separate hard error: nothing is written unless that edit sets replace_all_matches:true. " +
         "Omit `edits` and pass body_content to APPEND instead.",
     },
     body_content: {
@@ -2776,6 +2819,7 @@ const PAGE_OUTPUT_SCHEMA = {
     changed: { type: "array", items: { type: "string" } },
     icon: { oneOf: [{ type: "string" }, { type: "null" }] },
     created: { type: "boolean", const: true },
+    body_chars: { type: "integer" },
     parent_item_row_id: { type: "string" },
     parent_item_property: { type: "string" },
     already_linked: { type: "boolean" },
@@ -2874,41 +2918,17 @@ export function createNotionPageEditTool(deps: NotionPageDeps = {}): NotionTool<
     name: "notion_page_edit",
     description:
       "Change an existing Notion page: find-and-replace its text, append Markdown, update title/columns/icon, " +
-      "and/or move it. A single call may combine all of these; they are applied in this fixed order — " +
-      "(1) body content, (2) title/props/icon, (3) parent move — and `changed` reports each one that happened. " +
-      "THE THREE STEPS ARE INDEPENDENT: if one fails, the others still run. A failed old_str does NOT stop a " +
-      "valid title change or a valid move, because those do not depend on it. The result then says 部分成功 and " +
-      "lists what landed vs. what failed — retry ONLY the failed part, since resending everything re-applies " +
-      "the parts that already succeeded. " +
-      "CONTENT: `edits` is a list of {old_str, new_str} operations applied in order, so edit[i+1] sees edit[i]'s " +
-      "result. old_str matches ANY SUBSTRING of the page text (one word, one sentence, several blocks) — not just " +
-      "a whole block. The match target is the MARKDOWN notion_get shows, so copy it as-is with markers " +
-      "(**bold**, `code`, [link](url), ## heading, - item); stripping them is the one way to break it (a paragraph " +
-      "shown as `Alpha **b** omega` does not match as `Alpha b omega`). Adjacent blocks join with \\n (and merge on " +
-      "replace). The one reversal: where notion_get shows \\\\$ use \\\\$ in old_str but a bare $ in new_str, or the " +
-      "page is corrupted. " +
-      "new_str \"\" DELETES the matched text. " +
-      "MATCH OUTCOMES, three distinct cases — do not conflate them. " +
-      "(a) EVERY edit matches: call succeeds, `warnings` is absent. " +
-      "(b) SOME edit matches: the call SUCCEEDS, the matching edits stay applied, the unmatched ones come back in " +
-      "`warnings` (code \"no_match\") and edits_applied/edits_missed give the tally — nothing is rolled back, so " +
-      "re-read the page before assuming what it now contains; `warnings` is ABSENT when nothing missed (it is never " +
-      "an empty array). " +
-      "(c) NO edit matches: the call FAILS with Notion's validation_error and nothing is written. That is Notion's " +
-      "rule, not a local pre-check — treat it as \"my old_str were wrong\": re-read the page with notion_get and " +
-      "build new old_str from what it actually says. " +
-      "SEPARATELY, an old_str matching MORE THAN ONE place is also a hard error with nothing written, unless THAT " +
-      "edit sets replace_all_matches:true. " +
-      "There is NO whole-page replace: when `edits` is empty or absent and body_content is present, body_content is " +
-      "APPENDED to the end of the page (passing both edits and body_content is an error — do it in two calls). " +
-      "FIELDS: icon and body_content are TOP-LEVEL parameters, not props keys; props carries database COLUMNS " +
-      "only (name → simplified value, converted by column type). " +
-      "MOVE: parent page:<id> (or a bare page id) re-parents the page via POST /v1/pages/{id}/move; a bare ROW id " +
-      "re-links that row's Parent-item relation. Re-linking a row that already has a different parent needs " +
-      "yes:true (otherwise it refuses and shows the current parent ids); cycle-forming moves are refused. " +
-      "If step (2) or (3) fails after content was already written, the error says exactly what already landed — " +
-      "read it before retrying. When the returned body was truncated the result says so: truncated markdown is NOT " +
-      "the full page, so do not derive the next old_str from it.",
+      "and/or move it. A single call may combine all of these. " +
+      "THE STEPS ARE INDEPENDENT: they run in this order — (1) body content, (2) title/props/icon, " +
+      "(3) parent move — and a failure in one does NOT cancel the others. A failed old_str is a bad argument, " +
+      "not a broken page, so a valid title change or move still happens. The result then reports 部分成功 with " +
+      "exactly what landed and what did not: retry ONLY the failed part, because resending the whole call " +
+      "re-applies the parts that already succeeded. " +
+      "`changed` lists what actually happened. " +
+      "There is NO whole-page replace in this tool: to rewrite everything, delete the old text with edits " +
+      "(new_str \"\") and append the new text in a second call. " +
+      "When the returned body was truncated the result says so — truncated markdown is not the full page, so do " +
+      "not derive the next old_str from it.",
     timeoutMs: TOOL_TIMEOUTS.page,
     isConcurrencySafe: () => false,
     parameters: EDIT_PARAMETERS as unknown as JsonObject,

@@ -33,6 +33,7 @@ import {
 } from "../dsh/tool.ts";
 import type { NotionTool } from "../dsh/tool.ts";
 import { parseResolveDataSources } from "../lib/datasources.ts";
+import { describeFailure } from "../lib/failures.ts";
 import type { ResolvedDataSource } from "../lib/datasources.ts";
 import { extractNotionId } from "../lib/ids.ts";
 import {
@@ -109,10 +110,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Delegate to src/lib/failures.ts so a given underlying failure reads the same whichever
+ * tool hit it. That module attaches a hint only when the text identifies the cause, so an
+ * unrecognised failure stays exactly as ntn worded it instead of getting a guess.
+ */
 function summarizeFailure(result: RunNtnResult, action: string): string {
-  const detail = (result.stderr || result.stdout).trim();
-  const code = result.code === null ? "" : ` (exit ${result.code})`;
-  return `${action} failed${code}: ${detail || "no output from ntn"}`;
+  return describeFailure(result, `${action} failed`);
 }
 
 /**
