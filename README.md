@@ -288,7 +288,7 @@ Multiple matches found for "<old_str>". Found N matches...
 
 **5. `new_str: ""` 是删除。** 这是删掉一段正文的正式做法——把命中的文本替换成空串。没有单独的 delete-block 参数。
 
-### 三个容易踩的细节
+### 五个容易踩的细节
 
 **`old_str` 匹配的是块的纯文本，不是 Markdown。** 如果页面上是 `**加粗BBB**`：
 
@@ -547,7 +547,7 @@ So three outcomes, three different signals: *multiple matches* refuses everythin
 
 And **only Notion knows which edit was ambiguous** — the plugin does no local pre-check, so it cannot tell you in advance that "edit #2 matches more than once". After a refusal, work out from your own `old_str` values which one was insufficiently unique.
 
-Three details that bite:
+Five details that bite:
 
 - **`old_str` matches the block's plain text, not the markdown.** `old_str: "boldtext"` matches inside `**boldtext**` and the bold formatting survives. Do not include `**`, `_`, `#`, `>` or `-` markers — and remember that `notion_get` returns markdown, so strip the markers when copying an `old_str` out of it.
 - **Newlines in `new_str` decide block structure.** A single `\n` is a line break inside one block; `\n\n` starts a separate block. `old_str` may span blocks using `\n` or `\n\n`.

@@ -1129,6 +1129,14 @@ function planContent(
   let body = markdown;
   // Drop the H1 only when it became (or equals) the page title, to avoid duplication.
   if (h1 && title === h1.title) body = h1.rest;
+  else if (h1 && existingFrontmatterTitle === undefined) {
+    // The requested title DIFFERS from a leading H1. `ntn pages create` silently
+    // swallows an H1 that follows frontmatter (verified: the heading disappears and
+    // only the rest of the body lands), while a direct API call keeps it. Sending the
+    // H1 as a heading would lose content with a success status, so it is demoted to
+    // plain text: the user's words survive, which is what they can then fix.
+    body = `\\# ${h1.title}\n\n${h1.rest}`;
+  }
   if (title) body = withFrontmatterTitle(body, title);
   return title ? { body, title } : { body };
 }
@@ -1997,25 +2005,43 @@ async function editPage(params: EditParams, runner: NtnRunner): Promise<PageTool
   const needsPatch =
     params.props !== undefined || params.title !== undefined || params.icon !== undefined;
   if (needsPatch) {
-    const schema = await schemaForPage(runner, id);
-    const { properties, names, changes } = buildPropertyWrite(schema, params.props, params.title, {
-      pageId: id,
-      source: schema.source,
-    });
-    const patchResult = await runner({ args: patchArgs(id, properties, params.icon) });
-    if (!patchResult.ok) {
-      const cause = ntnFailure("PATCH 页面属性/icon", patchResult);
+    // Everything in this block can fail AFTER the content edit already landed —
+    // including the LOCAL validators (`schemaForPage`, `buildPropertyWrite`), not just
+    // the network PATCH. Wrapping the whole block is what makes the disclosure
+    // reliable: a caller that sent a valid edit plus a bad property would otherwise be
+    // told only "bad argument", retry with a fixed argument, and double-apply (or get a
+    // confusing "No matches found" from an old_str that had in fact already succeeded).
+    // Step 3 below needs no such wrapper because `movePage` is already the try body.
+    let patchResult;
+    try {
+      const schema = await schemaForPage(runner, id);
+      const { properties, names, changes } = buildPropertyWrite(schema, params.props, params.title, {
+        pageId: id,
+        source: schema.source,
+      });
+      patchResult = await runner({ args: patchArgs(id, properties, params.icon) });
+      if (!patchResult.ok) throw ntnFailure("PATCH 页面属性/icon", patchResult);
+      const patched = parseJsonMaybe(patchResult.stdout);
+      if (pageHasUrl(patched)) result.url = pageUrlFromRaw(patched, id);
+      result.properties = names;
+      result.changes.push(...changes);
+      if (params.icon !== undefined) result.changes.push("icon");
+      if (names.length > 0) applied.push(`属性（${names.join(", ")}）`);
+      if (params.icon !== undefined) applied.push("icon");
+    } catch (error) {
+      const cause =
+        error instanceof NotionToolError
+          ? error
+          : ntnFailure("PATCH 页面属性/icon", {
+              ok: false,
+              stdout: "",
+              stderr: error instanceof Error ? error.message : String(error),
+              code: null,
+            });
       throw applied.length > 0
         ? partialEditError(cause, applied, "属性/标题/icon（PATCH 页面属性/icon）")
         : cause;
     }
-    const patched = parseJsonMaybe(patchResult.stdout);
-    if (pageHasUrl(patched)) result.url = pageUrlFromRaw(patched, id);
-    result.properties = names;
-    result.changes.push(...changes);
-    if (params.icon !== undefined) result.changes.push("icon");
-    if (names.length > 0) applied.push(`属性（${names.join(", ")}）`);
-    if (params.icon !== undefined) applied.push("icon");
   }
 
   if (params.parent !== undefined) {
@@ -2300,6 +2326,15 @@ const NESTING_BLOCK_TYPES = new Set([
 const MAX_BLOCK_PAGES = 100;
 
 /**
+ * How many child pages to name in a refusal message.
+ *
+ * The list exists so a caller can see what it is about to delete, so it has to be long
+ * enough to be useful and short enough to stay readable in an error; the remainder is
+ * summarized with its count rather than silently dropped.
+ */
+const MAX_LISTED_CHILDREN = 20;
+
+/**
  * Direct child pages of one page, from `GET v1/blocks/{id}/children`.
  *
  * The walk follows EVERY page of the child list, not a fixed count: the default page
@@ -2459,9 +2494,27 @@ async function trashPage(
   if (target.kind === "page") {
     const children = await listChildPages(runner, id, { failOnUnreadable: !params.recursive });
     if (children.length > 0 && !params.recursive) {
+      // The child list MUST be in the message, not only in `details`: DSH drops
+      // `details` before the model sees the error (see NotionToolError), and the
+      // whole point of refusing is to show the caller what would go with the page.
+      // A container block (toggle/column_list/callout/…) is listed too, but labelled
+      // as such, because it is only *possibly* holding a nested page.
+      const listed = children
+        .slice(0, MAX_LISTED_CHILDREN)
+        .map((child) => {
+          const isContainer = child.title.endsWith("block with nested content)");
+          const kind = isContainer ? "嵌套容器" : "子页面";
+          return `  - [${kind}] ${child.title} — ${child.id}`;
+        })
+        .join("\n");
+      const overflow =
+        children.length > MAX_LISTED_CHILDREN
+          ? `\n  …另有 ${children.length - MAX_LISTED_CHILDREN} 个未列出（共 ${children.length} 个，完整列表见 Notion）。`
+          : "";
       throw new InputError(
-        `页面 ${id} 有 ${children.length} 个子页面。Notion 会连带归档整棵子树，` +
-          "所以默认拒绝。确认要一起删除请加 recursive: true；只想删父页面请先在 Notion 里移走子页面。",
+        `页面 ${id} 有 ${children.length} 个子页面/嵌套容器：\n${listed}${overflow}\n` +
+          "Notion 会连带归档整棵子树，所以默认拒绝。确认要一起删除请加 recursive: true；" +
+          "只想删父页面请先在 Notion 里移走这些子页面。",
         {
           id,
           children: children.map((child) => child.id),
@@ -2507,12 +2560,24 @@ const EDIT_ITEM_SCHEMA = {
     old_str: {
       type: "string",
       description:
-        "Required, non-empty. The existing text to find. It matches the block's PLAIN TEXT, not its markdown: to find text shown as **bold** write `text` without the asterisks, and write a plain `$` where notion_get returned `\\$`. Cross-block matches use \\n or \\n\\n.",
+        "Required, non-empty. The existing text to find. A SUBSTRING MATCHES — you may replace one word, one " +
+        "sentence, or several whole blocks; you do NOT have to repeat the whole paragraph. " +
+        "MATCHING RUNS ON PLAIN TEXT, WITH ONE RULE: the substring must lie ENTIRELY WITHIN ONE RICH-TEXT RUN " +
+        "and must NOT CONTAIN A FORMATTING MARKER. So for a paragraph shown as `Alpha **bold** omega`, these " +
+        "work: `Alpha `, `bold`, ` omega` — and these DON'T: `**bold**` (contains a marker), `Alpha bold` " +
+        "(crosses from plain text into the bold run), `Alpha **bold** omega` (contains a marker). " +
+        "PRACTICAL RULE, verified live: pick a short marker-free fragment from WITHIN a single run rather than " +
+        "copying the markup; if a unique fragment is impossible, send the whole paragraph with its markers and it " +
+        "will NOT match — instead choose a fragment on one side of the formatting. " +
+        "Adjacent blocks can be matched together with \\n; that merges them into one block on replace, so only " +
+        "do it when you intend to merge. " +
+        "A `$` may be written EITHER bare or escaped here — both match (verified), so copying the \\\\$ that notion_get renders works.",
     },
     new_str: {
       type: "string",
       description:
-        "Required. The replacement text. \"\" DELETES old_str. It is markdown: a new_str containing \\n\\n creates separate blocks.",
+        "Required. The replacement text. \"\" DELETES old_str. It is markdown, so **bold**, `code`, [link](url), ## headings and - list items all render as that formatting; a new_str containing \\n\\n creates separate blocks and a single \\n is a line break inside one block. " +
+        "Write a BARE $ here, never the escaped \\\\$ — an escaped \\\\$ in new_str is stored as a literal backslash-dollar and visibly corrupts the text (verified). notion_get renders a stored $ as \\\\$, so when reusing shown text as new_str, un-escape it first.",
     },
     replace_all_matches: {
       type: "boolean",
@@ -2725,8 +2790,13 @@ export function createNotionPageEditTool(deps: NotionPageDeps = {}): NotionTool<
       "and/or move it. A single call may combine all of these; they are applied in this fixed order — " +
       "(1) body content, (2) title/props/icon, (3) parent move — and `changed` reports each one that happened. " +
       "CONTENT: `edits` is a list of {old_str, new_str} operations applied in order, so edit[i+1] sees edit[i]'s " +
-      "result. old_str matches the block's PLAIN TEXT, not its markdown: write `text` for **text**, and a plain $ " +
-      "where notion_get showed \\$; a match can span blocks with \\n. new_str \"\" DELETES the matched text. " +
+      "result. old_str matches ANY SUBSTRING of the page text (one word, one sentence, several blocks) — not just " +
+      "a whole block. The match target is the MARKDOWN notion_get shows, so copy it as-is with markers " +
+      "(**bold**, `code`, [link](url), ## heading, - item); stripping them is the one way to break it (a paragraph " +
+      "shown as `Alpha **b** omega` does not match as `Alpha b omega`). Adjacent blocks join with \\n (and merge on " +
+      "replace). The one reversal: where notion_get shows \\\\$ use \\\\$ in old_str but a bare $ in new_str, or the " +
+      "page is corrupted. " +
+      "new_str \"\" DELETES the matched text. " +
       "MATCH OUTCOMES, three distinct cases — do not conflate them. " +
       "(a) EVERY edit matches: call succeeds, `warnings` is absent. " +
       "(b) SOME edit matches: the call SUCCEEDS, the matching edits stay applied, the unmatched ones come back in " +

@@ -1566,3 +1566,248 @@ describe("notion_page_edit: combined operations and failure debt", () => {
     assert.notEqual(result.details.content_applied, true);
   });
 });
+
+describe("notion_page_trash: the refusal must SHOW the children, not just count them", () => {
+  /**
+   * A refused recursive delete is only useful if the caller can see what it would
+   * have destroyed. `details` is never model-facing (DSH drops it before rendering),
+   * so the ids have to live in the MESSAGE. This regressed once already: the text
+   * said "有 2 个子页面" with no ids at all, so a model could not report what was at
+   * risk without extra round trips.
+   */
+  const CHILD_A = "aaaaaaaa-1111-4111-8111-111111111111";
+  const CHILD_B = "bbbbbbbb-2222-4222-8222-222222222222";
+
+  const scripted = (args: string[]): RunNtnResult => {
+    const joined = args.join(" ");
+    // The page itself: a normal, readable page.
+    if (joined.startsWith("api v1/pages/")) {
+      return ntnOk({ id: EDIT_PAGE_ID, object: "page", in_trash: false, parent: PAGE_PARENT });
+    }
+    // Its children: one real child page and one child database.
+    if (joined.includes("/children")) {
+      return ntnOk({
+        object: "list",
+        has_more: false,
+        next_cursor: null,
+        results: [
+          { id: CHILD_A, type: "child_page", has_children: false, child_page: { title: "A 子页面" } },
+          {
+            id: CHILD_B,
+            type: "child_database",
+            has_children: false,
+            child_database: { title: "B 子数据库" },
+          },
+        ],
+      });
+    }
+    return ntnFail("unexpected call");
+  };
+
+  it("lists every child id and title in the error text the model receives", async () => {
+    const { tool, calls } = trashHarness(scripted);
+    const result = await tool.execute("trash-children", { id: EDIT_PAGE_ID, yes: true });
+
+    assert.equal(result.isError, true);
+    const rendered = text(result);
+    // Both children must be named, with their ids, in the message itself.
+    assert.match(rendered, new RegExp(CHILD_A), "child page id missing from the message");
+    assert.match(rendered, new RegExp(CHILD_B), "child database id missing from the message");
+    assert.match(rendered, /A 子页面/);
+    assert.match(rendered, /B 子数据库/);
+    // And it must still say how to proceed.
+    assert.match(rendered, /recursive/);
+    // The refusal must never reach ntn pages trash: nothing may be deleted.
+    assert.equal(
+      calls.some((args) => args[0] === "pages" && args[1] === "trash"),
+      false,
+      "a refused recursive delete must not call ntn pages trash"
+    );
+  });
+
+  it("distinguishes a nesting CONTAINER from a real child page in the message", async () => {
+    // A toggle with content is reported by listChildPages as a container, not a page.
+    // Saying "1 个子页面" for it would be factually wrong and send the caller looking
+    // for a child page that does not exist.
+    const toggleOnly = (args: string[]): RunNtnResult => {
+      const joined = args.join(" ");
+      if (joined.startsWith("api v1/pages/")) {
+        return ntnOk({ id: EDIT_PAGE_ID, object: "page", in_trash: false, parent: PAGE_PARENT });
+      }
+      if (joined.includes("/children")) {
+        return ntnOk({
+          object: "list",
+          has_more: false,
+          next_cursor: null,
+          results: [
+            { id: CHILD_A, type: "toggle", has_children: true, toggle: { rich_text: [] } },
+          ],
+        });
+      }
+      return ntnFail("unexpected call");
+    };
+
+    const { tool } = trashHarness(toggleOnly);
+    const rendered = text(await tool.execute("trash-toggle", { id: EDIT_PAGE_ID, yes: true }));
+    assert.match(rendered, /嵌套容器/);
+    assert.doesNotMatch(rendered, /\[子页面\]/);
+  });
+});
+
+describe("notion_page_edit: LOCAL validation failures must also disclose prior writes", () => {
+  /**
+   * The content edit lands BEFORE properties/title/icon are validated. A LOCAL
+   * validation error in step 2 (a bad title, a props array, an unknown column) is
+   * thrown by the validators, not by the network — so a disclosure that only wraps
+   * the PATCH misses every one of them. A caller then sees "bad argument", fixes the
+   * argument and retries, double-applying an edit that had already succeeded.
+   */
+  const script = (args: string[]): RunNtnResult => {
+    const path = String(args[1] ?? "");
+    if (args[0] === "api" && args[1] === `v1/pages/${EDIT_PAGE_ID}` && args[3] !== "PATCH") {
+      return pageWithParent(DS_PARENT);
+    }
+    if (args[0] === "api" && args[1] === `v1/data_sources/${ACCEPTANCE.dataSourceId}`) {
+      return ntnOk(DATA_SOURCE_SCHEMA);
+    }
+    if (args[0] === "api" && path.endsWith("/markdown")) {
+      return markdownOk("# 标题\n\n新的正文");
+    }
+    return ntnFail(`unexpected call: ${args.join(" ")}`);
+  };
+
+  it("names the already-written content when the title is rejected by LOCAL validation", async () => {
+    const { tool, calls } = editHarness(script);
+    const result = await tool.execute("edit-local-title", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "旧", new_str: "新" }],
+      // Setting a title column to null is refused by buildPropertyWrite, locally.
+      props: { title: null },
+    });
+
+    assert.equal(result.isError, true);
+    // The content request DID run and is not rolled back.
+    assert.equal(calls.filter((args) => String(args[1] ?? "").endsWith("/markdown")).length, 1);
+    const rendered = text(result);
+    // The model must be told the content already landed...
+    assert.match(rendered, /已经生效的部分：内容/);
+    assert.match(rendered, /不会回滚/);
+    // ...and what failed.
+    assert.match(rendered, /属性\/标题\/icon/);
+    assert.equal(result.details.partial, true);
+    assert.deepEqual(result.details.applied, ["内容（1/1 条 edits）"]);
+    assert.equal(result.details.failed_step, "属性/标题/icon（PATCH 页面属性/icon）");
+  });
+
+  it("names the already-written content when an UNKNOWN COLUMN is rejected by LOCAL validation", async () => {
+    // buildPropertyWrite rejects an unknown column locally, after the content landed.
+    const { tool } = editHarness(script);
+    const result = await tool.execute("edit-local-column", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "旧", new_str: "新" }],
+      props: { "No Such Column": 1 },
+    });
+
+    assert.equal(result.isError, true);
+    const rendered = text(result);
+    assert.match(rendered, /已经生效的部分：内容/);
+    assert.match(rendered, /不会回滚/);
+    assert.equal(result.details.partial, true);
+  });
+
+  it("has NO debt to disclose when the props SHAPE is wrong, because that is rejected before any write", async () => {
+    // `props` is normalized in execute() BEFORE editPage runs, so a wrong shape never
+    // reaches the content edit. Claiming "content already written" here would be a lie
+    // in the opposite direction, which matters just as much.
+    const { tool, calls } = editHarness(script);
+    const result = await tool.execute("edit-local-shape", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "旧", new_str: "新" }],
+      props: [{ a: 1 }] as unknown as Record<string, unknown>,
+    });
+
+    assert.equal(result.isError, true);
+    assert.doesNotMatch(text(result), /已经生效的部分/);
+    assert.notEqual(result.details.partial, true);
+    // Proof nothing was written: no markdown request was ever issued.
+    assert.equal(calls.filter((args) => String(args[1] ?? "").endsWith("/markdown")).length, 0);
+  });
+
+  it("stays a plain error (no debt) when the content edit itself failed", async () => {
+    // Nothing was written, so there is no debt to disclose: the failure must not
+    // claim a partial write that did not happen.
+    const failMarkdown = (args: string[]): RunNtnResult => {
+      if (String(args[1] ?? "").endsWith("/markdown")) return ntnFail("no matches");
+      return script(args);
+    };
+    const { tool } = editHarness(failMarkdown);
+    const result = await tool.execute("edit-local-nocontent", {
+      id: EDIT_PAGE_ID,
+      edits: [{ old_str: "旧", new_str: "新" }],
+      props: { title: null },
+    });
+    assert.equal(result.isError, true);
+    assert.doesNotMatch(text(result), /已经生效的部分/);
+    assert.notEqual(result.details.partial, true);
+  });
+});
+
+describe("notion_page_create: a leading H1 must never vanish", () => {
+  /**
+   * `ntn pages create` silently swallows a `# Heading` that directly follows the
+   * frontmatter block the plugin prepends — the page comes back with the title set
+   * and the heading GONE, reported as a clean success. A direct API call keeps it,
+   * so this is the CLI's parser, but the plugin is the thing that fed it the content:
+   * the user's words must survive. These tests pin the content the plugin SENDS.
+   */
+  function createScript(): (args: string[]) => RunNtnResult {
+    return (args) => {
+      if (args[0] === "pages" && args[1] === "create") {
+        return ntnOk({ object: "page", id: NEW_PAGE_ID, url: "https://app.notion.com/p/x" });
+      }
+      if (args[0] === "api" && String(args[1] ?? "").startsWith("v1/pages/")) {
+        return ntnOk({ object: "page", id: NEW_PAGE_ID });
+      }
+      return ntnFail(`unexpected call: ${args.join(" ")}`);
+    };
+  }
+
+  const contentOf = (calls: string[][]): string => {
+    const args = calls.find((a) => a[0] === "pages" && a[1] === "create");
+    assert.ok(args, "no pages create call");
+    const flag = args.find((a) => a.startsWith("--content="));
+    assert.ok(flag, "no --content flag");
+    return flag.slice("--content=".length);
+  };
+
+  it("keeps a differing H1 as text instead of letting the CLI swallow it", async () => {
+    const { tool, calls } = createHarness(createScript());
+    await tool.execute("create-h1-diff", {
+      parent: `page:${ACCEPTANCE.parentPageId}`,
+      title: "Diff H1",
+      body_content: "# Other H1\n\nbody",
+    });
+
+    const content = contentOf(calls);
+    // The heading TEXT must still be in the payload, escaped so the CLI does not eat it.
+    assert.match(content, /Other H1/);
+    assert.match(content, /\\# Other H1/, "the H1 must be escaped; an unescaped one is dropped");
+    // And the body after it must survive too.
+    assert.match(content, /body/);
+  });
+
+  it("still dedupes when the H1 equals the title (that case is intentional)", async () => {
+    const { tool, calls } = createHarness(createScript());
+    await tool.execute("create-h1-same", {
+      parent: `page:${ACCEPTANCE.parentPageId}`,
+      title: "Same Title",
+      body_content: "# Same Title\n\nonly body",
+    });
+
+    const content = contentOf(calls);
+    // The heading becomes the page title, so it must NOT be repeated as a heading.
+    assert.doesNotMatch(content, /^# Same Title/m);
+    assert.doesNotMatch(content, /\\# Same Title/);
+    assert.match(content, /only body/);
+  });
+});

@@ -269,7 +269,12 @@ export function formatOutcome(outcome: SearchOutcome): string {
   const header = `Notion search "${outcome.query}": ${outcome.results.length} result(s) (limit ${outcome.limit}).`;
   const body =
     outcome.results.length === 0
-      ? ["No matches. Notion search matches titles only — try a shorter keyword or another language of the title."]
+      ? [
+          "No matches. Notion search scans TITLES only (never body text).",
+          'Next: retry the EXACT title in double quotes, e.g. "My Page Title" — that is the reliable lookup.',
+          "If it still misses, the page may be seconds old and not indexed yet: retry once, then search a distinctive single word.",
+          "Do NOT simply shorten the query: matching is token-OR, so fewer words means MORE unrelated hits, not fewer.",
+        ]
       : outcome.results.map((hit, index) => {
           const title = hit.title || "(untitled)";
           const url = hit.url ? `\n   ${hit.url}` : "";
@@ -293,13 +298,21 @@ export function createNotionSearchTool(deps: Partial<SearchDeps> = {}): NotionTo
   return defineNotionTool<SearchOutcome>({
     name: "notion_search",
     description:
-      "Search the Notion workspace by title and return every hit's id, title, URL and object type " +
-      "(page|database). The match is FUZZY, not exact: Notion matches words inside the title " +
-      "(case-insensitive), a hit can be loosely related, and an empty result does NOT prove the object " +
-      "is missing — try a shorter or different keyword first. Titles only: page body text is never " +
-      "searched. Use filter_object to cut noise. Any hit's id can be passed straight to notion_get or " +
-      "notion_query (both accept page, data source and database ids). Refine the query instead of " +
-      "raising limit, which is capped at 25.",
+      "Search the Notion workspace by TITLE and return hits with id, title, URL and object type " +
+      "(page|database|data_source). " +
+      "MATCHING IS TOKEN-OR, NOT SUBSTRING — this is the single most important thing to know: Notion splits " +
+      "the query into words and returns anything whose title contains ANY ONE of them, ranked. So a long query " +
+      "returns loosely-related pages that share one word, and hit #1 is often unrelated. Example from a real " +
+      "workspace: querying a page's full title returns 10 hits, only one of which is that page. " +
+      "TO LOOK UP ONE KNOWN PAGE, WRAP THE EXACT TITLE IN DOUBLE QUOTES (\\\"PRD · notion_page\\\") — that " +
+      "returns exactly that page. Do that FIRST whenever you already know the title. " +
+      "Titles only: page body text is never searched, so a term that appears only in the body finds nothing. " +
+      "An empty result does NOT prove the object is missing (a just-created page is not indexed for a " +
+      "second or two; retry once before concluding absence). " +
+      "Use filter_object to cut noise, and prefer refining the query over raising limit (capped at 25). " +
+      "Verify before you act: ids from here must be confirmed with notion_get, because a loosely related hit " +
+      "looks like a legitimate match. For a data_source hit, notion_get/notion_query need " +
+      "data-source:<id> or database:<id> to be unambiguous.",
     timeoutMs: TOOL_TIMEOUTS.search,
     // Read-only and independent of every other call: safe to run alongside siblings.
     isConcurrencySafe: () => true,

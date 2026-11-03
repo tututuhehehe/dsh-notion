@@ -1503,6 +1503,11 @@ function planContent(markdown, titleHint) {
   const title = titleHint ?? existingFrontmatterTitle ?? h1?.title;
   let body = markdown;
   if (h1 && title === h1.title) body = h1.rest;
+  else if (h1 && existingFrontmatterTitle === void 0) {
+    body = `\\# ${h1.title}
+
+${h1.rest}`;
+  }
   if (title) body = withFrontmatterTitle(body, title);
   return title ? { body, title } : { body };
 }
@@ -1986,23 +1991,31 @@ async function editPage(params, runner) {
   }
   const needsPatch = params.props !== void 0 || params.title !== void 0 || params.icon !== void 0;
   if (needsPatch) {
-    const schema = await schemaForPage(runner, id);
-    const { properties, names, changes } = buildPropertyWrite(schema, params.props, params.title, {
-      pageId: id,
-      source: schema.source
-    });
-    const patchResult = await runner({ args: patchArgs(id, properties, params.icon) });
-    if (!patchResult.ok) {
-      const cause = ntnFailure("PATCH \u9875\u9762\u5C5E\u6027/icon", patchResult);
+    let patchResult;
+    try {
+      const schema = await schemaForPage(runner, id);
+      const { properties, names, changes } = buildPropertyWrite(schema, params.props, params.title, {
+        pageId: id,
+        source: schema.source
+      });
+      patchResult = await runner({ args: patchArgs(id, properties, params.icon) });
+      if (!patchResult.ok) throw ntnFailure("PATCH \u9875\u9762\u5C5E\u6027/icon", patchResult);
+      const patched = parseJsonMaybe(patchResult.stdout);
+      if (pageHasUrl(patched)) result.url = pageUrlFromRaw(patched, id);
+      result.properties = names;
+      result.changes.push(...changes);
+      if (params.icon !== void 0) result.changes.push("icon");
+      if (names.length > 0) applied.push(`\u5C5E\u6027\uFF08${names.join(", ")}\uFF09`);
+      if (params.icon !== void 0) applied.push("icon");
+    } catch (error) {
+      const cause = error instanceof NotionToolError ? error : ntnFailure("PATCH \u9875\u9762\u5C5E\u6027/icon", {
+        ok: false,
+        stdout: "",
+        stderr: error instanceof Error ? error.message : String(error),
+        code: null
+      });
       throw applied.length > 0 ? partialEditError(cause, applied, "\u5C5E\u6027/\u6807\u9898/icon\uFF08PATCH \u9875\u9762\u5C5E\u6027/icon\uFF09") : cause;
     }
-    const patched = parseJsonMaybe(patchResult.stdout);
-    if (pageHasUrl(patched)) result.url = pageUrlFromRaw(patched, id);
-    result.properties = names;
-    result.changes.push(...changes);
-    if (params.icon !== void 0) result.changes.push("icon");
-    if (names.length > 0) applied.push(`\u5C5E\u6027\uFF08${names.join(", ")}\uFF09`);
-    if (params.icon !== void 0) applied.push("icon");
   }
   if (params.parent !== void 0) {
     let move2;
@@ -2199,6 +2212,7 @@ var NESTING_BLOCK_TYPES = /* @__PURE__ */ new Set([
   "callout"
 ]);
 var MAX_BLOCK_PAGES = 100;
+var MAX_LISTED_CHILDREN = 20;
 async function listChildPages(runner, pageId, options) {
   const children = [];
   let cursor;
@@ -2294,8 +2308,17 @@ async function trashPage(params, runner) {
   if (target.kind === "page") {
     const children = await listChildPages(runner, id, { failOnUnreadable: !params.recursive });
     if (children.length > 0 && !params.recursive) {
+      const listed = children.slice(0, MAX_LISTED_CHILDREN).map((child) => {
+        const isContainer = child.title.endsWith("block with nested content)");
+        const kind = isContainer ? "\u5D4C\u5957\u5BB9\u5668" : "\u5B50\u9875\u9762";
+        return `  - [${kind}] ${child.title} \u2014 ${child.id}`;
+      }).join("\n");
+      const overflow = children.length > MAX_LISTED_CHILDREN ? `
+  \u2026\u53E6\u6709 ${children.length - MAX_LISTED_CHILDREN} \u4E2A\u672A\u5217\u51FA\uFF08\u5171 ${children.length} \u4E2A\uFF0C\u5B8C\u6574\u5217\u8868\u89C1 Notion\uFF09\u3002` : "";
       throw new InputError(
-        `\u9875\u9762 ${id} \u6709 ${children.length} \u4E2A\u5B50\u9875\u9762\u3002Notion \u4F1A\u8FDE\u5E26\u5F52\u6863\u6574\u68F5\u5B50\u6811\uFF0C\u6240\u4EE5\u9ED8\u8BA4\u62D2\u7EDD\u3002\u786E\u8BA4\u8981\u4E00\u8D77\u5220\u9664\u8BF7\u52A0 recursive: true\uFF1B\u53EA\u60F3\u5220\u7236\u9875\u9762\u8BF7\u5148\u5728 Notion \u91CC\u79FB\u8D70\u5B50\u9875\u9762\u3002`,
+        `\u9875\u9762 ${id} \u6709 ${children.length} \u4E2A\u5B50\u9875\u9762/\u5D4C\u5957\u5BB9\u5668\uFF1A
+${listed}${overflow}
+Notion \u4F1A\u8FDE\u5E26\u5F52\u6863\u6574\u68F5\u5B50\u6811\uFF0C\u6240\u4EE5\u9ED8\u8BA4\u62D2\u7EDD\u3002\u786E\u8BA4\u8981\u4E00\u8D77\u5220\u9664\u8BF7\u52A0 recursive: true\uFF1B\u53EA\u60F3\u5220\u7236\u9875\u9762\u8BF7\u5148\u5728 Notion \u91CC\u79FB\u8D70\u8FD9\u4E9B\u5B50\u9875\u9762\u3002`,
         {
           id,
           children: children.map((child) => child.id),
@@ -2320,11 +2343,11 @@ var EDIT_ITEM_SCHEMA = {
   properties: {
     old_str: {
       type: "string",
-      description: "Required, non-empty. The existing text to find. It matches the block's PLAIN TEXT, not its markdown: to find text shown as **bold** write `text` without the asterisks, and write a plain `$` where notion_get returned `\\$`. Cross-block matches use \\n or \\n\\n."
+      description: "Required, non-empty. The existing text to find. A SUBSTRING MATCHES \u2014 you may replace one word, one sentence, or several whole blocks; you do NOT have to repeat the whole paragraph. MATCHING RUNS ON PLAIN TEXT, WITH ONE RULE: the substring must lie ENTIRELY WITHIN ONE RICH-TEXT RUN and must NOT CONTAIN A FORMATTING MARKER. So for a paragraph shown as `Alpha **bold** omega`, these work: `Alpha `, `bold`, ` omega` \u2014 and these DON'T: `**bold**` (contains a marker), `Alpha bold` (crosses from plain text into the bold run), `Alpha **bold** omega` (contains a marker). PRACTICAL RULE, verified live: pick a short marker-free fragment from WITHIN a single run rather than copying the markup; if a unique fragment is impossible, send the whole paragraph with its markers and it will NOT match \u2014 instead choose a fragment on one side of the formatting. Adjacent blocks can be matched together with \\n; that merges them into one block on replace, so only do it when you intend to merge. A `$` may be written EITHER bare or escaped here \u2014 both match (verified), so copying the \\\\$ that notion_get renders works."
     },
     new_str: {
       type: "string",
-      description: 'Required. The replacement text. "" DELETES old_str. It is markdown: a new_str containing \\n\\n creates separate blocks.'
+      description: 'Required. The replacement text. "" DELETES old_str. It is markdown, so **bold**, `code`, [link](url), ## headings and - list items all render as that formatting; a new_str containing \\n\\n creates separate blocks and a single \\n is a line break inside one block. Write a BARE $ here, never the escaped \\\\$ \u2014 an escaped \\\\$ in new_str is stored as a literal backslash-dollar and visibly corrupts the text (verified). notion_get renders a stored $ as \\\\$, so when reusing shown text as new_str, un-escape it first.'
     },
     replace_all_matches: {
       type: "boolean",
@@ -2483,7 +2506,7 @@ function createNotionPageEditTool(deps = {}) {
   const runner = deps.runNtn ?? runNtn;
   return defineNotionTool({
     name: "notion_page_edit",
-    description: 'Change an existing Notion page: find-and-replace its text, append Markdown, update title/columns/icon, and/or move it. A single call may combine all of these; they are applied in this fixed order \u2014 (1) body content, (2) title/props/icon, (3) parent move \u2014 and `changed` reports each one that happened. CONTENT: `edits` is a list of {old_str, new_str} operations applied in order, so edit[i+1] sees edit[i]\'s result. old_str matches the block\'s PLAIN TEXT, not its markdown: write `text` for **text**, and a plain $ where notion_get showed \\$; a match can span blocks with \\n. new_str "" DELETES the matched text. MATCH OUTCOMES, three distinct cases \u2014 do not conflate them. (a) EVERY edit matches: call succeeds, `warnings` is absent. (b) SOME edit matches: the call SUCCEEDS, the matching edits stay applied, the unmatched ones come back in `warnings` (code "no_match") and edits_applied/edits_missed give the tally \u2014 nothing is rolled back, so re-read the page before assuming what it now contains; `warnings` is ABSENT when nothing missed (it is never an empty array). (c) NO edit matches: the call FAILS with Notion\'s validation_error and nothing is written. That is Notion\'s rule, not a local pre-check \u2014 treat it as "my old_str were wrong": re-read the page with notion_get and build new old_str from what it actually says. SEPARATELY, an old_str matching MORE THAN ONE place is also a hard error with nothing written, unless THAT edit sets replace_all_matches:true. There is NO whole-page replace: when `edits` is empty or absent and body_content is present, body_content is APPENDED to the end of the page (passing both edits and body_content is an error \u2014 do it in two calls). FIELDS: icon and body_content are TOP-LEVEL parameters, not props keys; props carries database COLUMNS only (name \u2192 simplified value, converted by column type). MOVE: parent page:<id> (or a bare page id) re-parents the page via POST /v1/pages/{id}/move; a bare ROW id re-links that row\'s Parent-item relation. Re-linking a row that already has a different parent needs yes:true (otherwise it refuses and shows the current parent ids); cycle-forming moves are refused. If step (2) or (3) fails after content was already written, the error says exactly what already landed \u2014 read it before retrying. When the returned body was truncated the result says so: truncated markdown is NOT the full page, so do not derive the next old_str from it.',
+    description: 'Change an existing Notion page: find-and-replace its text, append Markdown, update title/columns/icon, and/or move it. A single call may combine all of these; they are applied in this fixed order \u2014 (1) body content, (2) title/props/icon, (3) parent move \u2014 and `changed` reports each one that happened. CONTENT: `edits` is a list of {old_str, new_str} operations applied in order, so edit[i+1] sees edit[i]\'s result. old_str matches ANY SUBSTRING of the page text (one word, one sentence, several blocks) \u2014 not just a whole block. The match target is the MARKDOWN notion_get shows, so copy it as-is with markers (**bold**, `code`, [link](url), ## heading, - item); stripping them is the one way to break it (a paragraph shown as `Alpha **b** omega` does not match as `Alpha b omega`). Adjacent blocks join with \\n (and merge on replace). The one reversal: where notion_get shows \\\\$ use \\\\$ in old_str but a bare $ in new_str, or the page is corrupted. new_str "" DELETES the matched text. MATCH OUTCOMES, three distinct cases \u2014 do not conflate them. (a) EVERY edit matches: call succeeds, `warnings` is absent. (b) SOME edit matches: the call SUCCEEDS, the matching edits stay applied, the unmatched ones come back in `warnings` (code "no_match") and edits_applied/edits_missed give the tally \u2014 nothing is rolled back, so re-read the page before assuming what it now contains; `warnings` is ABSENT when nothing missed (it is never an empty array). (c) NO edit matches: the call FAILS with Notion\'s validation_error and nothing is written. That is Notion\'s rule, not a local pre-check \u2014 treat it as "my old_str were wrong": re-read the page with notion_get and build new old_str from what it actually says. SEPARATELY, an old_str matching MORE THAN ONE place is also a hard error with nothing written, unless THAT edit sets replace_all_matches:true. There is NO whole-page replace: when `edits` is empty or absent and body_content is present, body_content is APPENDED to the end of the page (passing both edits and body_content is an error \u2014 do it in two calls). FIELDS: icon and body_content are TOP-LEVEL parameters, not props keys; props carries database COLUMNS only (name \u2192 simplified value, converted by column type). MOVE: parent page:<id> (or a bare page id) re-parents the page via POST /v1/pages/{id}/move; a bare ROW id re-links that row\'s Parent-item relation. Re-linking a row that already has a different parent needs yes:true (otherwise it refuses and shows the current parent ids); cycle-forming moves are refused. If step (2) or (3) fails after content was already written, the error says exactly what already landed \u2014 read it before retrying. When the returned body was truncated the result says so: truncated markdown is NOT the full page, so do not derive the next old_str from it.',
     timeoutMs: TOOL_TIMEOUTS.page,
     isConcurrencySafe: () => false,
     parameters: EDIT_PARAMETERS,
@@ -3072,7 +3095,12 @@ async function searchNotion(params, runner = defaultDeps.run) {
 }
 function formatOutcome(outcome) {
   const header = `Notion search "${outcome.query}": ${outcome.results.length} result(s) (limit ${outcome.limit}).`;
-  const body = outcome.results.length === 0 ? ["No matches. Notion search matches titles only \u2014 try a shorter keyword or another language of the title."] : outcome.results.map((hit, index) => {
+  const body = outcome.results.length === 0 ? [
+    "No matches. Notion search scans TITLES only (never body text).",
+    'Next: retry the EXACT title in double quotes, e.g. "My Page Title" \u2014 that is the reliable lookup.',
+    "If it still misses, the page may be seconds old and not indexed yet: retry once, then search a distinctive single word.",
+    "Do NOT simply shorten the query: matching is token-OR, so fewer words means MORE unrelated hits, not fewer."
+  ] : outcome.results.map((hit, index) => {
     const title = hit.title || "(untitled)";
     const url = hit.url ? `
    ${hit.url}` : "";
@@ -3086,7 +3114,7 @@ function createNotionSearchTool(deps = {}) {
   const runner = deps.run ?? defaultDeps.run;
   return defineNotionTool({
     name: "notion_search",
-    description: "Search the Notion workspace by title and return every hit's id, title, URL and object type (page|database). The match is FUZZY, not exact: Notion matches words inside the title (case-insensitive), a hit can be loosely related, and an empty result does NOT prove the object is missing \u2014 try a shorter or different keyword first. Titles only: page body text is never searched. Use filter_object to cut noise. Any hit's id can be passed straight to notion_get or notion_query (both accept page, data source and database ids). Refine the query instead of raising limit, which is capped at 25.",
+    description: `Search the Notion workspace by TITLE and return hits with id, title, URL and object type (page|database|data_source). MATCHING IS TOKEN-OR, NOT SUBSTRING \u2014 this is the single most important thing to know: Notion splits the query into words and returns anything whose title contains ANY ONE of them, ranked. So a long query returns loosely-related pages that share one word, and hit #1 is often unrelated. Example from a real workspace: querying a page's full title returns 10 hits, only one of which is that page. TO LOOK UP ONE KNOWN PAGE, WRAP THE EXACT TITLE IN DOUBLE QUOTES (\\"PRD \xB7 notion_page\\") \u2014 that returns exactly that page. Do that FIRST whenever you already know the title. Titles only: page body text is never searched, so a term that appears only in the body finds nothing. An empty result does NOT prove the object is missing (a just-created page is not indexed for a second or two; retry once before concluding absence). Use filter_object to cut noise, and prefer refining the query over raising limit (capped at 25). Verify before you act: ids from here must be confirmed with notion_get, because a loosely related hit looks like a legitimate match. For a data_source hit, notion_get/notion_query need data-source:<id> or database:<id> to be unambiguous.`,
     timeoutMs: TOOL_TIMEOUTS.search,
     // Read-only and independent of every other call: safe to run alongside siblings.
     isConcurrencySafe: () => true,

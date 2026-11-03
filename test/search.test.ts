@@ -271,7 +271,12 @@ describe("formatOutcome", () => {
   it("explains an empty result set", () => {
     const text = formatOutcome({ query: "zzz", limit: 10, hasMore: false, results: [] });
     assert.match(text, /0 result\(s\)/);
-    assert.match(text, /matches titles only/);
+    assert.match(text, /scans TITLES only/);
+    // Under token-OR matching, "try a shorter keyword" is actively harmful advice:
+    // fewer words means MORE unrelated hits. The message must say the opposite.
+    assert.match(text, /EXACT title in double quotes/);
+    assert.match(text, /Do NOT simply shorten the query/);
+    assert.doesNotMatch(text, /try a shorter keyword/);
   });
 
   it("tells the model when upstream has more", () => {
