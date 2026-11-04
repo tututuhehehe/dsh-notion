@@ -1359,7 +1359,7 @@ var TRASH_PENDING_TEXT = {
   cancel: (p) => `\u4E0D\u5220\u9664   \u2192 double_check({ "id": "${p.id}", "yes": false })`,
   // id ← pending.id
   /** 只想删父页面时的替代路径：复核不会替调用方保留子页面。 */
-  onlyParent: (p) => `\u53EA\u60F3\u5220\u7236\u9875\u9762 \u2192 \u5148 double_check({ "id": "${p.id}", "yes": false })\uFF0C\u518D\u7528 notion_page_edit \u628A\u4E0B\u9762\u8FD9\u4E9B\u5B50\u9875\u9762\u79FB\u5230\u522B\u5904\uFF0C\u6700\u540E\u91CD\u65B0\u8C03\u7528 notion_page_trash\u3002`
+  onlyParent: (p) => `\u53EA\u60F3\u5220\u7236\u9875\u9762 \u2192 \u5148 double_check({ "id": "${p.id}", "yes": false })\uFF0C\u518D\u7528 notion_page_edit \u628A\u4E0A\u9762\u5217\u51FA\u7684\u5B50\u9875\u9762\u9010\u4E2A\u79FB\u5230\u522B\u5904\uFF0C\u6700\u540E\u91CD\u65B0\u8C03\u7528 notion_page_trash\u3002`
   // id ← pending.id
 };
 

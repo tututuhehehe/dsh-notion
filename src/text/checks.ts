@@ -92,6 +92,6 @@ export const TRASH_PENDING_TEXT = {
   /** 只想删父页面时的替代路径：复核不会替调用方保留子页面。 */
   onlyParent: (p: { id: string }): string =>
     `只想删父页面 → 先 double_check({ "id": "${p.id}", "yes": false })，` +
-    "再用 notion_page_edit 把下面这些子页面移到别处，最后重新调用 notion_page_trash。",
+    "再用 notion_page_edit 把上面列出的子页面逐个移到别处，最后重新调用 notion_page_trash。",
   // id ← pending.id
 } as const;
