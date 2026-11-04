@@ -1267,12 +1267,11 @@ function isRecord(value) {
 function readDoublecheck(get) {
   const service = get();
   if (service === void 0 || service === null) return void 0;
-  const checkpoint2 = service.checkpoint;
-  if (typeof checkpoint2 !== "function") throw reviewBroken();
   return service;
 }
 function checkpoint(p) {
-  if (!p.service) {
+  const usable = p.service !== void 0 && typeof p.service.checkpoint === "function";
+  if (!usable) {
     if (p.risk !== null) throw p.unavailable();
     return void 0;
   }

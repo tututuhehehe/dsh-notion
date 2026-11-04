@@ -45,12 +45,10 @@ export type DoublecheckService = {
   checkpoint(exec: unknown, risk: RiskSnapshot | null): unknown;
 };
 
-/** 读取可选服务；插件没装或没启用时是 undefined。 */
+/** 读取可选服务；插件没装或没启用时是 undefined。形状校验在 {@link checkpoint} 里做。 */
 export function readDoublecheck(get: () => unknown): DoublecheckService | undefined {
   const service = get();
   if (service === undefined || service === null) return undefined;
-  const checkpoint = (service as { checkpoint?: unknown }).checkpoint;
-  if (typeof checkpoint !== "function") throw reviewBroken();
   return service as DoublecheckService;
 }
 
@@ -69,15 +67,18 @@ export function checkpoint(p: {
   risk: RiskSnapshot | null;
   unavailable: () => NotionToolError;
 }): PendingValue | undefined {
-  if (!p.service) {
-    // 没有复核通道：有风险的删除一律不做，报错；没有风险的操作本来就不需要它。
+  // No channel, or one that does not actually offer `checkpoint` (a version mismatch):
+  // a call with risk does not happen, a call without risk does. Nothing is being ignored
+  // in the second case — there is no side effect that needs a review.
+  const usable = p.service !== undefined && typeof p.service.checkpoint === "function";
+  if (!usable) {
     if (p.risk !== null) throw p.unavailable();
     return undefined;
   }
   if (p.risk !== null) assertRisk(p.risk);
   let decision: unknown;
   try {
-    decision = p.service.checkpoint(p.exec, p.risk);
+    decision = p.service!.checkpoint(p.exec, p.risk);
   } catch (error) {
     // doublecheck 内部的拒绝（DC_* 错误）已经是模型可读的中文消息，保留原文。
     if (error instanceof NotionToolError) throw error;

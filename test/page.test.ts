@@ -1647,6 +1647,15 @@ describe("notion_page_trash: a leaf page is deleted by the one call", () => {
     assert.deepEqual(result.details.changed, ["trashed"]);
     assert.deepEqual(calls.at(-1), ["pages", "trash", EDIT_PAGE_ID, "--yes"]);
   });
+
+  it("is not blocked by a review channel that is installed but has no checkpoint", async () => {
+    // A version mismatch must not turn every leaf delete into an error: there is nothing
+    // to review here, so an unusable channel is simply not consulted.
+    const { tool } = trashHarness(noChildren(), () => ({ notTheService: true }));
+    const result = await tool.execute("t-leaf-broken", { id: EDIT_PAGE_ID });
+    assert.equal(result.isError, false, text(result));
+    assert.deepEqual(result.details.changed, ["trashed"]);
+  });
 });
 
 describe("notion_page_trash: a page with children is NOT deleted by the call that names it", () => {
