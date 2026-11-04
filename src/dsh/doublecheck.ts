@@ -12,6 +12,17 @@
  *     不能当成错误抛出去；
  *   - `risk` 为 null 也要走一次：确认过的调用会用原参数重放，只有再过一次检查点，
  *     doublecheck 才能发现「范围已经和复核时不一样了」并把旧确认判为失效。
+ *
+ * 实测记录：2026-11-04，doublecheck 0.1.0（含当日那次「摘要 + 子工具内容」渲染改版）
+ * 与真实 Notion 跑通 5 条路径——无子页面直删、子树 pending、确认删除、复核后范围变化
+ * 触发重审、取消；`then` 替代调用也验过。上面四条契约在那次改版里**一条都没变**
+ * （`src/core.js` 未改动），改的只是 `double_check` 自己的渲染与文档。
+ *
+ * 两处不归我们拥有、因此刻意宽处理的东西：
+ *   - pending 的字段集合由 doublecheck 决定，我们的 `output.schema` 对它放开
+ *     `additionalProperties`，他们加字段不会让这里报错；
+ *   - PTC（`run_code`）里 pending 走 `deferContext` 投递完整的 pending JSON，
+ *     不经过我们 `render` 的那两行答复指引——`double_check` 的工具描述负责补齐。
  */
 import { CHECK_ERRORS } from "../text/errors.ts";
 import { NOTION_ERROR_CODES, NotionToolError } from "./tool.ts";

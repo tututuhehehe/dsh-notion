@@ -3212,7 +3212,7 @@ var TRASH_PENDING_OUTPUT_SCHEMA = {
     details: { description: TRASH_PENDING_OUTPUT_TEXT.details }
   },
   required: ["kind", "id", "reason"],
-  additionalProperties: false
+  additionalProperties: true
 };
 var TRASH_OUTPUT_SCHEMA = {
   oneOf: [PAGE_OUTPUT_SCHEMA, TRASH_PENDING_OUTPUT_SCHEMA]

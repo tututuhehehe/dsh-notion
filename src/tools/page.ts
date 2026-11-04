@@ -2890,6 +2890,12 @@ const PAGE_OUTPUT_SCHEMA = {
  * It is NOT an error: nothing failed and nothing was written. It is returned as the
  * canonical value so the model gets a structured `id` to answer with, and so
  * `output.render` can say "not executed" in words.
+ *
+ * `additionalProperties: true` on purpose, unlike every other value here: this object is
+ * built by doublecheck, not by this plugin, so its field set is not ours to freeze. A
+ * closed schema would turn their next added field (an audit code, a note) into "this tool
+ * returned a value its own schema rejects" — a plugin error with no cause in this plugin.
+ * The three required fields are the part we actually depend on.
  */
 const TRASH_PENDING_OUTPUT_SCHEMA = {
   type: "object",
@@ -2900,7 +2906,7 @@ const TRASH_PENDING_OUTPUT_SCHEMA = {
     details: { description: TRASH_PENDING_OUTPUT_TEXT.details },
   },
   required: ["kind", "id", "reason"],
-  additionalProperties: false,
+  additionalProperties: true,
 };
 
 /**

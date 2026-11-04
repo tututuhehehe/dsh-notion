@@ -1771,6 +1771,26 @@ describe("notion_page_trash: a page with children is NOT deleted by the call tha
     assert.doesNotMatch(json, /undefined/);
   });
 
+  it("passes through a pending field it does not know about", async () => {
+    // The pending object is built by doublecheck, not here, so its field set is theirs.
+    // If they add one, this tool must keep working: a closed output schema would fail the
+    // call with "my own value does not match my own schema" — an error with no cause here.
+    const dc = fakeDoublecheck((risk: any) => ({
+      kind: "pending",
+      id: "0007",
+      reason: risk.reason,
+      details: risk.details,
+      audit_code: "notion.trash.subtree.v1",
+    }));
+    const { tool } = trashHarness(withChildren(), dc.get);
+    const result = await tool.execute("t-extra", { id: EDIT_PAGE_ID });
+
+    assert.equal(result.isError, false, text(result));
+    assert.equal(result.details.kind, "pending");
+    assert.equal(result.details.audit_code, "notion.trash.subtree.v1");
+    assert.match(text(result), /未删除/);
+  });
+
   it("fails closed when the review channel is missing", async () => {
     const { tool, calls } = trashHarness(withChildren());
     const result = await tool.execute("t-nodc", { id: EDIT_PAGE_ID });
