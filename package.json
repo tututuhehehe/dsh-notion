@@ -1,7 +1,7 @@
 {
   "name": "dsh-notion",
-  "version": "1.0.6",
-  "description": "Six consolidated Notion tools for DeepSeek Harness over the official ntn CLI: search, get, query, page_create, page_edit, page_trash",
+  "version": "1.1.0",
+  "description": "Six consolidated Notion tools for DeepSeek Harness over the official ntn CLI: search, get, query, page_create, page_edit, page_trash (a subtree delete needs a doublecheck review first)",
   "type": "module",
   "main": "./dist/index.js",
   "exports": {

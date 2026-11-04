@@ -74,10 +74,14 @@ export const TOOL_DESCRIPTIONS = {
   pageTrash:
 
     "Move one Notion page or database row to the trash. " +
-    "yes:true is required, otherwise nothing is called. " +
-    "Three guards a bare delete does not give you: a database or data source is refused even with yes:true " +
-    "(deleting one destroys its rows too — ask the user to do it in Notion); a page that is already in the trash " +
-    "returns success with already_archived:true instead of an error; and a page with child pages is refused " +
-    "unless recursive:true, because Notion archives the whole subtree — the error lists the child ids so you can " +
-    "show the user exactly what else would go. Trash is idempotent: calling it twice is safe.",
+    "A page with NO child pages is deleted by this one call, immediately. " +
+    "A page WITH child pages is NOT deleted by this one call: it returns kind:'pending' and lists every child " +
+    "page (id + title) that would go with it, because Notion always trashes the whole subtree. You must then " +
+    "answer that pending in a LATER model step with double_check — yes:true deletes the whole subtree, " +
+    "yes:false cancels; double_check becomes visible with the first pending. If the doublecheck service is " +
+    "unavailable, a subtree delete fails without deleting anything. " +
+    "Two things are refusals rather than pendings: a database or data source is refused outright (deleting one " +
+    "destroys its rows too — ask the user to do it in Notion), and a page whose child list cannot be read is " +
+    "refused because the scope could not be stated. A page already in the trash returns success with " +
+    "already_archived:true and changed:[] — nothing was written. Trash is idempotent: calling it twice is safe.",
 } as const;

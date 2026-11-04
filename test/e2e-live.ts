@@ -1,7 +1,7 @@
 /**
- * Live end-to-end check for dsh-notion 1.1 (NOT part of `npm test`).
+ * Live end-to-end check for dsh-notion (NOT part of `npm test`).
  *
- * Covers the v1.1 behaviors that cannot be proven with mocks:
+ * Covers the behaviors that cannot be proven with mocks:
  *   - child row create under a parent row (bare parent row id → Parent-item relation)
  *   - notion_query `under` returns that child row
  *   - notion_page_edit with a bare row id parent moves the child (overwrite needs yes:true;
@@ -9,6 +9,8 @@
  *   - cycle refusal (C under B when B is already under C) and self-move refusal
  *   - find-and-replace: a matching edit applies, a non-matching one comes back as a
  *     warning on a successful call, and an appended body_content lands at the end
+ *   - the trash gate: a page WITH a child page comes back as a pending that names the
+ *     child and deletes nothing; only a proceeding review deletes the subtree
  *   - trash cleanup of every temp row, including after a failed step
  *
  * Run on the box with a real token:
@@ -127,13 +129,102 @@ async function waitForChild(
   return false;
 }
 
-async function trash(id: string): Promise<boolean> {
-  const result = await call("notion_page_trash", { id, yes: true });
-  if (!result.isError) {
-    const index = created.findIndex((entry) => sameNotionId(entry.id, id));
-    if (index >= 0) created.splice(index, 1);
+async function trash(id: string): Promise<{ ok: boolean; why: string }> {
+  // No `yes`: a page with no child pages is deleted by this one call, and a subtree delete
+  // would come back as a pending instead of deleting (the cleanup below only ever sees
+  // leaves once the deepest-first order is respected).
+  let why = "";
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const result = await call("notion_page_trash", { id });
+    if (!result.isError) {
+      const index = created.findIndex((entry) => sameNotionId(entry.id, id));
+      if (index >= 0) created.splice(index, 1);
+      return { ok: true, why: "" };
+    }
+    why = text(result).slice(0, 400);
+    // The line this runs on sees api.notion.com drop TLS handshakes in bursts, so a
+    // cleanup failure gets two more chances before it is reported as a real failure.
+    await new Promise((resolve) => setTimeout(resolve, 2500));
   }
-  return !result.isError;
+  return { ok: false, why };
+}
+
+/**
+ * The trash gate, against real pages.
+ *
+ * The real doublecheck service is only reachable through a live DSH execution, so the tool
+ * is mounted twice with stand-ins: one that always returns a pending (echoing the risk the
+ * way the service does) and one that proceeds. What this proves against real Notion is the
+ * part mocks cannot: that the child list is enumerated for a real page, that the pending
+ * names real ids, and that nothing is deleted until the review proceeds.
+ */
+async function checkTrashGate(): Promise<void> {
+  const hostTitle = `e2e ${stamp} gate host`;
+  const host = await call("notion_page_create", {
+    parent: `page:${ACCEPTANCE.parentPageId}`,
+    title: hostTitle,
+    body_content: "temp host for the trash review",
+  });
+  const hostId = detailId(host);
+  if (!hostId) throw new Error(`gate: could not create the host page: ${text(host)}`);
+  created.push({ id: hostId, label: "gate host" });
+
+  const child = await call("notion_page_create", {
+    parent: `page:${hostId}`,
+    title: `e2e ${stamp} gate child`,
+    body_content: "temp child page",
+  });
+  const childId = detailId(child);
+  if (!childId) throw new Error(`gate: could not create the child page: ${text(child)}`);
+  created.push({ id: childId, label: "gate child" });
+
+  const pendingTool = mount(
+    createNotionPageTrashTool({
+      getDoublecheck: () => ({
+        checkpoint: (_exec: unknown, risk: { reason: string; details?: unknown } | null) =>
+          risk === null
+            ? { kind: "proceed" }
+            : { kind: "pending", id: "0001", reason: risk.reason, details: risk.details },
+      }),
+    })
+  );
+  const pended = await pendingTool.execute("e2e-gate-pending", { id: hostId });
+  const pendedText = text(pended);
+  check(
+    "a page with a child page returns a pending instead of deleting",
+    pended.isError !== true && pended.details?.kind === "pending",
+    pendedText.slice(0, 400)
+  );
+  check(
+    "the pending names the real child page id and says nothing was deleted",
+    pendedText.includes(childId) && /未删除/.test(pendedText) && /不是失败/.test(pendedText),
+    pendedText.slice(0, 600)
+  );
+  check(
+    "the pending names the page title it is about",
+    pendedText.includes(hostTitle),
+    pendedText.slice(0, 400)
+  );
+  // Nothing was deleted: the host page is still readable.
+  const stillThere = await call("notion_get", { id_or_url: hostId });
+  check("the host page still exists after a pending", stillThere.isError !== true, text(stillThere).slice(0, 300));
+
+  const proceedTool = mount(
+    createNotionPageTrashTool({
+      getDoublecheck: () => ({ checkpoint: () => ({ kind: "proceed" }) }),
+    })
+  );
+  const confirmed = await proceedTool.execute("e2e-gate-confirmed", { id: hostId });
+  check(
+    "a proceeding review deletes the page together with its child",
+    confirmed.isError !== true && confirmed.details?.changed?.includes?.("trashed") === true,
+    text(confirmed).slice(0, 400)
+  );
+  created.splice(
+    0,
+    created.length,
+    ...created.filter((entry) => ![hostId, childId].some((id) => sameNotionId(id, entry.id)))
+  );
 }
 
 async function main(): Promise<void> {
@@ -315,12 +406,15 @@ async function main(): Promise<void> {
       deleted.isError !== true && deleted.details?.edits_applied === 1,
       text(deleted).slice(0, 300)
     );
+
+    // 6. The trash gate: a subtree delete needs a review, a leaf delete does not.
+    await checkTrashGate();
   } finally {
-    // 6. Cleanup: trash every temp row, deepest first so no child is left pointing at a trashed parent.
+    // 7. Cleanup: trash every temp row, deepest first so no child is left pointing at a trashed parent.
     const toTrash = [...created].reverse();
     for (const entry of toTrash) {
-      const ok = await trash(entry.id);
-      check(`cleanup trash ${entry.label} (${entry.id})`, ok);
+      const trashed = await trash(entry.id);
+      check(`cleanup trash ${entry.label} (${entry.id})`, trashed.ok, trashed.why);
     }
     if (created.length > 0) {
       console.log(

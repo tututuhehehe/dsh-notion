@@ -17,7 +17,7 @@ dsh-notion 的做法是**收敛工具面**：
 - 改正文是**查找替换**，不是整页重写——所以没有「整页覆盖」这个灾难面（见下文）
 - 基于官方 `ntn` CLI，直连稳定能力，不额外维护一套 API 客户端
 - 结构化 JSON 返回，只给模型稳定、精简的字段，不把原始 Notion 对象塞进上下文
-- 写操作有安全网：库页属性按 schema 校验、create 失败自动回滚、移动拒绝成环和覆盖、删除有三重保护
+- 写操作有安全网：库页属性按 schema 校验、create 失败自动回滚、移动拒绝成环和覆盖、有子页面的删除必须经 `doublecheck` 复核
 - 后续只补充**确实必要**的能力（评论、文件上传等），不为了"全"而堆工具
 
 工具数从 4 变成 6，是因为 `notion_page` 一个工具塞了四个动作，模型光读它就要吃掉一大段描述，还得先用 `action` 选分支才能看到自己真正关心的规则。拆开之后每个描述都短，且**只讲自己那件事**。
@@ -30,7 +30,7 @@ dsh-notion 的做法是**收敛工具面**：
 | `notion_get` | 读页面 Markdown，或读数据库/data source 的 schema | 读正文、看有哪些列可写 |
 | `notion_page_create` | 新建页面或数据库行 | 新建页、写列、挂父级 |
 | `notion_page_edit` | 查找替换正文、改标题/列/图标、移动父级 | 改一句话、补一段、改状态、搬家 |
-| `notion_page_trash` | 删除页面或行（带三重保护） | 删掉废弃页 |
+| `notion_page_trash` | 删除页面或行（有子页面时先复核） | 删掉废弃页 |
 | `notion_query` | 对已知数据库/data source 做 filter / sort / 分页 | "这个库里未完成的任务有哪些" |
 
 > `search` 找对象，`query` 查表里的行；两者职责不混。
@@ -155,8 +155,13 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
 ### notion_page_trash
 
 ```jsonc
-{ "id": "<page-id>", "yes": true }
-{ "id": "<page-id>", "yes": true, "recursive": true }   // 连同子页面
+// 没有子页面：这一次调用就删完
+{ "id": "<page-id>" }
+
+// 有子页面：这一次调用**不删**，返回 pending（列出每个子页面的 id 和标题），
+// 在同一轮的**后续模型步骤**里回答：
+double_check({ "id": "<pending-id>", "yes": true })    // 连同整棵子树一起删
+double_check({ "id": "<pending-id>", "yes": false })   // 不删
 ```
 
 ### notion_query
@@ -177,7 +182,7 @@ Integration 需要在 Notion 里 Share 给目标页面/数据库，否则 API �
 | --- | --- | --- |
 | `notion_page_create` | `parent`（**可省略**）、`title`、`props`、`icon`、`body_content` | 省略 `parent` = 建在**工作区根级**；`props` 只放真实列 |
 | `notion_page_edit` | `id`（必填）、`edits`、`body_content`、`props`、`title`、`icon`、`parent`、`yes` | 至少给一项；`edits` 与 `body_content` **互斥**；`yes` 只在行→行覆盖父级时与 `parent` 一起用 |
-| `notion_page_trash` | `id`（必填）、`yes`（必填 `true`）、`recursive` | 三种保护见下 |
+| `notion_page_trash` | `id`（必填） | 只有这一个参数；有子页面的删除要过一次复核，见下 |
 
 三个写工具的 `timeoutMs` 都是 180 秒，`isConcurrencySafe` 都是 `false`（每个动作都可能写入）。
 
@@ -363,33 +368,41 @@ old_str 匹配的是整段文本，很容易连带覆盖 `<page url="...">…</p
 | 既改又要追加 | 分**两次**调用（`edits` 与 `body_content` 不能同时传） |
 | 整页重写 | 没有这种操作。先建新页再 `trash` 旧页，或逐段替换 |
 
-## 删除（trash）的三重保护
+## 删除（trash）的两道闸
 
-`notion_page_trash` 不是对 `ntn pages trash` 的薄包装，它在调用前先判定目标类型：
+`notion_page_trash` 不是对 `ntn pages trash` 的薄包装：它先判定目标类型，再决定这一次调用能不能删。
 
 | 情况 | 行为 |
 | --- | --- |
-| 目标是 **database / data source** | **直接拒绝**，即使 `yes: true`。删除数据库会连带它的数据源和全部行，破坏性远超删页面，所以交给用户手动确认。 |
-| 目标**已在回收站/已归档** | 返回**成功**（`already_archived: true`，且 `changed: []`），不报错。`ntn` 对已归档对象会返回 `400 Can't edit block that is archived`，那看起来像故障并诱导重试，而删除本来就应当幂等。**注意：什么都没写，所以 `changed` 为空**，不要把 `changed` 非空当成已执行删除。 |
-| 目标页面**有子页面** | **默认拒绝**，返回子页面 id 列表，提示需要 `recursive: true`。Notion 归档父页面会连带归档整棵子树，调用方必须先看到还会删掉什么。 |
-| 目标页面**无子页面** | 正常删除。 |
+| 目标是 **database / data source** | **直接拒绝**。删除数据库会连带它的数据源和全部行，破坏性远超删页面，复核也不能授权它——交给用户手动确认。 |
+| 目标**已在回收站/已归档** | 返回**成功**（`already_archived: true`，`changed: []`），不报错。`ntn` 对已归档对象返回 `400 Can't edit block that is archived`，那看起来像故障并诱导重试，而删除本来就应当幂等。**什么都没有写，所以 `changed` 为空**。 |
+| 目标**没有子页面** | 这一次调用直接删除。没有连带损失，也就没有要复核的东西。 |
+| 目标**有子页面** | **这一次调用不删**：返回 `kind: "pending"`，正文列出每个会被连带删掉的子页面（标题 + id），并要求在**同一轮的后续模型步骤**里用 `double_check` 回答。 |
 
 ```jsonc
-// 有子页面时，需要显式同意连带删除
-{ "id": "<page-id>", "yes": true, "recursive": true }
+// 有子页面时，调用本身不删；答复 pending 才删
+double_check({ "id": "0003", "yes": true })    // 连同整棵子树
+double_check({ "id": "0003", "yes": false })   // 取消
 ```
 
-`yes` 与 `recursive` 是两件事：`yes` 表示「我确认要删除」，`recursive` 表示「我确认连同子页面一起删除」。只有 `recursive` 而没有 `yes` 仍然会被拒绝。
+为什么不在参数里给个「我确认」的开关：参数可以在**同一个调用**里填，模型还没看到子页面清单就已经点头了。
+Pending 必须等到下一步才能答（doublecheck 会拒绝同一步骤里的自我确认），所以「先看到范围、再决定删不删」是流程强制的，不是靠自觉。
 
-子页面检查走 `GET v1/blocks/{id}/children`，会顺着 `next_cursor` **翻到最后一页**再判断。不能只翻一页：该接口是按**块**分页的（默认每页 100 个块），一个大页面里大量段落会把子页面挤到后面的页，漏读就会漏报子页面、进而误判可以删除。翻页上限只作为失控保护（100 页 × 100 块 ≈ 10000 块），真到达上限时**拒绝删除**而不是猜。子块列表读不出来/解析不了时同样**拒绝**——"没能枚举"不等于"没有子页面"。
+**复核服务不可用时 fail closed**：`doublecheck` 插件没装或没启用，有子页面的删除会报 `[REVIEW_UNAVAILABLE]` 并且什么都没删；没有子页面的删除不受影响，插件可以单独使用。
+
+**复核不是事务锁**：放行之后到真正 spawn `ntn pages trash` 之间还有约一秒的窗口，期间别人往这个页面里新加的子页面不会被这次复核看到。这是已知残差——Notion 没有提供带版本号的删除前置条件。
+
+子页面检查走 `GET v1/blocks/{id}/children`，会顺着 `next_cursor` **翻到最后一页**再判断。不能只翻一页：该接口是按**块**分页的（默认每页 100 个块），一个大页面里大量段落会把子页面挤到后面的页，漏读就会漏报子页面、进而误判可以删除。翻页上限只作为失控保护（100 页 × 100 块 ≈ 10000 块），真到达上限时**拒绝删除**而不是猜。子块列表读不出来/解析不了时同样**拒绝**——"没能枚举"不等于"没有子页面"，范围说不清就不能让模型签。
+
+`yes` / `recursive` 这两个旧参数已经删掉。调用里仍然带着它们不会报错，但也不会有任何作用——「我确认要删」这句话现在只能由 pending 的答复表达。
 
 ## 包容输入
 
 模型不需要记住精确拼写。插件在参数层做**类型宽容**，只有无法对应到任何明确意图的输入才报错。
 
-**类型宽容**：`yes` 接受 `true` / `"true"` / `"yes"` / `1` / `"1"`；`limit` 接受数字字符串，小数会被截断（`2.5` → `2`，但 `<= 0` 仍报错）；`id` 接受 UUID、32 位 hex 或**整条 Notion URL**。
+**类型宽容**：`yes`（只剩 `notion_page_edit` 的行→行覆盖在用）接受 `true` / `"true"` / `"yes"` / `1` / `"1"`；`limit` 接受数字字符串，小数会被截断（`2.5` → `2`，但 `<= 0` 仍报错）；`id` 接受 UUID、32 位 hex 或**整条 Notion URL**。`notion_page_trash` 的旧参数 `yes` / `recursive` 会被**忽略而不报错**，避免带着上一版记忆的调用白丢一轮。
 
-**不做的事**：拼写错误不做模糊匹配，`yes` 不接受语义含糊的字符串。猜错可能执行成另一个真实存在的写操作，风险大于收益。
+**不做的事**：拼写错误不做模糊匹配，`yes` 不接受语义含糊的字符串。猜错可能执行成另一个真实存在的写操作，风险大于收益。删除的确认不在这套宽容范围内——它是 pending + `double_check`，不看参数。
 
 > 工具拆分之后不再有 `action` 的同义词表（`delete`→`trash` 之类）：工具名就是动作，模型直接调用正确的工具，不存在"选错分支"这回事。
 
@@ -411,6 +424,8 @@ old_str 匹配的是整段文本，很容易连带覆盖 `<page url="...">…</p
 三个写工具的返回值结构一致：必有 `ok: true`、`properties`、`changed`；另有 `id`、`url` 等。
 
 `changed` 的取值只有这几个：`body_content` / `properties` / `icon` / `title` / `parent` / `parent_item_relation` / `trashed`。用它来判断"到底写成了什么"——例如同时给了内容和 `parent` 时，`changed` 里会同时出现 `body_content` 和 `parent`。**空数组 = 有意为之的空操作**（例如已归档页再 trash 一次）。
+
+`notion_page_trash` 是唯一可能返回 **`kind: "pending"`** 的写工具：那个值不是成功，也不是错误——什么都没写，只是把范围摆出来等复核。它带着 `id`（交给 `double_check`）、`reason`（删什么、连带什么）和 `details`（同样的证据，排序后的 JSON）。看到 `kind: "pending"` 就不要汇报「已删除」。
 
 | 只在对应场景出现的字段 | 含义 |
 | --- | --- |
@@ -454,6 +469,7 @@ DSH 把抛出的错误渲染成 `Error: <message>`，只对它自己的 `Harness
 | `[NTN_FAILED]` | `ntn` 本身失败（未登录、无效 token、Notion API 报错、exit ≠ 0） | 检查 token / workspace / 权限，或原样上报 |
 | `[ABORTED]` | 调用**被取消**（子进程已被 SIGTERM）。注意：DSH 层超时不走这个码——`dsh-tool-call-timeout-policy` 会报 `TOOL_TIMEOUT`；`ntn` 自己的进程超时归入 `[NTN_FAILED]` | 通常无需重试，或换更小的查询 |
 | `[PARTIAL_WRITE]` | 后续写入失败且回滚也失败，工作区留下了半成品 | 用消息中给出的 id 手动 `trash` 或 `edit` 清理 |
+| `[REVIEW_UNAVAILABLE]` | 有子页面的删除需要 `doublecheck` 复核，但复核通道不可用或返回了读不懂的结果。**什么都没删**，参数也不是问题 | 告诉用户启用 doublecheck 插件，或让用户在 Notion 里删；不要改参数重试 |
 | `[NTN_FAILED]`（`details.refused = "deleting_child_content"`） | 这次编辑会连带删掉页面里嵌入的**子页面/子数据库**，Notion 的 `allow_deleting_content` 保护拒绝执行（插件故意不开这个开关）。消息是重写过的，不是原样 ntn 输出 | 把 `old_str` 缩小到那段文字本身，避开 `<page>`/`<database>` 块 |
 
 成功回滚的 create 不报 `[PARTIAL_WRITE]`，而是保留真正失败的那个类别（`[NTN_FAILED]` / `[INVALID_INPUT]`），并附带 `partial: false`。
@@ -479,9 +495,9 @@ npm run typecheck    # tsc --noEmit
 插件源码结构：
 
 ```
-src/dsh/      # DSH Host 层：tool.ts 工具契约、index.ts 注册、config/runner（token 与 ntn 调用）
+src/dsh/      # DSH Host 层：tool.ts 工具契约、index.ts 注册、doublecheck.ts 复核适配、config/runner（token 与 ntn 调用）
 src/tools/    # 工具实现：search / get / query / page（create、edit、trash 三个工具）
-src/text/     # ★ 模型可见的全部文案：工具描述 / 参数描述 / 结果句子 / 错误消息
+src/text/     # ★ 模型可见的全部文案：工具描述 / 参数描述 / 待复核正文 / 结果句子 / 错误消息
 src/lib/      # 共享工具库（id 解析、schema 提取、ntn runner、失败诊断等）
 test/         # 单元测试（不依赖真实 Notion）
 ```
@@ -494,6 +510,7 @@ test/         # 单元测试（不依赖真实 Notion）
 | --- | --- | --- |
 | `tools.ts` | 六个工具的 description | 选工具**之前** |
 | `params.ts` | 参数说明、`props` 说明、`icon` 三种形式 | 填参数时 |
+| `checks.ts` | 「待复核」正文与答复行（pending） | 删除被挂起、等复核时 |
 | `results.ts` | 结果里的句子（发生了什么） | 成功后 |
 | `errors.ts` | 全部错误消息 | 失败后 |
 
@@ -535,7 +552,7 @@ plugin_manager install_bundle target=/absolute/path/to/dsh-notion
                                           "body_content": "# Title\n\nBody" } }
 { "tool": "notion_page_edit",   "args": { "id": "<page-id>", "edits": [
                                           { "old_str": "Status: TODO", "new_str": "Status: DONE" } ] } }
-{ "tool": "notion_page_trash",  "args": { "id": "<page-id>", "yes": true } }
+{ "tool": "notion_page_trash",  "args": { "id": "<page-id>" } }
 { "tool": "notion_query",       "args": { "database_or_data_source": "<ds-id>",
                                           "filter": { "property": "Done", "checkbox": { "equals": false } } } }
 ```
@@ -604,15 +621,30 @@ One call can combine all of these. They run in a **fixed order — (1) body, (2)
 
 ### Trash safety
 
-`notion_page_trash` classifies its target before calling `ntn pages trash`:
+`notion_page_trash` classifies its target before calling `ntn pages trash`, and it takes exactly one argument: `id`.
 
-- **A database or data source is refused outright**, even with `yes: true` — removing one destroys its data sources and every row, which stays a human decision.
+- **A database or data source is refused outright** — removing one destroys its data sources and every row, so it stays a human decision. A review cannot authorize it either.
 - **An already-archived target reports success** (`already_archived: true`, `changed: []`) instead of surfacing Notion's `400 Can't edit block that is archived`, so a retry is harmless. Nothing is written, so `changed` stays empty.
-- **A page with child pages is refused** with the child ids unless `recursive: true` is also passed, because Notion archives the whole subtree. `yes` and `recursive` are separate consents. The child list is read from `GET v1/blocks/{id}/children` following `next_cursor` to the end: that endpoint pages over **blocks**, so one page of 100 blocks can hide child pages behind paragraphs, and a truncated read would under-report the subtree. The page cap (100 pages × 100 blocks ≈ 10 000 blocks) is a runaway guard only, and reaching it refuses the delete rather than guessing. An unreadable or unparseable child list also refuses: "could not enumerate" is not "has no children".
+- **A page with NO child pages is deleted by this one call.** Nothing else goes with it, so there is nothing to review.
+- **A page WITH child pages is NOT deleted by this call.** It returns `kind: "pending"`: the reason names every child page (id + title) that would go with it, and answering that pending needs a `double_check` in a **later model step** (`yes: true` deletes the whole subtree, `yes: false` cancels). `double_check` refuses to be answered inside the step that produced the pending, so "see the scope, then decide" is enforced by the flow rather than by good behaviour.
+
+```jsonc
+// the call itself deletes nothing; answering the pending is what deletes
+double_check({ "id": "0003", "yes": true })    // the whole subtree
+double_check({ "id": "0003", "yes": false })   // cancel
+```
+
+There is deliberately no `yes`/`recursive` parameter any more: a parameter can be filled in the SAME call that names the page, before the child list was ever read. A call that still carries them is accepted and they are ignored — they no longer express anything.
+
+**The review fails closed**: if the `doublecheck` plugin is not installed or not enabled, a delete that would take child pages with it reports `[REVIEW_UNAVAILABLE]` and deletes nothing. A leaf delete does not need the service, so the plugin stays usable on its own.
+
+**The review is not a transaction lock**: about a second passes between "proceed" and the actual spawn, and a child page created in that window is not covered by the review that approved it. That is a known residual — Notion offers no versioned precondition for a delete.
+
+The child list is read from `GET v1/blocks/{id}/children` following `next_cursor` to the end: that endpoint pages over **blocks**, so one page of 100 blocks can hide child pages behind paragraphs, and a truncated read would under-report the subtree. The page cap (100 pages × 100 blocks ≈ 10 000 blocks) is a runaway guard only, and reaching it refuses the delete rather than guessing. An unreadable or unparseable child list also refuses: "could not enumerate" is not "has no children" — a scope that cannot be stated cannot be signed off.
 
 ### Tolerant arguments
 
-The model does not have to memorize exact spellings. `"true"`/`"yes"`/`1` for `yes`, numeric strings for `limit`, and full Notion URLs for `id` are all accepted. Misspellings are **not** fuzzy-matched: guessing could perform a different real write. With the action split there is no longer an action-synonym table — the tool name *is* the action.
+The model does not have to memorize exact spellings. `"true"`/`"yes"`/`1` for `yes` (which only `notion_page_edit` still takes, for a row→row parent overwrite), numeric strings for `limit`, and full Notion URLs for `id` are all accepted. `notion_page_trash` still accepts the removed `yes`/`recursive` keys and ignores them, so a caller carrying the previous contract does not lose a round trip. Misspellings are **not** fuzzy-matched: guessing could perform a different real write. With the action split there is no longer an action-synonym table — the tool name *is* the action.
 
 Any id from `notion_search` works with any tool: `notion_get` falls back page → database → data source, and `notion_query` resolves a database id automatically.
 
@@ -624,11 +656,13 @@ Each tool declares a per-call `timeoutMs` (enforced by `dsh-tool-call-timeout-po
 
 Body writes go through `PATCH v1/pages/{id}/markdown` rather than `ntn pages edit --content` — the CLI flag's semantics are "replace the page with", which is exactly the capability that no longer exists here. Property, icon and Parent-item writes remain `PATCH v1/pages/{id}`.
 
-All three write tools return the same shape: always `ok: true`, `properties` and `changed`; plus `id`, `url` and the other fields listed above where they apply. `changed` uses a closed vocabulary — `body_content`, `properties`, `icon`, `title`, `parent`, `parent_item_relation`, `trashed` — so it is how you tell what actually landed (a combined content edit plus move lists both `body_content` and `parent`); an empty array is a deliberate no-op. `warnings` is an array of `{ code, message }`, echoed verbatim from Notion, and the field is **omitted entirely when there is nothing to say** — never an empty array.
+`notion_page_trash` is the only write tool that can return `kind: "pending"` instead: that value is neither a success nor an error — nothing was written, and it carries `id` (answer it with `double_check`), `reason` (what goes, and what goes with it) and `details` (the same evidence as sorted JSON). Do not report a pending as a deletion.
+
+Otherwise all three write tools return the same shape: always `ok: true`, `properties` and `changed`; plus `id`, `url` and the other fields listed above where they apply. `changed` uses a closed vocabulary — `body_content`, `properties`, `icon`, `title`, `parent`, `parent_item_relation`, `trashed` — so it is how you tell what actually landed (a combined content edit plus move lists both `body_content` and `parent`); an empty array is a deliberate no-op. `warnings` is an array of `{ code, message }`, echoed verbatim from Notion, and the field is **omitted entirely when there is nothing to say** — never an empty array.
 
 ### Error codes
 
-DSH renders a thrown error as `Error: <message>` and keeps a structured `{ name, code }` only for its own `HarnessError`; a plain Error's `code` is dropped. This plugin therefore puts the category at the front of the message: `[INVALID_INPUT]`, `[NTN_FAILED]`, `[ABORTED]`, `[PARTIAL_WRITE]` (a failed write whose rollback also failed, so a half-made page remains — the message carries the id to clean up). One `[NTN_FAILED]` sub-case is worth recognizing: an edit that would delete a nested child page or database comes back with `details.refused = "deleting_child_content"` and a rewritten message (not raw ntn output) telling you to narrow `old_str` past the `<page>`/`<database>` block.
+DSH renders a thrown error as `Error: <message>` and keeps a structured `{ name, code }` only for its own `HarnessError`; a plain Error's `code` is dropped. This plugin therefore puts the category at the front of the message: `[INVALID_INPUT]`, `[NTN_FAILED]`, `[ABORTED]`, `[PARTIAL_WRITE]` (a failed write whose rollback also failed, so a half-made page remains — the message carries the id to clean up), and `[REVIEW_UNAVAILABLE]` (a subtree delete needed a review and the review channel was unusable: **nothing was deleted** and the arguments are not the problem). One `[NTN_FAILED]` sub-case is worth recognizing: an edit that would delete a nested child page or database comes back with `details.refused = "deleting_child_content"` and a rewritten message (not raw ntn output) telling you to narrow `old_str` past the `<page>`/`<database>` block.
 
 Of the three find-and-replace outcomes only the partial one is not an error: a multiple match and a total miss both come back from Notion as `validation_error` and are surfaced as `[NTN_FAILED]` with nothing written (the plugin does no local pre-check, so both originate with Notion). **A partial match is not an error at all** — it is a success carrying `warnings`.
 

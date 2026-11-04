@@ -7,7 +7,13 @@ var NOTION_ERROR_CODES = {
   /** The call was cancelled or timed out; the child process was killed. */
   aborted: "ABORTED",
   /** A follow-up write failed and the page could not be fully cleaned up. */
-  partialWrite: "PARTIAL_WRITE"
+  partialWrite: "PARTIAL_WRITE",
+  /**
+   * A destructive call needed a doublecheck review and the review channel was unusable
+   * (service missing, or it answered something unreadable). Nothing was deleted, and the
+   * caller's arguments were not the problem — fixing them will not help.
+   */
+  reviewUnavailable: "REVIEW_UNAVAILABLE"
 };
 var NotionToolError = class extends Error {
   /** Stable machine-readable kind (`INVALID_INPUT`, `NTN_FAILED`, ...). */
@@ -398,6 +404,15 @@ ${p.n}`,
   rollbackCreatedPage_1: (p) => `${p.detail}${p.rollbackLine}`,
   // detail ← cause.detail
   // rollbackLine ← rollbackLine
+  /** 回滚成功：新页面 … 已移入回收站（partial: false），没有留下半成品。 */
+  rollbackCreatedPage_2: (p) => `
+\u5DF2\u56DE\u6EDA\uFF1A\u65B0\u9875\u9762 ${p.pageId} \u5DF2\u79FB\u5165\u56DE\u6536\u7AD9\uFF08partial: false\uFF09\uFF0C\u6CA1\u6709\u7559\u4E0B\u534A\u6210\u54C1\u3002`,
+  // pageId ← pageId
+  /** 回滚失败：… 该页面/行仍然存在（partial: true）。请手动清理：notion_page_trash { id: "…" }。 */
+  rollbackCreatedPage_3: (p) => `
+\u56DE\u6EDA\u5931\u8D25\uFF1Antn pages trash ${p.pageId} \u4E5F\u5931\u8D25\u4E86${p.detail ? `\uFF08${p.detail}\uFF09` : ""}\uFF0C\u8BE5\u9875\u9762/\u884C\u4ECD\u7136\u5B58\u5728\uFF08partial: true\uFF09\u3002\u8BF7\u624B\u52A8\u6E05\u7406\uFF1Anotion_page_trash { id: "${p.pageId}" }\u3002`,
+  // pageId ← pageId
+  // detail ← truncate(detail, 300)
   /* ---------- createPage ---------- */
   /** 在 … 所在 data source : container.kind} 中创建页面需要标题： + 请传 title、在 pro… */
   createPage_1: (p) => `\u5728 ${p.kind} \u4E2D\u521B\u5EFA\u9875\u9762\u9700\u8981\u6807\u9898\uFF1A\u8BF7\u4F20 title\u3001\u5728 props \u91CC\u5199\u6807\u9898\u5C5E\u6027\uFF08${p.title}\uFF09\uFF0C\u6216\u8BA9 body_content \u4EE5 "# \u6807\u9898" \u5F00\u5934\u3002\u53EF\u5199\u5C5E\u6027\uFF1A${p.hints}\u3002`,
@@ -475,27 +490,24 @@ ${p.reported}
   trashPage_1: (p) => `\u9875\u9762 ${p.id} \u4E0D\u5B58\u5728\uFF0C\u6216\u6CA1\u6709\u88AB\u5F53\u524D\u7684 Notion integration \u5171\u4EAB\uFF08\u2022\u2022\u2022 \u2192 Connections\uFF09\uFF0C\u56E0\u6B64\u65E0\u6CD5\u5220\u9664\u3002\u8BF7\u5148\u7528 notion_search \u786E\u8BA4 id \u6B63\u786E\u3002`,
   // id ← id
   /** notion_page_trash cannot delete a database (id …). Removing a da… */
-  trashPage_2: (p) => `notion_page_trash cannot delete a database (id ${p.id}). Removing a database, its data sources and every row in them is far more destructive than deleting a page, so this tool refuses even with yes: true. Ask the user to delete it in Notion (\u2022\u2022\u2022 \u2192 Delete) if that is really intended.`,
+  trashPage_2: (p) => `notion_page_trash cannot delete a database (id ${p.id}). Removing a database, its data sources and every row in them is far more destructive than deleting a page, so this tool refuses it outright \u2014 a review cannot authorize it either. Ask the user to delete it in Notion (\u2022\u2022\u2022 \u2192 Delete) if that is really intended.`,
   // id ← id
-  /** 页面 … 有 … 个子页面/嵌套容器：\n……\n + "Notion 会连带归档整棵子树，所以默认拒绝。确认要一起删除请加 r… */
-  trashPage_3: (p) => `\u9875\u9762 ${p.id} \u6709 ${p.length} \u4E2A\u5B50\u9875\u9762/\u5D4C\u5957\u5BB9\u5668\uFF1A
-${p.listed}${p.overflow}
-Notion \u4F1A\u8FDE\u5E26\u5F52\u6863\u6574\u68F5\u5B50\u6811\uFF0C\u6240\u4EE5\u9ED8\u8BA4\u62D2\u7EDD\u3002\u786E\u8BA4\u8981\u4E00\u8D77\u5220\u9664\u8BF7\u52A0 recursive: true\uFF1B\u53EA\u60F3\u5220\u7236\u9875\u9762\u8BF7\u5148\u5728 Notion \u91CC\u79FB\u8D70\u8FD9\u4E9B\u5B50\u9875\u9762\u3002`,
+  /** 页面 … 有 … 个子页面，删除会连带整棵子树，需要复核；doublecheck 服务不可用，因此没有删除。 */
+  trashPage_3: (p) => `\u9875\u9762 ${p.id} \u6709 ${p.count} \u4E2A\u5B50\u9875\u9762\uFF0C\u5220\u9664\u4F1A\u8FDE\u5E26\u6574\u68F5\u5B50\u6811\uFF0C\u6240\u4EE5\u5FC5\u987B\u5148\u8FC7 doublecheck \u590D\u6838\uFF1Bdoublecheck \u670D\u52A1\u5F53\u524D\u4E0D\u53EF\u7528\uFF0C\u56E0\u6B64\u6CA1\u6709\u5220\u9664\u4EFB\u4F55\u5185\u5BB9\uFF08\u9875\u9762\u548C\u5B50\u9875\u9762\u90FD\u8FD8\u5728\uFF09\u3002\u8BF7\u8BA9\u7528\u6237\u5728 Notion \u91CC\u5220\u9664\uFF0C\u6216\u5148\u542F\u7528 doublecheck \u63D2\u4EF6\u518D\u91CD\u8BD5\u3002`,
   // id ← id
-  // length ← children.length
-  // listed ← listed
-  // overflow ← overflow
+  // count ← children.length
   /* ---------- createNotionPageEditTool ---------- */
   /** yes 只用于「行→行移动时覆盖已有 Parent-item 链接」，没有 parent 时传 yes 没有意义；请去掉 yes… */
   createNotionPageEditTool_1: "yes \u53EA\u7528\u4E8E\u300C\u884C\u2192\u884C\u79FB\u52A8\u65F6\u8986\u76D6\u5DF2\u6709 Parent-item \u94FE\u63A5\u300D\uFF0C\u6CA1\u6709 parent \u65F6\u4F20 yes \u6CA1\u6709\u610F\u4E49\uFF1B\u8BF7\u53BB\u6389 yes\u3002\u672C\u6B21\u6CA1\u6709\u5199\u5165\u3002",
   /** edits（查找替换）和 body_content（追加到末尾）不能同时传：二选一。" + "需要既改又追加时请分两次调用 no… */
   createNotionPageEditTool_2: "edits\uFF08\u67E5\u627E\u66FF\u6362\uFF09\u548C body_content\uFF08\u8FFD\u52A0\u5230\u672B\u5C3E\uFF09\u4E0D\u80FD\u540C\u65F6\u4F20\uFF1A\u4E8C\u9009\u4E00\u3002\u9700\u8981\u65E2\u6539\u53C8\u8FFD\u52A0\u65F6\u8BF7\u5206\u4E24\u6B21\u8C03\u7528 notion_page_edit\u3002\u672C\u6B21\u6CA1\u6709\u5199\u5165\u3002",
   /** notion_page_edit 需要 edits、body_content、props、title、icon、parent 至… */
-  createNotionPageEditTool_3: (p) => "notion_page_edit \u9700\u8981 edits\u3001body_content\u3001props\u3001title\u3001icon\u3001parent \u81F3\u5C11\u4E00\u9879\uFF1B\u7A7A\u8C03\u7528\u4E0D\u4F1A\u4FEE\u6539\u9875\u9762\u3002" + (p.bodyProvided ? "body_content \u662F\u7A7A\u767D\uFF1A\u8FFD\u52A0\u7A7A\u767D\u5185\u5BB9\u4E0D\u4F1A\u4FEE\u6539\u9875\u9762\u3002" : "\u8981\u8FFD\u52A0\u5185\u5BB9\u8BF7\u4F20 body_content\uFF08\u4E0D\u4F20 edits\uFF09\u3002"),
+  createNotionPageEditTool_3: (p) => "notion_page_edit \u9700\u8981 edits\u3001body_content\u3001props\u3001title\u3001icon\u3001parent \u81F3\u5C11\u4E00\u9879\uFF1B\u7A7A\u8C03\u7528\u4E0D\u4F1A\u4FEE\u6539\u9875\u9762\u3002" + (p.bodyProvided ? "body_content \u662F\u7A7A\u767D\uFF1A\u8FFD\u52A0\u7A7A\u767D\u5185\u5BB9\u4E0D\u4F1A\u4FEE\u6539\u9875\u9762\u3002" : "\u8981\u8FFD\u52A0\u5185\u5BB9\u8BF7\u4F20 body_content\uFF08\u4E0D\u4F20 edits\uFF09\u3002")
   // bodyProvided ← body !== undefined
-  /* ---------- createNotionPageTrashTool ---------- */
-  /** notion_page_trash 会删除（移入回收站）页面，必须显式传 yes: true（或 "true" / "yes" … */
-  createNotionPageTrashTool_1: 'notion_page_trash \u4F1A\u5220\u9664\uFF08\u79FB\u5165\u56DE\u6536\u7AD9\uFF09\u9875\u9762\uFF0C\u5FC5\u987B\u663E\u5F0F\u4F20 yes: true\uFF08\u6216 "true" / "yes" / 1\uFF09\u624D\u4F1A\u8C03\u7528 ntn\uFF1B\u672C\u6B21\u6CA1\u6709\u8C03\u7528 ntn\u3002'
+};
+var CHECK_ERRORS = {
+  /** doublecheck 返回了无法识别的复核结果；按 fail closed 处理，没有执行删除。 */
+  malformed: "doublecheck \u8FD4\u56DE\u4E86\u65E0\u6CD5\u8BC6\u522B\u7684\u590D\u6838\u7ED3\u679C\uFF0C\u56E0\u6B64\u6CA1\u6709\u6267\u884C\u5220\u9664\uFF08fail closed\uFF09\u3002\u8FD9\u662F\u63D2\u4EF6\u7248\u672C\u4E0D\u5339\u914D\u7684\u8FF9\u8C61\uFF1A\u8BF7\u68C0\u67E5 doublecheck \u4E0E dsh-notion \u7684\u7248\u672C\u3002"
 };
 
 // src/text/params.ts
@@ -578,11 +590,7 @@ var EDIT_PARAMS = {
 };
 var TRASH_PARAMS = {
   /** `id` */
-  id: "Required. The page id (32 hex or dashed UUID) or its Notion URL.",
-  /** `yes` */
-  yes: "Required true. Without it the tool refuses without calling ntn, so a trash is never a guess.",
-  /** `recursive` */
-  recursive: "Consent to delete the page together with its child pages (Notion archives the whole subtree). Without it a page that has child pages is refused with the child ids."
+  id: "Required. The page id (32 hex or dashed UUID) or its Notion URL. There is no yes/recursive parameter: a page with no child pages is deleted by this one call, and a page with child pages returns a pending that you answer with double_check."
 };
 var ICON_PARAMETER_TEXT_CREATE = "The page icon.";
 var ICON_PARAMETER_TEXT_EDIT = "New page icon; null clears it.";
@@ -600,7 +608,7 @@ var TOOL_DESCRIPTIONS = {
   /** `notion_page_edit` */
   pageEdit: 'Change an existing Notion page: find-and-replace its text, append Markdown, update title/columns/icon, and/or move it. A single call may combine all of these. THE STEPS ARE INDEPENDENT: they run in this order \u2014 (1) body content, (2) title/props/icon, (3) parent move \u2014 and a failure in one does NOT cancel the others. A failed old_str is a bad argument, not a broken page, so a valid title change or move still happens. The result then reports \u90E8\u5206\u6210\u529F with exactly what landed and what did not: retry ONLY the failed part, because resending the whole call re-applies the parts that already succeeded. `changed` lists what actually happened. There is NO whole-page replace in this tool: to rewrite everything, delete the old text with edits (new_str "") and append the new text in a second call. When the returned body was truncated the result says so \u2014 truncated markdown is not the full page, so do not derive the next old_str from it.',
   /** `notion_page_trash` */
-  pageTrash: "Move one Notion page or database row to the trash. yes:true is required, otherwise nothing is called. Three guards a bare delete does not give you: a database or data source is refused even with yes:true (deleting one destroys its rows too \u2014 ask the user to do it in Notion); a page that is already in the trash returns success with already_archived:true instead of an error; and a page with child pages is refused unless recursive:true, because Notion archives the whole subtree \u2014 the error lists the child ids so you can show the user exactly what else would go. Trash is idempotent: calling it twice is safe."
+  pageTrash: "Move one Notion page or database row to the trash. A page with NO child pages is deleted by this one call, immediately. A page WITH child pages is NOT deleted by this one call: it returns kind:'pending' and lists every child page (id + title) that would go with it, because Notion always trashes the whole subtree. You must then answer that pending in a LATER model step with double_check \u2014 yes:true deletes the whole subtree, yes:false cancels; double_check becomes visible with the first pending. If the doublecheck service is unavailable, a subtree delete fails without deleting anything. Two things are refusals rather than pendings: a database or data source is refused outright (deleting one destroys its rows too \u2014 ask the user to do it in Notion), and a page whose child list cannot be read is refused because the scope could not be stated. A page already in the trash returns success with already_archived:true and changed:[] \u2014 nothing was written. Trash is idempotent: calling it twice is safe."
 };
 
 // src/lib/failures.ts
@@ -1255,13 +1263,114 @@ function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// src/dsh/doublecheck.ts
+function readDoublecheck(get) {
+  const service = get();
+  if (service === void 0 || service === null) return void 0;
+  const checkpoint2 = service.checkpoint;
+  if (typeof checkpoint2 !== "function") throw reviewBroken();
+  return service;
+}
+function checkpoint(p) {
+  if (!p.service) {
+    if (p.risk !== null) throw p.unavailable();
+    return void 0;
+  }
+  if (p.risk !== null) assertRisk(p.risk);
+  let decision;
+  try {
+    decision = p.service.checkpoint(p.exec, p.risk);
+  } catch (error) {
+    if (error instanceof NotionToolError) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    throw new NotionToolError(message, { code: NOTION_ERROR_CODES.reviewUnavailable });
+  }
+  return interpret(decision);
+}
+function interpret(decision) {
+  if (!isRecord2(decision) || typeof decision.kind !== "string") throw reviewBroken();
+  if (decision.kind === "proceed") return void 0;
+  if (decision.kind !== "pending") throw reviewBroken();
+  const { id, reason } = decision;
+  if (typeof id !== "string" || id.trim() === "" || typeof reason !== "string" || reason.trim() === "") {
+    throw reviewBroken();
+  }
+  return decision;
+}
+function assertRisk(risk) {
+  if (typeof risk.code !== "string" || risk.code.trim() === "" || typeof risk.reason !== "string" || risk.reason.trim() === "") {
+    throw reviewBroken();
+  }
+}
+function isRecord2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function reviewBroken() {
+  return new NotionToolError(CHECK_ERRORS.malformed, {
+    code: NOTION_ERROR_CODES.reviewUnavailable
+  });
+}
+
+// src/text/checks.ts
+var TRASH_RISK_CODES = {
+  subtree: "notion.trash.subtree.v1"
+};
+var TRASH_CHILD_LABELS = {
+  page: "\u5B50\u9875\u9762",
+  database: "\u5B50\u6570\u636E\u5E93",
+  container: "\u5D4C\u5957\u5BB9\u5668"
+};
+var TRASH_CHECKS = {
+  /** 列表里的一行。种类要说清楚：把 toggle 容器写成「子页面」是在报一个不存在的页面。 */
+  childLine: (p) => `  - [${TRASH_CHILD_LABELS[p.kind]}] ${p.label} \u2014 ${p.id}`,
+  // kind ← listChildPages 判定的种类
+  // label ← 子页面/数据库的标题，嵌套容器是块类型（比如 toggle）
+  // id ← 子项的块 id
+  /** 超过列出上限时补的一行：数量要说全，别让「只删父页面」看起来像「只删了列出来的那些」。 */
+  overflow: (p) => `
+  \u2026\u53E6\u6709 ${p.rest} \u4E2A\u672A\u5217\u51FA\uFF08\u5171 ${p.total} \u4E2A\uFF0C\u5B8C\u6574\u6E05\u5355\u89C1 Notion\uFF09\u3002`,
+  // rest ← children.length - MAX_LISTED_CHILDREN
+  // total ← children.length
+  /** 有子页面时唯一要复核的事：这一删会连整棵子树一起进回收站。 */
+  subtree: (p) => `\u5220\u9664${p.target}\u300C${p.title}\u300D(${p.id})\uFF0C\u4F1A\u8FDE\u5E26 ${p.count} \u4E2A\u5B50\u9875\u9762\u4E00\u8D77\u8FDB\u5165 Notion \u56DE\u6536\u7AD9\uFF1A
+${p.listed}${p.overflow}
+\u6CA1\u6709\u300C\u53EA\u5220\u7236\u9875\u9762\u3001\u4FDD\u7559\u5B50\u9875\u9762\u300D\u8FD9\u4E2A\u9009\u9879\u3002`
+  // target ← 目标种类（"页面" / "数据行"）
+  // title ← pageTitleOf(v1/pages/{id} 的响应)
+  // id ← 参数 id
+  // count ← children.length
+  // listed ← 前 MAX_LISTED_CHILDREN 行 childLine
+  // overflow ← children.length > MAX_LISTED_CHILDREN 时的剩余数量
+};
+var TRASH_PENDING_OUTPUT_TEXT = {
+  details: "Stable JSON evidence from doublecheck; reason already states it in words."
+};
+var TRASH_PENDING_TEXT = {
+  /**
+   * pending 的第一行。
+   *
+   * 上一版的删除必须先传 yes:true，模型很可能把 pending 读成「失败了，重试」，
+   * 所以第一句就否认这个读法：没有失败，也还没有删除。
+   */
+  head: "\u5F85\u590D\u6838 \xB7 \u672A\u5220\u9664\uFF1A\u76EE\u6807\u8FD8\u5728\u539F\u5904\u3002\u8FD9\u4E0D\u662F\u5931\u8D25 \u2014\u2014 \u6709\u5B50\u9875\u9762\u7684\u5220\u9664\u8981\u5148\u8FC7\u590D\u6838\u3002",
+  /** 确认删除整棵子树。 */
+  confirm: (p) => `\u786E\u8BA4\u5220\u9664 \u2192 double_check({ "id": "${p.id}", "yes": true })`,
+  // id ← pending.id（doublecheck 生成的四位十六进制）
+  /** 放弃删除。 */
+  cancel: (p) => `\u4E0D\u5220\u9664   \u2192 double_check({ "id": "${p.id}", "yes": false })`,
+  // id ← pending.id
+  /** 只想删父页面时的替代路径：复核不会替调用方保留子页面。 */
+  onlyParent: (p) => `\u53EA\u60F3\u5220\u7236\u9875\u9762 \u2192 \u5148 double_check({ "id": "${p.id}", "yes": false })\uFF0C\u518D\u7528 notion_page_edit \u628A\u4E0B\u9762\u8FD9\u4E9B\u5B50\u9875\u9762\u79FB\u5230\u522B\u5904\uFF0C\u6700\u540E\u91CD\u65B0\u8C03\u7528 notion_page_trash\u3002`
+  // id ← pending.id
+};
+
 // src/lib/datasources.ts
 function parseResolveDataSources(raw) {
-  const isRecord4 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+  const isRecord5 = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
   let items = [];
   if (Array.isArray(raw)) {
     items = raw;
-  } else if (isRecord4(raw)) {
+  } else if (isRecord5(raw)) {
     if (Array.isArray(raw.data_sources)) items = raw.data_sources;
     else if (Array.isArray(raw.results)) items = raw.results;
     else if (typeof raw.id === "string" || typeof raw.data_source_id === "string") items = [raw];
@@ -1277,7 +1386,7 @@ function parseResolveDataSources(raw) {
       }
       continue;
     }
-    if (!isRecord4(item)) continue;
+    if (!isRecord5(item)) continue;
     const id = typeof item.id === "string" ? item.id : typeof item.data_source_id === "string" ? item.data_source_id : typeof item.dataSourceId === "string" ? item.dataSourceId : void 0;
     if (!id || seen.has(id)) continue;
     seen.add(id);
@@ -1288,27 +1397,27 @@ function parseResolveDataSources(raw) {
 }
 
 // src/lib/schema.ts
-function isRecord2(value) {
+function isRecord3(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function extractSchemaProperties(raw) {
-  if (!isRecord2(raw)) return void 0;
+  if (!isRecord3(raw)) return void 0;
   let properties = raw.properties;
-  if (!isRecord2(properties)) {
+  if (!isRecord3(properties)) {
     for (const wrapper of ["data_source", "database"]) {
       const nested = raw[wrapper];
-      if (isRecord2(nested) && isRecord2(nested.properties)) {
+      if (isRecord3(nested) && isRecord3(nested.properties)) {
         properties = nested.properties;
         break;
       }
     }
   }
-  if (!isRecord2(properties)) return void 0;
+  if (!isRecord3(properties)) return void 0;
   const map = /* @__PURE__ */ new Map();
   for (const [name2, entry] of Object.entries(properties)) {
-    if (!isRecord2(entry)) continue;
+    if (!isRecord3(entry)) continue;
     const type = typeof entry.type === "string" ? entry.type : "unknown";
-    const relation = isRecord2(entry.relation) ? entry.relation : void 0;
+    const relation = isRecord3(entry.relation) ? entry.relation : void 0;
     const relationDataSourceId = relation && typeof relation.data_source_id === "string" ? relation.data_source_id : void 0;
     map.set(name2, {
       name: name2,
@@ -1319,7 +1428,7 @@ function extractSchemaProperties(raw) {
   return map.size ? map : void 0;
 }
 function reportedDataSourceId(raw, fallback) {
-  if (isRecord2(raw) && typeof raw.id === "string" && raw.id) return raw.id;
+  if (isRecord3(raw) && typeof raw.id === "string" && raw.id) return raw.id;
   return fallback;
 }
 
@@ -2398,9 +2507,7 @@ async function rollbackCreatedPage(runner, pageId, cause) {
   }
   const detail = (trash.stderr || trash.stdout || "").trim();
   const partial = !trash.ok;
-  const rollbackLine = partial ? `
-\u56DE\u6EDA\u5931\u8D25\uFF1Antn pages trash ${pageId} \u4E5F\u5931\u8D25\u4E86${detail ? `\uFF08${truncate(detail, 300)}\uFF09` : ""}\uFF0C\u8BE5\u9875\u9762/\u884C\u4ECD\u7136\u5B58\u5728\uFF08partial: true\uFF09\u3002\u8BF7\u624B\u52A8\u6E05\u7406\uFF1Anotion_page_trash { id: "${pageId}", yes: true }\u3002` : `
-\u5DF2\u56DE\u6EDA\uFF1A\u65B0\u9875\u9762 ${pageId} \u5DF2\u79FB\u5165\u56DE\u6536\u7AD9\uFF08partial: false\uFF09\uFF0C\u6CA1\u6709\u7559\u4E0B\u534A\u6210\u54C1\u3002`;
+  const rollbackLine = partial ? PAGE_ERRORS.rollbackCreatedPage_3({ pageId, detail: detail ? truncate(detail, 300) : "" }) : PAGE_ERRORS.rollbackCreatedPage_2({ pageId });
   const details = {
     ...cause.details,
     partial,
@@ -2770,7 +2877,14 @@ async function classifyTrashTarget(runner, id) {
       if (probe.kind === "database") return { kind: "database" };
       const raw = parseJsonMaybe(res.stdout);
       const archived = isPlainObject(raw) && (raw.archived === true || raw.in_trash === true);
-      return { kind: "page", archived };
+      const title = isPlainObject(raw) ? pageTitleOf(raw) : void 0;
+      const parent = isPlainObject(raw) ? pageParentOf(raw) : void 0;
+      return {
+        kind: "page",
+        archived,
+        ...title === void 0 ? {} : { title },
+        ...parent === void 0 ? {} : { parent }
+      };
     }
     if (!isNotFound(res)) {
       return { kind: "unreadable", reason: (res.stderr || res.stdout).trim() };
@@ -2789,19 +2903,18 @@ var NESTING_BLOCK_TYPES = /* @__PURE__ */ new Set([
 ]);
 var MAX_BLOCK_PAGES = 100;
 var MAX_LISTED_CHILDREN = 20;
-async function listChildPages(runner, pageId, options) {
+var MAX_RISK_CHILDREN = 50;
+var MAX_LISTED_TITLE = 40;
+var MAX_LISTED_CHILD_TITLE = 24;
+async function listChildPages(runner, pageId) {
   const children = [];
   let cursor;
   for (let page = 0; page < MAX_BLOCK_PAGES; page += 1) {
     const query = cursor ? `?start_cursor=${encodeURIComponent(cursor)}` : "";
     const result = await runner({ args: ["api", `v1/blocks/${pageId}/children${query}`] });
-    if (!result.ok) {
-      if (!options.failOnUnreadable && children.length > 0) return children;
-      throw ntnFailure(`\u5217\u51FA\u9875\u9762 ${pageId} \u7684\u5B50\u5757`, result);
-    }
+    if (!result.ok) throw ntnFailure(`\u5217\u51FA\u9875\u9762 ${pageId} \u7684\u5B50\u5757`, result);
     const parsed = parseJsonMaybe(result.stdout);
     if (!isPlainObject(parsed)) {
-      if (!options.failOnUnreadable && children.length > 0) return children;
       throw inputError(
         PAGE_ERRORS.listChildPages_1({ pageId, trim: truncate((result.stdout || "").trim(), 200) }),
         { id: pageId, enumerable: false }
@@ -2813,26 +2926,22 @@ async function listChildPages(runner, pageId, options) {
       if (typeof block.id !== "string") continue;
       if (block.type === "child_page") {
         const title = isPlainObject(block.child_page) && typeof block.child_page.title === "string" ? block.child_page.title : "(untitled)";
-        children.push({ id: block.id, title });
+        children.push({ id: block.id, label: title, kind: "page" });
         continue;
       }
       if (block.type === "child_database") {
         const title = isPlainObject(block.child_database) && typeof block.child_database.title === "string" ? block.child_database.title : "(untitled database)";
-        children.push({ id: block.id, title });
+        children.push({ id: block.id, label: title, kind: "database" });
         continue;
       }
       if (block.has_children === true && NESTING_BLOCK_TYPES.has(String(block.type))) {
-        const type = String(block.type);
-        const payload = isPlainObject(block[type]) ? block[type] : void 0;
-        const title = payload && typeof payload.title === "string" ? payload.title : `(${type} block with nested content)`;
-        children.push({ id: block.id, title });
+        children.push({ id: block.id, label: String(block.type), kind: "container" });
       }
     }
     const hasMore = parsed.has_more === true;
     const next = typeof parsed.next_cursor === "string" ? parsed.next_cursor : void 0;
     if (!hasMore) return children;
     if (!next) {
-      if (!options.failOnUnreadable && children.length > 0) return children;
       throw inputError(
         PAGE_ERRORS.listChildPages_2({ pageId }),
         { id: pageId, enumerable: false }
@@ -2840,7 +2949,6 @@ async function listChildPages(runner, pageId, options) {
     }
     cursor = next;
     if (page === MAX_BLOCK_PAGES - 1) {
-      if (!options.failOnUnreadable && children.length > 0) return children;
       throw inputError(
         PAGE_ERRORS.listChildPages_3({ pageId, MAX_BLOCK_PAGES }),
         { id: pageId, children_enumerated: children.length, enumerable: false }
@@ -2849,8 +2957,10 @@ async function listChildPages(runner, pageId, options) {
   }
   return children;
 }
-async function trashPage(params, runner) {
+async function trashPage(params, runner, deps) {
   const { id } = params;
+  const signal = deps.exec?.signal;
+  if (signal?.aborted) throw abortError();
   const target = await classifyTrashTarget(runner, id);
   if (target.kind === "unreadable") {
     throw ntnFailure(`\u786E\u8BA4\u9875\u9762 ${id} \u7684\u7C7B\u578B\uFF08page / database / data source\uFF09`, {
@@ -2872,7 +2982,7 @@ async function trashPage(params, runner) {
       { id, target: "database", refused: "database_delete" }
     );
   }
-  if (target.kind === "page" && target.archived) {
+  if (target.archived) {
     return pageValue({
       id,
       url: pageUrl(id),
@@ -2881,30 +2991,89 @@ async function trashPage(params, runner) {
       changed: []
     });
   }
-  if (target.kind === "page") {
-    const children = await listChildPages(runner, id, { failOnUnreadable: !params.recursive });
-    if (children.length > 0 && !params.recursive) {
-      const listed = children.slice(0, MAX_LISTED_CHILDREN).map((child) => {
-        const isContainer = child.title.endsWith("block with nested content)");
-        const kind = isContainer ? "\u5D4C\u5957\u5BB9\u5668" : "\u5B50\u9875\u9762";
-        return `  - [${kind}] ${child.title} \u2014 ${child.id}`;
-      }).join("\n");
-      const overflow = children.length > MAX_LISTED_CHILDREN ? `
-  \u2026\u53E6\u6709 ${children.length - MAX_LISTED_CHILDREN} \u4E2A\u672A\u5217\u51FA\uFF08\u5171 ${children.length} \u4E2A\uFF0C\u5B8C\u6574\u5217\u8868\u89C1 Notion\uFF09\u3002` : "";
-      throw new InputError(
-        PAGE_ERRORS.trashPage_3({ id, length: children.length, listed, overflow }),
-        {
-          id,
-          children: children.map((child) => child.id),
-          child_pages: children,
-          recursive_required: true
-        }
-      );
-    }
-  }
+  const children = await listChildPages(runner, id);
+  const risk = children.length === 0 ? null : trashSubtreeRisk(id, target, children);
+  const pending = checkpoint({
+    service: readDoublecheck(deps.getDoublecheck ?? (() => void 0)),
+    exec: deps.exec,
+    risk,
+    // Only reached when child pages exist and there is no review channel: say what was
+    // found, because "nothing happened" alone would hide how much was at stake.
+    unavailable: () => new NotionToolError(PAGE_ERRORS.trashPage_3({ id, count: children.length }), {
+      code: NOTION_ERROR_CODES.reviewUnavailable,
+      details: {
+        id,
+        children: children.map((child) => child.id),
+        children_count: children.length
+      }
+    })
+  });
+  if (pending) return pending;
+  if (signal?.aborted) throw abortError();
   const result = await runner({ args: ["pages", "trash", id, "--yes"] });
   if (!result.ok) throw ntnFailure("ntn pages trash", result);
   return pageValue({ id, url: pageUrl(id), properties: [], changed: ["trashed"] });
+}
+function trashSubtreeRisk(id, target, children) {
+  const ordered = [...children].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  const reason = TRASH_CHECKS.subtree({
+    target: "\u9875\u9762",
+    title: truncate(target.title ?? id, MAX_LISTED_TITLE),
+    id,
+    count: ordered.length,
+    listed: ordered.slice(0, MAX_LISTED_CHILDREN).map(
+      (child) => TRASH_CHECKS.childLine({
+        kind: child.kind,
+        label: truncate(child.label, MAX_LISTED_CHILD_TITLE),
+        id: child.id
+      })
+    ).join("\n"),
+    overflow: ordered.length > MAX_LISTED_CHILDREN ? TRASH_CHECKS.overflow({ rest: ordered.length - MAX_LISTED_CHILDREN, total: ordered.length }) : ""
+  });
+  return {
+    code: TRASH_RISK_CODES.subtree,
+    reason,
+    details: {
+      scope: "subtree",
+      tool: "notion_page_trash",
+      page_id: id,
+      ...target.title === void 0 ? {} : { page_title: target.title },
+      ...target.parent === void 0 ? {} : { parent: target.parent },
+      child_count: ordered.length,
+      children: ordered.slice(0, MAX_RISK_CHILDREN).map((child) => ({
+        kind: child.kind,
+        id: child.id,
+        title: child.label
+      })),
+      children_truncated: ordered.length > MAX_RISK_CHILDREN
+    }
+  };
+}
+function pageTitleOf(raw) {
+  const properties = isPlainObject(raw.properties) ? raw.properties : void 0;
+  if (!properties) return void 0;
+  for (const value of Object.values(properties)) {
+    if (!isPlainObject(value) || value.type !== "title" || !Array.isArray(value.title)) continue;
+    const text2 = value.title.map((part) => isPlainObject(part) && typeof part.plain_text === "string" ? part.plain_text : "").join("").trim();
+    return text2 === "" ? void 0 : text2;
+  }
+  return void 0;
+}
+function pageParentOf(raw) {
+  const parent = isPlainObject(raw.parent) ? raw.parent : void 0;
+  if (!parent || typeof parent.type !== "string") return void 0;
+  const id = parent.type === "page_id" ? parent.page_id : parent.type === "database_id" ? parent.database_id : void 0;
+  return typeof id === "string" ? { type: parent.type, id } : void 0;
+}
+function describeTrashPending(pending) {
+  return [
+    TRASH_PENDING_TEXT.head,
+    pending.reason,
+    "",
+    TRASH_PENDING_TEXT.confirm({ id: pending.id }),
+    TRASH_PENDING_TEXT.cancel({ id: pending.id }),
+    TRASH_PENDING_TEXT.onlyParent({ id: pending.id })
+  ].join("\n");
 }
 var ICON_PARAMETERS = [
   { type: "string", description: ICON_TEXT.string },
@@ -2990,17 +3159,9 @@ var TRASH_PARAMETERS = {
     id: {
       type: "string",
       description: TRASH_PARAMS.id
-    },
-    yes: {
-      type: "boolean",
-      description: TRASH_PARAMS.yes
-    },
-    recursive: {
-      type: "boolean",
-      description: TRASH_PARAMS.recursive
     }
   },
-  required: ["id", "yes"],
+  required: ["id"],
   additionalProperties: false
 };
 var PAGE_OUTPUT_SCHEMA = {
@@ -3042,6 +3203,20 @@ var PAGE_OUTPUT_SCHEMA = {
   },
   required: ["ok", "properties", "changed"],
   additionalProperties: false
+};
+var TRASH_PENDING_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    kind: { type: "string", const: "pending" },
+    id: { type: "string" },
+    reason: { type: "string" },
+    details: { description: TRASH_PENDING_OUTPUT_TEXT.details }
+  },
+  required: ["kind", "id", "reason"],
+  additionalProperties: false
+};
+var TRASH_OUTPUT_SCHEMA = {
+  oneOf: [PAGE_OUTPUT_SCHEMA, TRASH_PENDING_OUTPUT_SCHEMA]
 };
 function createNotionPageCreateTool(deps = {}) {
   const runner = deps.runNtn ?? runNtn;
@@ -3144,29 +3319,26 @@ function createNotionPageTrashTool(deps = {}) {
     isConcurrencySafe: () => false,
     parameters: TRASH_PARAMETERS,
     output: {
-      schema: PAGE_OUTPUT_SCHEMA,
-      render: (_args, value) => textBlocks(describePageValue(value))
+      schema: TRASH_OUTPUT_SCHEMA,
+      render: (_args, value) => textBlocks(isPendingValue(value) ? describeTrashPending(value) : describePageValue(value))
     },
     async execute(args, exec) {
       rejectUnexpectedParams(
         args,
         ["id", "yes", "recursive"],
-        "notion_page_trash \u53EA\u63A5\u53D7 { id, yes, recursive }\u3002"
+        "notion_page_trash \u53EA\u63A5\u53D7 { id }\uFF08yes/recursive \u5DF2\u4E0D\u518D\u9700\u8981\uFF0C\u4F20\u4E86\u4E5F\u4F1A\u88AB\u5FFD\u7565\uFF09\u3002"
       );
       if (exec.signal?.aborted) throw abortError();
-      if (args.yes === void 0 || !readBoolean(args.yes, "yes")) {
-        throw new InputError(
-          PAGE_ERRORS.createNotionPageTrashTool_1,
-          { yes: args.yes }
-        );
-      }
-      const params = {
-        id: requireId(args.id, "trash"),
-        recursive: args.recursive === void 0 ? false : readBoolean(args.recursive, "recursive")
-      };
-      return await trashPage(params, bindSignal(runner, exec.signal));
+      return await trashPage(
+        { id: requireId(args.id, "trash") },
+        bindSignal(runner, exec.signal),
+        { exec, getDoublecheck: deps.getDoublecheck }
+      );
     }
   });
+}
+function isPendingValue(value) {
+  return value.kind === "pending";
 }
 
 // src/tools/query.ts
@@ -3180,7 +3352,7 @@ var QueryInputError = class extends Error {
     this.details = details;
   }
 };
-function isRecord3(value) {
+function isRecord4(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function summarizeFailure(result, action) {
@@ -3218,7 +3390,7 @@ function buildQueryArgs(target, options) {
   return args;
 }
 function normalizeRow(row, index) {
-  if (!isRecord3(row)) {
+  if (!isRecord4(row)) {
     throw new Error(`ntn datasources query returned result #${index + 1} that is not an object.`);
   }
   if (typeof row.id !== "string" || !row.id) {
@@ -3227,11 +3399,11 @@ function normalizeRow(row, index) {
   return {
     id: row.id,
     url: typeof row.url === "string" ? row.url : null,
-    properties: isRecord3(row.properties) ? row.properties : {}
+    properties: isRecord4(row.properties) ? row.properties : {}
   };
 }
 function parseQueryResponse(raw, target) {
-  const payload = Array.isArray(raw) ? { results: raw, next_cursor: null, has_more: false } : isRecord3(raw) ? raw : null;
+  const payload = Array.isArray(raw) ? { results: raw, next_cursor: null, has_more: false } : isRecord4(raw) ? raw : null;
   if (!payload) {
     throw new Error(`ntn datasources query returned no JSON object for ${target}.`);
   }
@@ -3307,7 +3479,7 @@ function collectFilterProperties(filter, out = /* @__PURE__ */ new Set()) {
     for (const item of filter) collectFilterProperties(item, out);
     return out;
   }
-  if (!isRecord3(filter)) return out;
+  if (!isRecord4(filter)) return out;
   if (typeof filter.property === "string") out.add(filter.property);
   for (const key of ["and", "or"]) {
     if (filter[key] !== void 0) collectFilterProperties(filter[key], out);
@@ -3386,7 +3558,7 @@ async function queryDataSource(params, runner = runNtn) {
   const sorts = normalizeSort(params.sort);
   const startCursor = rawCursor === void 0 || rawCursor === null || typeof rawCursor === "string" && rawCursor.trim() === "" ? void 0 : readString(rawCursor, "start_cursor");
   const callerFilter = params.filter;
-  if (callerFilter !== void 0 && !isRecord3(callerFilter)) {
+  if (callerFilter !== void 0 && !isRecord4(callerFilter)) {
     throw new QueryInputError("filter must be a Notion filter JSON object.");
   }
   const underFilter = params.under === void 0 ? void 0 : await filterUnder(params, target, runner);
@@ -3819,7 +3991,9 @@ function apply(ctx, config) {
   ctx.tools.register(createNotionGetTool(run));
   ctx.tools.register(createNotionPageCreateTool({ runNtn: run }));
   ctx.tools.register(createNotionPageEditTool({ runNtn: run }));
-  ctx.tools.register(createNotionPageTrashTool({ runNtn: run }));
+  ctx.tools.register(
+    createNotionPageTrashTool({ runNtn: run, getDoublecheck: () => ctx.get("doublecheck") })
+  );
   ctx.tools.register(createNotionQueryTool({ runNtn: run }));
 }
 export {

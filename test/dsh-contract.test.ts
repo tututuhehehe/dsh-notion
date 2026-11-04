@@ -153,8 +153,13 @@ describe("the page split is expressible to the model", () => {
     assert.equal(paramSchema(edit).properties.block_update, undefined);
   });
 
-  it("requires `yes` on trash and `id` on edit/trash — but NOT `parent` on create", () => {
-    assert.deepEqual(paramSchema(trash).required, ["id", "yes"]);
+  it("requires only `id` on trash and edit — but NOT `parent` on create", () => {
+    // `yes` / `recursive` are deliberately gone from the trash contract: the confirmation
+    // for a subtree delete is the pending value plus a `double_check` in a LATER step,
+    // which is not something a parameter can express — a `yes:true` in the same call would
+    // be answered before the scope was ever seen.
+    assert.deepEqual(paramSchema(trash).required, ["id"]);
+    assert.deepEqual(Object.keys(paramSchema(trash).properties), ["id"]);
     assert.deepEqual(paramSchema(edit).required, ["id"]);
     // `parent` is deliberately optional: omitting it creates the page at the workspace
     // root, which is what `ntn pages create` (it documents --parent as optional) and
@@ -324,40 +329,45 @@ describe("argument guards: no internal TypeError may reach the model", () => {
     assert.doesNotMatch(result.content[0].text, /Cannot read|is not a function/);
   });
 
-  it("notion_page_trash with a non-boolean yes", async () => {
-    const result = await mount(createNotionPageTrashTool({ runNtn: inertRun })).execute("c10", {
+  /**
+   * The previous version required `yes: true` and `recursive: true`. A model that still
+   * carries that contract must not lose a round trip to INVALID_INPUT: neither value can
+   * express consent any more, so both are accepted and ignored. This is also the check
+   * that a leaf delete needs no doublecheck service at all — the fixture passes none.
+   */
+  const leafRunner = async (options: { args: string[] }) => {
+    if (options.args[0] === "api" && options.args[1]?.startsWith("v1/pages/")) {
+      return { ok: true, stdout: JSON.stringify({ archived: false }), stderr: "", code: 0 };
+    }
+    if (options.args[0] === "api" && options.args[1]?.includes("/children")) {
+      return { ok: true, stdout: JSON.stringify({ results: [], has_more: false }), stderr: "", code: 0 };
+    }
+    return { ok: true, stdout: "{}", stderr: "", code: 0 };
+  };
+
+  it("ignores the removed yes/recursive instead of rejecting them", async () => {
+    for (const extra of [
+      { yes: true },
+      { yes: "maybe" },
+      { recursive: true },
+      { yes: true, recursive: "yes" },
+    ]) {
+      const result = await mount(createNotionPageTrashTool({ runNtn: leafRunner })).execute("c10", {
+        id: "11111111-1111-4111-8111-111111111111",
+        ...extra,
+      });
+      assert.equal(result.isError, false, `${JSON.stringify(extra)}: ${result.content[0].text}`);
+      assert.deepEqual(result.details.changed, ["trashed"]);
+    }
+  });
+
+  it("still refuses an argument it has never accepted", async () => {
+    const result = await mount(createNotionPageTrashTool({ runNtn: leafRunner })).execute("c11", {
       id: "11111111-1111-4111-8111-111111111111",
-      yes: "maybe",
+      force: true,
     });
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /^Error: \[INVALID_INPUT\] /);
-  });
-
-  it("accepts the documented boolean spellings for yes", async () => {
-    // "true"/"yes"/1 must all count as consent; only a genuinely false value stops.
-    for (const yes of [true, "true", "yes", 1, "1", "YES"]) {
-      const tool = createNotionPageTrashTool({
-        runNtn: async (options: { args: string[] }) => {
-          if (options.args[0] === "api" && options.args[1]?.startsWith("v1/pages/")) {
-            return { ok: true, stdout: JSON.stringify({ archived: false }), stderr: "", code: 0 };
-          }
-          if (options.args[0] === "api" && options.args[1]?.includes("/children")) {
-            return {
-              ok: true,
-              stdout: JSON.stringify({ results: [], has_more: false }),
-              stderr: "",
-              code: 0,
-            };
-          }
-          return { ok: true, stdout: "{}", stderr: "", code: 0 };
-        },
-      });
-      const result = await mount(tool).execute("c11", {
-        id: "11111111-1111-4111-8111-111111111111",
-        yes,
-      });
-      assert.equal(result.isError, false, `yes=${JSON.stringify(yes)}: ${result.content[0].text}`);
-    }
   });
 });
 

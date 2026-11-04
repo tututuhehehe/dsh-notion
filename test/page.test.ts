@@ -40,7 +40,7 @@ import {
  * Harness
  * ------------------------------------------------------------------ */
 
-type Factory = (deps: { runNtn: NtnRunner }) => NotionTool<any>;
+type Factory = (deps: { runNtn: NtnRunner; getDoublecheck?: () => unknown }) => NotionTool<any>;
 
 /**
  * Mount one of the three page tools with a scripted `ntn` runner.
@@ -51,22 +51,30 @@ type Factory = (deps: { runNtn: NtnRunner }) => NotionTool<any>;
  */
 function harness(
   factory: Factory,
-  handler: (args: string[]) => RunNtnResult = () => ntnOk("{}")
+  handler: (args: string[]) => RunNtnResult = () => ntnOk("{}"),
+  extra: { getDoublecheck?: () => unknown } = {}
 ): { tool: MountedTool<any>; calls: string[][] } {
   const calls: string[][] = [];
   const runner: NtnRunner = async (options) => {
     calls.push(options.args);
     return handler(options.args);
   };
-  return { tool: mount(factory({ runNtn: runner })), calls };
+  return { tool: mount(factory({ runNtn: runner, ...extra })), calls };
 }
 
 const createHarness = (handler?: (args: string[]) => RunNtnResult) =>
   harness(createNotionPageCreateTool, handler);
 const editHarness = (handler?: (args: string[]) => RunNtnResult) =>
   harness(createNotionPageEditTool, handler);
-const trashHarness = (handler?: (args: string[]) => RunNtnResult) =>
-  harness(createNotionPageTrashTool, handler);
+/**
+ * Trash takes an optional doublecheck service. Most tests pass none — a leaf delete must
+ * work without it — and the subtree cases inject a fake one, because the real service can
+ * only be reached through a live DSH execution.
+ */
+const trashHarness = (
+  handler?: (args: string[]) => RunNtnResult,
+  dc?: () => unknown
+) => harness(createNotionPageTrashTool, handler, dc ? { getDoublecheck: dc } : {});
 
 const NEW_PAGE_ID = "11111111-1111-4111-8111-111111111111";
 const EDIT_PAGE_ID = "22222222-2222-4222-8222-222222222222";
@@ -190,7 +198,7 @@ describe("notion_page_* registration", () => {
       "title",
       "yes",
     ]);
-    assert.deepEqual(paramKeys(trashHarness().tool), ["id", "recursive", "yes"]);
+    assert.deepEqual(paramKeys(trashHarness().tool), ["id"]);
     for (const tool of [createHarness().tool, editHarness().tool, trashHarness().tool]) {
       assert.equal("action" in params(tool).properties, false, `${tool.name} must not take action`);
     }
@@ -1569,90 +1577,228 @@ describe("notion_page_edit: combined operations and failure debt", () => {
   });
 });
 
-describe("notion_page_trash: the refusal must SHOW the children, not just count them", () => {
-  /**
-   * A refused recursive delete is only useful if the caller can see what it would
-   * have destroyed. `details` is never model-facing (DSH drops it before rendering),
-   * so the ids have to live in the MESSAGE. This regressed once already: the text
-   * said "有 2 个子页面" with no ids at all, so a model could not report what was at
-   * risk without extra round trips.
-   */
-  const CHILD_A = "aaaaaaaa-1111-4111-8111-111111111111";
-  const CHILD_B = "bbbbbbbb-2222-4222-8222-222222222222";
-
-  const scripted = (args: string[]): RunNtnResult => {
-    const joined = args.join(" ");
-    // The page itself: a normal, readable page.
-    if (joined.startsWith("api v1/pages/")) {
-      return ntnOk({ id: EDIT_PAGE_ID, object: "page", in_trash: false, parent: PAGE_PARENT });
-    }
-    // Its children: one real child page and one child database.
-    if (joined.includes("/children")) {
-      return ntnOk({
-        object: "list",
-        has_more: false,
-        next_cursor: null,
-        results: [
-          { id: CHILD_A, type: "child_page", has_children: false, child_page: { title: "A 子页面" } },
-          {
-            id: CHILD_B,
-            type: "child_database",
-            has_children: false,
-            child_database: { title: "B 子数据库" },
-          },
-        ],
-      });
-    }
-    return ntnFail("unexpected call");
+/**
+ * A stand-in for the doublecheck service.
+ *
+ * The real one can only be reached through a live DSH execution (`ctx.get("doublecheck")`
+ * plus the current call identity), so unit tests inject this. It records every checkpoint
+ * call — including the `null` risk a leaf delete passes — and answers with `answer`.
+ */
+function fakeDoublecheck(answer: unknown) {
+  const seen: { risk: any }[] = [];
+  return {
+    seen,
+    get: () => ({
+      checkpoint(_exec: unknown, risk: any) {
+        seen.push({ risk });
+        return typeof answer === "function" ? answer(risk) : answer;
+      },
+    }),
   };
+}
 
-  it("lists every child id and title in the error text the model receives", async () => {
-    const { tool, calls } = trashHarness(scripted);
-    const result = await tool.execute("trash-children", { id: EDIT_PAGE_ID, yes: true });
+/** Echo the risk back the way the real service does: the pending reason IS the risk reason. */
+const echoRisk = (risk: any) =>
+  risk === null
+    ? { kind: "proceed" }
+    : {
+        kind: "pending",
+        id: "0003",
+        reason: risk.reason,
+        ...(risk.details === undefined ? {} : { details: risk.details }),
+      };
 
-    assert.equal(result.isError, true);
+const CHILD_A = "aaaaaaaa-1111-4111-8111-111111111111";
+const CHILD_B = "bbbbbbbb-2222-4222-8222-222222222222";
+
+/** A readable page with the given child blocks. */
+const pageWith = (results: unknown[]) => (args: string[]): RunNtnResult => {
+  const joined = args.join(" ");
+  if (args[0] === "pages") return ntnOk("trashed");
+  if (joined.startsWith("api v1/pages/")) {
+    return ntnOk({ id: EDIT_PAGE_ID, object: "page", in_trash: false, parent: PAGE_PARENT });
+  }
+  if (joined.includes("/children")) {
+    return ntnOk({ object: "list", has_more: false, next_cursor: null, results });
+  }
+  return ntnFail(`unexpected call: ${joined}`);
+};
+
+const noChildren = () => pageWith([]);
+
+describe("notion_page_trash: a leaf page is deleted by the one call", () => {
+  it("deletes, and still tells the review channel about a null risk", async () => {
+    // `null` is not a no-op: on a replayed confirmation doublecheck compares risks, so a
+    // scope that disappeared has to be reported as "there is no risk now", not skipped.
+    const dc = fakeDoublecheck({ kind: "proceed" });
+    const { tool, calls } = trashHarness(noChildren(), dc.get);
+    const result = await tool.execute("t-leaf", { id: EDIT_PAGE_ID });
+
+    assert.equal(result.isError, false, text(result));
+    assert.deepEqual(result.details.changed, ["trashed"]);
+    assert.deepEqual(calls.at(-1), ["pages", "trash", EDIT_PAGE_ID, "--yes"]);
+    assert.deepEqual(dc.seen.map((call) => call.risk), [null]);
+  });
+
+  it("works with no review channel installed at all", async () => {
+    const { tool, calls } = trashHarness(noChildren());
+    const result = await tool.execute("t-leaf-nodc", { id: EDIT_PAGE_ID });
+    assert.equal(result.isError, false, text(result));
+    assert.deepEqual(result.details.changed, ["trashed"]);
+    assert.deepEqual(calls.at(-1), ["pages", "trash", EDIT_PAGE_ID, "--yes"]);
+  });
+});
+
+describe("notion_page_trash: a page with children is NOT deleted by the call that names it", () => {
+  /**
+   * The pending value is the confirmation: it must state the scope in words the model can
+   * read, because `details` alone is not enough evidence to authorize a subtree delete.
+   * The id cannot live in the risk reason (the reason is compared byte-for-byte on replay
+   * and the id is generated afterwards), so it appears in the answer lines instead.
+   */
+  const withChildren = () =>
+    pageWith([
+      { id: CHILD_A, type: "child_page", has_children: false, child_page: { title: "A 子页面" } },
+      { id: CHILD_B, type: "child_database", has_children: false, child_database: { title: "B 子数据库" } },
+    ]);
+
+  it("returns a pending that names every child, and calls no delete", async () => {
+    const dc = fakeDoublecheck(echoRisk);
+    const { tool, calls } = trashHarness(withChildren(), dc.get);
+    const result = await tool.execute("t-subtree", { id: EDIT_PAGE_ID });
+
+    assert.equal(result.isError, false, text(result));
+    assert.equal(result.details.kind, "pending");
+    assert.equal(result.details.id, "0003");
+
     const rendered = text(result);
-    // Both children must be named, with their ids, in the message itself.
-    assert.match(rendered, new RegExp(CHILD_A), "child page id missing from the message");
-    assert.match(rendered, new RegExp(CHILD_B), "child database id missing from the message");
+    // Both children, with ids, in the text the model reads.
+    assert.match(rendered, new RegExp(CHILD_A));
+    assert.match(rendered, new RegExp(CHILD_B));
     assert.match(rendered, /A 子页面/);
     assert.match(rendered, /B 子数据库/);
-    // And it must still say how to proceed.
-    assert.match(rendered, /recursive/);
-    // The refusal must never reach ntn pages trash: nothing may be deleted.
+    assert.match(rendered, /\[子页面\]/);
+    assert.match(rendered, /\[子数据库\]/);
+    // It must not read like a success...
+    assert.match(rendered, /未删除/);
+    assert.match(rendered, /不是失败/);
+    // ...and it must say exactly how to answer.
+    assert.match(rendered, /double_check\(\{ "id": "0003", "yes": true \}\)/);
+    assert.match(rendered, /double_check\(\{ "id": "0003", "yes": false \}\)/);
+
     assert.equal(
       calls.some((args) => args[0] === "pages" && args[1] === "trash"),
       false,
-      "a refused recursive delete must not call ntn pages trash"
+      "a pending must not call ntn pages trash"
     );
   });
 
-  it("distinguishes a nesting CONTAINER from a real child page in the message", async () => {
-    // A toggle with content is reported by listChildPages as a container, not a page.
-    // Saying "1 个子页面" for it would be factually wrong and send the caller looking
-    // for a child page that does not exist.
-    const toggleOnly = (args: string[]): RunNtnResult => {
-      const joined = args.join(" ");
-      if (joined.startsWith("api v1/pages/")) {
+  it("sends a risk whose details are sorted, counted and free of the pending id", async () => {
+    const dc = fakeDoublecheck(echoRisk);
+    const { tool } = trashHarness(withChildren(), dc.get);
+    const result = await tool.execute("t-risk", { id: EDIT_PAGE_ID });
+
+    const risk = dc.seen[0]!.risk;
+    assert.equal(risk.code, "notion.trash.subtree.v1");
+    assert.equal(risk.details.scope, "subtree");
+    assert.equal(risk.details.child_count, 2);
+    assert.deepEqual(
+      risk.details.children.map((child: any) => child.id),
+      [CHILD_A, CHILD_B]
+    );
+    assert.deepEqual(result.details.details, risk.details);
+    // The id is created after the snapshot, so it can never be part of it.
+    assert.doesNotMatch(JSON.stringify(risk), /0003/);
+  });
+
+  it("distinguishes a nesting CONTAINER from a real child page", async () => {
+    // A toggle with content can hide a page but is not itself one; calling it a
+    // "子页面" would send the reviewer looking for a page that does not exist.
+    const { tool } = trashHarness(
+      pageWith([{ id: CHILD_A, type: "toggle", has_children: true, toggle: { rich_text: [] } }]),
+      fakeDoublecheck(echoRisk).get
+    );
+    const rendered = text(await tool.execute("t-toggle", { id: EDIT_PAGE_ID }));
+    assert.match(rendered, /\[嵌套容器\] toggle/);
+    assert.doesNotMatch(rendered, /\[子页面\]/);
+  });
+
+  it("keeps the risk reason inside doublecheck's 2048-character budget", async () => {
+    // doublecheck rejects a longer reason outright. A page whose 20 child titles are long
+    // must still be reviewable, otherwise the gate turns into "this page can never be
+    // deleted" — a fail-closed that fails for the wrong reason.
+    const longTitle = "非常长的子页面标题".repeat(12);
+    const children = Array.from({ length: 24 }, (_, index) => ({
+      id: `${String(index).padStart(8, "0")}-1111-4111-8111-111111111111`,
+      type: "child_page",
+      has_children: false,
+      child_page: { title: longTitle },
+    }));
+    const dc = fakeDoublecheck(echoRisk);
+    const { tool } = trashHarness(pageWith(children), dc.get);
+    await tool.execute("t-long", { id: EDIT_PAGE_ID });
+
+    const risk = dc.seen[0]!.risk;
+    assert.ok(risk.reason.length <= 2048, `reason was ${risk.reason.length} chars`);
+    // The cap must not silently drop the count: the reviewer still learns how many.
+    assert.match(risk.reason, /共 24 个/);
+    assert.equal(risk.details.child_count, 24);
+  });
+
+  it("fails closed when the review channel is missing", async () => {
+    const { tool, calls } = trashHarness(withChildren());
+    const result = await tool.execute("t-nodc", { id: EDIT_PAGE_ID });
+
+    assert.equal(result.isError, true);
+    const rendered = text(result);
+    assert.match(rendered, /^Error: \[REVIEW_UNAVAILABLE\] /);
+    // The reason has to say how much was at stake: "nothing happened" alone hides it.
+    assert.match(rendered, /2 个子页面/);
+    assert.match(rendered, /没有删除/);
+    assert.equal(
+      calls.some((args) => args[0] === "pages" && args[1] === "trash"),
+      false,
+      "a gated delete must not delete when it cannot be reviewed"
+    );
+  });
+
+  it("fails closed when the channel answers something unreadable", async () => {
+    for (const answer of [{ kind: "weird" }, {}, { kind: "pending" }, { kind: "pending", id: "", reason: "x" }]) {
+      const { tool, calls } = trashHarness(withChildren(), fakeDoublecheck(answer).get);
+      const result = await tool.execute("t-garbage", { id: EDIT_PAGE_ID });
+      assert.equal(result.isError, true, JSON.stringify(answer));
+      assert.match(text(result), /^Error: \[REVIEW_UNAVAILABLE\] /);
+      assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
+    }
+  });
+
+  it("deletes once when the channel proceeds (confirmation replay)", async () => {
+    const { tool, calls } = trashHarness(withChildren(), fakeDoublecheck({ kind: "proceed" }).get);
+    const result = await tool.execute("t-confirmed", { id: EDIT_PAGE_ID });
+
+    assert.equal(result.isError, false, text(result));
+    assert.deepEqual(result.details.changed, ["trashed"]);
+    assert.equal(calls.filter((args) => args[0] === "pages" && args[1] === "trash").length, 1);
+  });
+
+  it("refuses without pening when the child list cannot be enumerated", async () => {
+    // "Could not read the children" must never be treated as "no children": the pending
+    // would then be approved against a scope nobody could state.
+    const broken = (args: string[]): RunNtnResult => {
+      if (args[0] === "api" && args[1]?.startsWith("v1/pages/")) {
         return ntnOk({ id: EDIT_PAGE_ID, object: "page", in_trash: false, parent: PAGE_PARENT });
       }
-      if (joined.includes("/children")) {
-        return ntnOk({
-          object: "list",
-          has_more: false,
-          next_cursor: null,
-          results: [
-            { id: CHILD_A, type: "toggle", has_children: true, toggle: { rich_text: [] } },
-          ],
-        });
-      }
+      if (args[1]?.includes("/children")) return ntnOk("not json at all");
       return ntnFail("unexpected call");
     };
+    const dc = fakeDoublecheck(echoRisk);
+    const { tool, calls } = trashHarness(broken, dc.get);
+    const result = await tool.execute("t-unreadable", { id: EDIT_PAGE_ID });
 
-    const { tool } = trashHarness(toggleOnly);
-    const rendered = text(await tool.execute("trash-toggle", { id: EDIT_PAGE_ID, yes: true }));
-    assert.match(rendered, /嵌套容器/);
-    assert.doesNotMatch(rendered, /\[子页面\]/);
+    assert.equal(result.isError, true);
+    assert.match(text(result), /无法解析/);
+    assert.equal(dc.seen.length, 0, "an unstateable scope must not even reach the review");
+    assert.equal(calls.some((args) => args[0] === "pages" && args[1] === "trash"), false);
   });
 });
 

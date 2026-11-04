@@ -159,13 +159,9 @@ export const EDIT_PARAMS = {
 export const TRASH_PARAMS = {
   /** `id` */
   id:
-    "Required. The page id (32 hex or dashed UUID) or its Notion URL.",
-  /** `yes` */
-  yes:
-    "Required true. Without it the tool refuses without calling ntn, so a trash is never a guess.",
-  /** `recursive` */
-  recursive:
-    "Consent to delete the page together with its child pages (Notion archives the whole subtree). Without it a page that has child pages is refused with the child ids.",
+    "Required. The page id (32 hex or dashed UUID) or its Notion URL. " +
+    "There is no yes/recursive parameter: a page with no child pages is deleted by this one call, " +
+    "and a page with child pages returns a pending that you answer with double_check.",
 } as const;
 
 /**

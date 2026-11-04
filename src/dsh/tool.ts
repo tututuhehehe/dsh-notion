@@ -47,6 +47,12 @@ export const NOTION_ERROR_CODES = {
   aborted: "ABORTED",
   /** A follow-up write failed and the page could not be fully cleaned up. */
   partialWrite: "PARTIAL_WRITE",
+  /**
+   * A destructive call needed a doublecheck review and the review channel was unusable
+   * (service missing, or it answered something unreadable). Nothing was deleted, and the
+   * caller's arguments were not the problem — fixing them will not help.
+   */
+  reviewUnavailable: "REVIEW_UNAVAILABLE",
 } as const;
 
 export type NotionErrorCode = (typeof NOTION_ERROR_CODES)[keyof typeof NOTION_ERROR_CODES];

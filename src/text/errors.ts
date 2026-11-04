@@ -394,6 +394,18 @@ export const PAGE_ERRORS = {
   // detail ← cause.detail
   // rollbackLine ← rollbackLine
 
+  /** 回滚成功：新页面 … 已移入回收站（partial: false），没有留下半成品。 */
+  rollbackCreatedPage_2: (p: { pageId: string }): string =>
+    `\n已回滚：新页面 ${p.pageId} 已移入回收站（partial: false），没有留下半成品。`,
+  // pageId ← pageId
+
+  /** 回滚失败：… 该页面/行仍然存在（partial: true）。请手动清理：notion_page_trash { id: "…" }。 */
+  rollbackCreatedPage_3: (p: { pageId: string, detail: string }): string =>
+    `\n回滚失败：ntn pages trash ${p.pageId} 也失败了${p.detail ? `（${p.detail}）` : ""}，` +
+    `该页面/行仍然存在（partial: true）。请手动清理：notion_page_trash { id: "${p.pageId}" }。`,
+  // pageId ← pageId
+  // detail ← truncate(detail, 300)
+
   /* ---------- createPage ---------- */
   /** 在 … 所在 data source : container.kind} 中创建页面需要标题： + 请传 title、在 pro… */
   createPage_1: (p: { kind: string | number, title: string | number, hints: string }): string =>
@@ -521,20 +533,18 @@ export const PAGE_ERRORS = {
   /** notion_page_trash cannot delete a database (id …). Removing a da… */
   trashPage_2: (p: { id: string }): string =>
     `notion_page_trash cannot delete a database (id ${p.id}). Removing a database, its data ` +
-    "sources and every row in them is far more destructive than deleting a page, so " +
-    "this tool refuses even with yes: true. Ask the user to delete it in Notion " +
-    "(••• → Delete) if that is really intended.",
+    "sources and every row in them is far more destructive than deleting a page, so this tool " +
+    "refuses it outright — a review cannot authorize it either. Ask the user to delete it in " +
+    "Notion (••• → Delete) if that is really intended.",
   // id ← id
 
-  /** 页面 … 有 … 个子页面/嵌套容器：\n……\n + "Notion 会连带归档整棵子树，所以默认拒绝。确认要一起删除请加 r… */
-  trashPage_3: (p: { id: string | number, length: string | number, listed: string | number, overflow: string }): string =>
-    `页面 ${p.id} 有 ${p.length} 个子页面/嵌套容器：\n${p.listed}${p.overflow}\n` +
-    "Notion 会连带归档整棵子树，所以默认拒绝。确认要一起删除请加 recursive: true；" +
-    "只想删父页面请先在 Notion 里移走这些子页面。",
+  /** 页面 … 有 … 个子页面，删除会连带整棵子树，需要复核；doublecheck 服务不可用，因此没有删除。 */
+  trashPage_3: (p: { id: string, count: number }): string =>
+    `页面 ${p.id} 有 ${p.count} 个子页面，删除会连带整棵子树，所以必须先过 doublecheck 复核；` +
+    "doublecheck 服务当前不可用，因此没有删除任何内容（页面和子页面都还在）。" +
+    "请让用户在 Notion 里删除，或先启用 doublecheck 插件再重试。",
   // id ← id
-  // length ← children.length
-  // listed ← listed
-  // overflow ← overflow
+  // count ← children.length
 
   /* ---------- createNotionPageEditTool ---------- */
   /** yes 只用于「行→行移动时覆盖已有 Parent-item 链接」，没有 parent 时传 yes 没有意义；请去掉 yes… */
@@ -554,9 +564,18 @@ export const PAGE_ERRORS = {
       : "要追加内容请传 body_content（不传 edits）。"),
   // bodyProvided ← body !== undefined
 
-  /* ---------- createNotionPageTrashTool ---------- */
-  /** notion_page_trash 会删除（移入回收站）页面，必须显式传 yes: true（或 "true" / "yes" … */
-  createNotionPageTrashTool_1:
-    'notion_page_trash 会删除（移入回收站）页面，必须显式传 yes: true（或 "true" / "yes" / 1）才会调用 ntn；本次没有调用 ntn。',
-
 } as const;
+
+/**
+ * `src/dsh/doublecheck.ts` 适配层的错误。
+ *
+ * 这类失败不是调用方的参数问题，也不代表删除被拒绝：它意味着复核通道本身坏了，
+ * 所以按 fail closed 处理 —— 什么都没删。消息必须把这一点说清楚，否则模型会去改参数。
+ */
+export const CHECK_ERRORS = {
+  /** doublecheck 返回了无法识别的复核结果；按 fail closed 处理，没有执行删除。 */
+  malformed:
+    "doublecheck 返回了无法识别的复核结果，因此没有执行删除（fail closed）。" +
+    "这是插件版本不匹配的迹象：请检查 doublecheck 与 dsh-notion 的版本。",
+} as const;
+

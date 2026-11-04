@@ -17,6 +17,11 @@
  * the arguments its operation accepts, so a create cannot carry an `old_str` and an edit
  * cannot carry `recursive` by mistake.
  *
+ * Trash is the one destructive operation, and it is the only one that can be INTERRUPTED:
+ * a page with child pages is not deleted on the call that names it — the call returns a
+ * `pending` value listing every child that would go with it, and the model has to answer it
+ * in a later step through the optional doublecheck service (see ../dsh/doublecheck.ts).
+ *
  * Page-level fields are TOP-LEVEL parameters, never `props` keys:
  *   - `icon`         : an emoji ("🎯"), an http(s) image URL, an already-typed Notion icon
  *                      object, or `null` to clear it.
@@ -89,8 +94,11 @@ import {
   TOOL_TIMEOUTS,
 } from "../dsh/tool.ts";
 import type { JsonObject, NotionTool } from "../dsh/tool.ts";
+import { checkpoint, readDoublecheck } from "../dsh/doublecheck.ts";
+import type { PendingValue, RiskSnapshot } from "../dsh/doublecheck.ts";
 import { PAGE_RESULT_TEXT } from "../text/results.ts";
 import { PAGE_ERRORS } from "../text/errors.ts";
+import { TRASH_CHECKS, TRASH_PENDING_OUTPUT_TEXT, TRASH_PENDING_TEXT, TRASH_RISK_CODES } from "../text/checks.ts";
 import {
   CREATE_PARAMS,
   EDIT_ITEM_TEXT,
@@ -124,6 +132,14 @@ export type NtnRunner = (options: RunNtnOptions) => Promise<RunNtnResult>;
 export type NotionPageDeps = {
   /** Injected for tests; production always spawns the real `ntn`. */
   runNtn?: NtnRunner;
+  /**
+   * Reads the OPTIONAL doublecheck service (`ctx.get("doublecheck")`).
+   *
+   * Optional on purpose: dsh-notion works without the plugin, and a leaf delete never needs
+   * a review. Only a delete that would take child pages with it is gated, and that gate
+   * fails closed when this returns undefined.
+   */
+  getDoublecheck?: () => unknown;
 };
 
 type ParentKind = "page" | "database" | "data_source";
@@ -1777,9 +1793,8 @@ async function rollbackCreatedPage(
   const detail = (trash.stderr || trash.stdout || "").trim();
   const partial = !trash.ok;
   const rollbackLine = partial
-    ? `\n回滚失败：ntn pages trash ${pageId} 也失败了${detail ? `（${truncate(detail, 300)}）` : ""}，` +
-      `该页面/行仍然存在（partial: true）。请手动清理：notion_page_trash { id: "${pageId}", yes: true }。`
-    : `\n已回滚：新页面 ${pageId} 已移入回收站（partial: false），没有留下半成品。`;
+    ? PAGE_ERRORS.rollbackCreatedPage_3({ pageId: pageId, detail: detail ? truncate(detail, 300) : "" })
+    : PAGE_ERRORS.rollbackCreatedPage_2({ pageId: pageId });
 
   // A failed cleanup leaves a page behind: the model must act on that differently from
   // "the arguments were rejected", so it gets its own code. A clean rollback keeps the
@@ -2320,7 +2335,14 @@ async function movePage(
  * API read, not from the string.
  */
 type TrashTarget =
-  | { kind: "page"; archived: boolean }
+  | {
+      kind: "page";
+      archived: boolean;
+      /** Title read from the same probe response; absent when it is empty or unreadable. */
+      title?: string;
+      /** Parent identity, only what a reviewer needs to tell two pages apart. */
+      parent?: { type: string; id: string };
+    }
   | { kind: "database" }
   /** No probe claimed the id, so it is not an object this token can see. */
   | { kind: "missing" }
@@ -2361,7 +2383,17 @@ async function classifyTrashTarget(runner: NtnRunner, id: string): Promise<Trash
       if (probe.kind === "database") return { kind: "database" };
       const raw = parseJsonMaybe(res.stdout);
       const archived = isPlainObject(raw) && (raw.archived === true || raw.in_trash === true);
-      return { kind: "page", archived };
+      // The title and parent come from the response that was already fetched to classify
+      // the target: a reviewer that has to tell two pages apart needs both, and paying a
+      // second read for them would double the cost of every trash.
+      const title = isPlainObject(raw) ? pageTitleOf(raw) : undefined;
+      const parent = isPlainObject(raw) ? pageParentOf(raw) : undefined;
+      return {
+        kind: "page",
+        archived,
+        ...(title === undefined ? {} : { title }),
+        ...(parent === undefined ? {} : { parent }),
+      };
     }
     // A non-404 failure says nothing about the target's type, and a later probe
     // would only replace a useful error with a misleading 404.
@@ -2393,45 +2425,64 @@ const NESTING_BLOCK_TYPES = new Set([
 const MAX_BLOCK_PAGES = 100;
 
 /**
- * How many child pages to name in a refusal message.
+ * How many child pages to name in the review reason.
  *
- * The list exists so a caller can see what it is about to delete, so it has to be long
- * enough to be useful and short enough to stay readable in an error; the remainder is
- * summarized with its count rather than silently dropped.
+ * The list exists so a reviewer can see what it is about to delete, so it has to be long
+ * enough to be useful and short enough to stay readable; the remainder is summarized with
+ * its count rather than silently dropped.
  */
 const MAX_LISTED_CHILDREN = 20;
+
+/**
+ * How many children to keep in the risk `details`.
+ *
+ * `details` is machine evidence, not prose: it is what a later audit (or a retry that
+ * recomputes the risk) compares. It is capped because doublecheck caps a whole risk
+ * snapshot at 32 KiB, and a page can have hundreds of children.
+ */
+const MAX_RISK_CHILDREN = 50;
+
+/**
+ * How long a title may be inside the review reason.
+ *
+ * doublecheck rejects a risk whose `reason` exceeds 2048 characters, and a fail-closed
+ * "review unavailable" for a page with long titles would make the page undeletable. The
+ * cap keeps 20 listed children plus the page title well inside that budget; the full
+ * title stays in the page itself and in `details`.
+ */
+const MAX_LISTED_TITLE = 40;
+const MAX_LISTED_CHILD_TITLE = 24;
+
+/** One child that would go down with the page. */
+type TrashChild = {
+  id: string;
+  /** What to show: a title for a page/database, the block type for a nesting container. */
+  label: string;
+  kind: "page" | "database" | "container";
+};
 
 /**
  * Direct child pages of one page, from `GET v1/blocks/{id}/children`.
  *
  * The walk follows EVERY page of the child list, not a fixed count: the default page
  * returns 100 BLOCKS (not 100 child pages), so a page with many paragraphs can hide child
- * pages on a later page. Stopping early would under-report the subtree and let the guard
- * approve a delete that removes children it never listed. The bound is a runaway guard
- * only, and reaching it refuses instead of guessing.
+ * pages on a later page. Stopping early would under-report the subtree and let the caller
+ * approve a delete that removes children it never saw. The bound is a runaway guard only,
+ * and reaching it refuses instead of guessing.
  *
- * One exception is deliberate: once a page has been found, a later block page that cannot
- * be READ stops the walk and reports what was found. The guard only needs a non-empty list
- * to refuse the delete (and it refuses before the caller can consent), so continuing to
- * spend round trips on a list whose verdict is already decided serves nothing.
+ * A partial list is never returned: since this list is the ONLY thing that states the scope
+ * of a subtree delete, "I could not finish enumerating" has to mean "refuse", not "delete
+ * what I happened to see".
  */
-async function listChildPages(
-  runner: NtnRunner,
-  pageId: string,
-  options: { failOnUnreadable: boolean }
-): Promise<{ id: string; title: string }[]> {
-  const children: { id: string; title: string }[] = [];
+async function listChildPages(runner: NtnRunner, pageId: string): Promise<TrashChild[]> {
+  const children: TrashChild[] = [];
   let cursor: string | undefined;
   for (let page = 0; page < MAX_BLOCK_PAGES; page += 1) {
     const query = cursor ? `?start_cursor=${encodeURIComponent(cursor)}` : "";
     const result = await runner({ args: ["api", `v1/blocks/${pageId}/children${query}`] });
-    if (!result.ok) {
-      if (!options.failOnUnreadable && children.length > 0) return children;
-      throw ntnFailure(`列出页面 ${pageId} 的子块`, result);
-    }
+    if (!result.ok) throw ntnFailure(`列出页面 ${pageId} 的子块`, result);
     const parsed = parseJsonMaybe(result.stdout);
     if (!isPlainObject(parsed)) {
-      if (!options.failOnUnreadable && children.length > 0) return children;
       // The child list is the ONLY evidence this guard has. An unparseable response
       // is "I could not enumerate", not "there are no children": treating it as empty
       // would approve a subtree delete blind, so refuse instead.
@@ -2448,7 +2499,7 @@ async function listChildPages(
           isPlainObject(block.child_page) && typeof block.child_page.title === "string"
             ? block.child_page.title
             : "(untitled)";
-        children.push({ id: block.id, title });
+        children.push({ id: block.id, label: title, kind: "page" });
         continue;
       }
       // An inline database is its own object with rows; it is archived with the page.
@@ -2457,7 +2508,7 @@ async function listChildPages(
           isPlainObject(block.child_database) && typeof block.child_database.title === "string"
             ? block.child_database.title
             : "(untitled database)";
-        children.push({ id: block.id, title });
+        children.push({ id: block.id, label: title, kind: "database" });
         continue;
       }
       // Only container types that can actually hold a page or database are walked.
@@ -2465,20 +2516,13 @@ async function listChildPages(
       // which would make ordinary pages permanently undeletable. Toggles, columns,
       // synced blocks and links can nest a page, so they are reported.
       if (block.has_children === true && NESTING_BLOCK_TYPES.has(String(block.type))) {
-        const type = String(block.type);
-        const payload = isPlainObject(block[type]) ? block[type] : undefined;
-        const title =
-          payload && typeof payload.title === "string"
-            ? payload.title
-            : `(${type} block with nested content)`;
-        children.push({ id: block.id, title });
+        children.push({ id: block.id, label: String(block.type), kind: "container" });
       }
     }
     const hasMore = parsed.has_more === true;
     const next = typeof parsed.next_cursor === "string" ? parsed.next_cursor : undefined;
     if (!hasMore) return children;
     if (!next) {
-      if (!options.failOnUnreadable && children.length > 0) return children;
       // More blocks exist but no cursor was offered: the enumeration is incomplete.
       throw inputError(PAGE_ERRORS.listChildPages_2({ pageId: pageId }),
         { id: pageId, enumerable: false }
@@ -2486,7 +2530,6 @@ async function listChildPages(
     }
     cursor = next;
     if (page === MAX_BLOCK_PAGES - 1) {
-      if (!options.failOnUnreadable && children.length > 0) return children;
       // Refuse rather than approve a delete over a subtree we could not enumerate.
       throw inputError(PAGE_ERRORS.listChildPages_3({ pageId: pageId, MAX_BLOCK_PAGES: MAX_BLOCK_PAGES }),
         { id: pageId, children_enumerated: children.length, enumerable: false }
@@ -2497,21 +2540,29 @@ async function listChildPages(
 }
 
 /**
- * Trash one page, with three guards that a bare `ntn pages trash` does not give us.
+ * Trash one page: the only operation in this file that cannot be undone by calling the tool
+ * again with different arguments.
  *
- *   1. A database or data source is refused outright: deleting one is far more
- *      destructive than deleting a page, so it stays a human decision.
+ *   1. A database or data source is refused outright: deleting one is far more destructive
+ *      than deleting a page, so it stays a human decision in Notion — a review cannot
+ *      authorize it.
  *   2. An already-archived page reports success instead of failing: Notion answers
- *      400 "Can't edit block that is archived", which reads like a fault and makes
- *      a retry look broken. Trash is naturally idempotent.
- *   3. A page with child pages is refused unless `recursive: true`, because Notion
- *      archives the whole subtree — the caller has to see what else would go.
+ *      400 "Can't edit block that is archived", which reads like a fault and makes a retry
+ *      look broken. Trash is naturally idempotent.
+ *   3. A page with child pages is NOT deleted here. The child list is read first, and the
+ *      call returns a `pending` value that states the exact scope; deleting needs a second
+ *      step (doublecheck) so the scope is seen before it is destroyed. A leaf page is
+ *      deleted by this one call — nothing else goes with it, so there is nothing to review.
  */
 async function trashPage(
-  params: { id: string; recursive: boolean },
-  runner: NtnRunner
-): Promise<PageToolValue> {
+  params: { id: string },
+  runner: NtnRunner,
+  deps: TrashDeps
+): Promise<PageToolValue | PendingValue> {
   const { id } = params;
+  const signal = (deps.exec as { signal?: AbortSignal } | undefined)?.signal;
+  if (signal?.aborted) throw abortError();
+
   const target = await classifyTrashTarget(runner, id);
   if (target.kind === "unreadable") {
     throw ntnFailure(`确认页面 ${id} 的类型（page / database / data source）`, {
@@ -2535,7 +2586,7 @@ async function trashPage(
     );
   }
 
-  if (target.kind === "page" && target.archived) {
+  if (target.archived) {
     // Nothing was written: the page was already in the trash. Saying "trashed" here
     // would claim an effect that did not happen and hide that from the caller.
     return pageValue({
@@ -2547,41 +2598,137 @@ async function trashPage(
     });
   }
 
-  if (target.kind === "page") {
-    const children = await listChildPages(runner, id, { failOnUnreadable: !params.recursive });
-    if (children.length > 0 && !params.recursive) {
-      // The child list MUST be in the message, not only in `details`: DSH drops
-      // `details` before the model sees the error (see NotionToolError), and the
-      // whole point of refusing is to show the caller what would go with the page.
-      // A container block (toggle/column_list/callout/…) is listed too, but labelled
-      // as such, because it is only *possibly* holding a nested page.
-      const listed = children
-        .slice(0, MAX_LISTED_CHILDREN)
-        .map((child) => {
-          const isContainer = child.title.endsWith("block with nested content)");
-          const kind = isContainer ? "嵌套容器" : "子页面";
-          return `  - [${kind}] ${child.title} — ${child.id}`;
-        })
-        .join("\n");
-      const overflow =
-        children.length > MAX_LISTED_CHILDREN
-          ? `\n  …另有 ${children.length - MAX_LISTED_CHILDREN} 个未列出（共 ${children.length} 个，完整列表见 Notion）。`
-          : "";
-      throw new InputError(PAGE_ERRORS.trashPage_3({ id: id, length: children.length, listed: listed, overflow: overflow }),
-        {
+  // The child list is the ONLY thing that can state the scope of this delete, so it is
+  // always read in full. "Could not enumerate" must never be treated as "no children".
+  const children = await listChildPages(runner, id);
+  const risk = children.length === 0 ? null : trashSubtreeRisk(id, target, children);
+
+  // Every execution passes the checkpoint, INCLUDING a null risk: a confirmed call is
+  // replayed with its original arguments, and only a fresh checkpoint lets doublecheck
+  // notice that the scope changed in the meantime (it then refuses the stale confirmation
+  // and asks for a new review instead of deleting a subtree nobody approved).
+  const pending = checkpoint({
+    service: readDoublecheck(deps.getDoublecheck ?? (() => undefined)),
+    exec: deps.exec,
+    risk,
+    // Only reached when child pages exist and there is no review channel: say what was
+    // found, because "nothing happened" alone would hide how much was at stake.
+    unavailable: () =>
+      new NotionToolError(PAGE_ERRORS.trashPage_3({ id: id, count: children.length }), {
+        code: NOTION_ERROR_CODES.reviewUnavailable,
+        details: {
           id,
           children: children.map((child) => child.id),
-          child_pages: children,
-          recursive_required: true,
-        }
-      );
-    }
-  }
+          children_count: children.length,
+        },
+      }),
+  });
+  if (pending) return pending;
 
+  // The review is not a transaction: this spawn still takes a moment, and a child page
+  // created in that window would be deleted without having been listed. Known residual,
+  // measured at ~1s; the alternative (a versioned pre-condition) is not offered by Notion.
+  if (signal?.aborted) throw abortError();
   const result = await runner({ args: ["pages", "trash", id, "--yes"] });
   if (!result.ok) throw ntnFailure("ntn pages trash", result);
 
   return pageValue({ id, url: pageUrl(id), properties: [], changed: ["trashed"] });
+}
+
+/** Dependencies of {@link trashPage}: the review channel plus the execution it belongs to. */
+type TrashDeps = {
+  /** The real DSH execution of this call; doublecheck validates the call identity against it. */
+  exec: unknown;
+  /** Reads the optional doublecheck service; absent = no review channel. */
+  getDoublecheck?: () => unknown;
+};
+
+/**
+ * The one risk a trash can carry: the page has children, so Notion takes the whole subtree.
+ *
+ * Everything in here is deterministic on purpose: the same page must produce a byte-identical
+ * snapshot on the retry that follows a confirmation, or doublecheck treats the risk as
+ * changed. That is why the children are sorted by id and nothing time-dependent is included.
+ */
+function trashSubtreeRisk(
+  id: string,
+  target: Extract<TrashTarget, { kind: "page" }>,
+  children: TrashChild[]
+): RiskSnapshot {
+  const ordered = [...children].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const reason = TRASH_CHECKS.subtree({
+    target: "页面",
+    title: truncate(target.title ?? id, MAX_LISTED_TITLE),
+    id,
+    count: ordered.length,
+    listed: ordered
+      .slice(0, MAX_LISTED_CHILDREN)
+      .map((child) =>
+        TRASH_CHECKS.childLine({
+          kind: child.kind,
+          label: truncate(child.label, MAX_LISTED_CHILD_TITLE),
+          id: child.id,
+        })
+      )
+      .join("\n"),
+    overflow:
+      ordered.length > MAX_LISTED_CHILDREN
+        ? TRASH_CHECKS.overflow({ rest: ordered.length - MAX_LISTED_CHILDREN, total: ordered.length })
+        : "",
+  });
+  return {
+    code: TRASH_RISK_CODES.subtree,
+    reason,
+    details: {
+      scope: "subtree",
+      tool: "notion_page_trash",
+      page_id: id,
+      ...(target.title === undefined ? {} : { page_title: target.title }),
+      ...(target.parent === undefined ? {} : { parent: target.parent }),
+      child_count: ordered.length,
+      children: ordered.slice(0, MAX_RISK_CHILDREN).map((child) => ({
+        kind: child.kind,
+        id: child.id,
+        title: child.label,
+      })),
+      children_truncated: ordered.length > MAX_RISK_CHILDREN,
+    },
+  };
+}
+
+/** Page title from `GET v1/pages/{id}`: the one property whose type is `title`. */
+function pageTitleOf(raw: JsonObject): string | undefined {
+  const properties = isPlainObject(raw.properties) ? raw.properties : undefined;
+  if (!properties) return undefined;
+  for (const value of Object.values(properties)) {
+    if (!isPlainObject(value) || value.type !== "title" || !Array.isArray(value.title)) continue;
+    const text = value.title
+      .map((part) => (isPlainObject(part) && typeof part.plain_text === "string" ? part.plain_text : ""))
+      .join("")
+      .trim();
+    return text === "" ? undefined : text;
+  }
+  return undefined;
+}
+
+/** Parent identity from `GET v1/pages/{id}`; a workspace-level page has no parent id. */
+function pageParentOf(raw: JsonObject): { type: string; id: string } | undefined {
+  const parent = isPlainObject(raw.parent) ? raw.parent : undefined;
+  if (!parent || typeof parent.type !== "string") return undefined;
+  const id = parent.type === "page_id" ? parent.page_id : parent.type === "database_id" ? parent.database_id : undefined;
+  return typeof id === "string" ? { type: parent.type, id } : undefined;
+}
+
+/** The model-facing body of a trash `pending`: not executed, what is at stake, how to answer. */
+function describeTrashPending(pending: PendingValue): string {
+  return [
+    TRASH_PENDING_TEXT.head,
+    pending.reason,
+    "",
+    TRASH_PENDING_TEXT.confirm({ id: pending.id }),
+    TRASH_PENDING_TEXT.cancel({ id: pending.id }),
+    TRASH_PENDING_TEXT.onlyParent({ id: pending.id }),
+  ].join("\n");
 }
 
 /* ------------------------------------------------------------------ *
@@ -2675,6 +2822,14 @@ const EDIT_PARAMETERS = {
   additionalProperties: false,
 };
 
+/**
+ * `notion_page_trash` takes ONE argument.
+ *
+ * There is deliberately no `yes`/`recursive`: the confirmation is the pending that a
+ * subtree delete returns, and it is answered in a later model step through double_check.
+ * A caller carrying the old parameters still works — `execute` ignores them instead of
+ * failing, because "I meant to confirm" is no longer something a parameter can express.
+ */
 const TRASH_PARAMETERS = {
   type: "object",
   properties: {
@@ -2682,16 +2837,8 @@ const TRASH_PARAMETERS = {
       type: "string",
       description: TRASH_PARAMS.id,
     },
-    yes: {
-      type: "boolean",
-      description: TRASH_PARAMS.yes,
-    },
-    recursive: {
-      type: "boolean",
-      description: TRASH_PARAMS.recursive,
-    },
   },
-  required: ["id", "yes"],
+  required: ["id"],
   additionalProperties: false,
 };
 
@@ -2735,6 +2882,36 @@ const PAGE_OUTPUT_SCHEMA = {
   },
   required: ["ok", "properties", "changed"],
   additionalProperties: false,
+};
+
+/**
+ * The value a gated delete returns instead of a success.
+ *
+ * It is NOT an error: nothing failed and nothing was written. It is returned as the
+ * canonical value so the model gets a structured `id` to answer with, and so
+ * `output.render` can say "not executed" in words.
+ */
+const TRASH_PENDING_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    kind: { type: "string", const: "pending" },
+    id: { type: "string" },
+    reason: { type: "string" },
+    details: { description: TRASH_PENDING_OUTPUT_TEXT.details },
+  },
+  required: ["kind", "id", "reason"],
+  additionalProperties: false,
+};
+
+/**
+ * Trash can end in either shape, so its schema is a `oneOf`.
+ *
+ * The branches cannot overlap: a success always carries `ok`/`properties`/`changed`
+ * (which the pending forbids), and a pending always carries `kind`/`reason` (which the
+ * success forbids). Create and edit keep the plain success schema — they never pend.
+ */
+const TRASH_OUTPUT_SCHEMA = {
+  oneOf: [PAGE_OUTPUT_SCHEMA, TRASH_PENDING_OUTPUT_SCHEMA],
 };
 
 /* ------------------------------------------------------------------ *
@@ -2853,38 +3030,45 @@ export function createNotionPageEditTool(deps: NotionPageDeps = {}): NotionTool<
   });
 }
 
-/** `notion_page_trash` — delete one page (or row), with the three guards. */
-export function createNotionPageTrashTool(deps: NotionPageDeps = {}): NotionTool<PageToolValue> {
+/** `notion_page_trash` — delete one page (or row); a subtree delete needs a second step. */
+export function createNotionPageTrashTool(deps: NotionPageDeps = {}): NotionTool<PageToolValue | PendingValue> {
   const runner: NtnRunner = deps.runNtn ?? runNtn;
 
-  return defineNotionTool<PageToolValue>({
+  return defineNotionTool<PageToolValue | PendingValue>({
     name: "notion_page_trash",
     description: TOOL_DESCRIPTIONS.pageTrash,
     timeoutMs: TOOL_TIMEOUTS.page,
     isConcurrencySafe: () => false,
     parameters: TRASH_PARAMETERS as unknown as JsonObject,
     output: {
-      schema: PAGE_OUTPUT_SCHEMA as unknown as JsonObject,
-      render: (_args, value) => textBlocks(describePageValue(value)),
+      schema: TRASH_OUTPUT_SCHEMA as unknown as JsonObject,
+      render: (_args, value) =>
+        textBlocks(isPendingValue(value) ? describeTrashPending(value) : describePageValue(value)),
     },
 
     async execute(args, exec) {
+      // `yes` / `recursive` are the previous version's parameters. They are accepted and
+      // IGNORED rather than rejected: a model carrying the old contract would otherwise
+      // burn a round trip on INVALID_INPUT for something it cannot express any more, and
+      // "I meant to confirm" is exactly what the pending now asks it to say out loud.
       rejectUnexpectedParams(
         args,
         ["id", "yes", "recursive"],
-        "notion_page_trash 只接受 { id, yes, recursive }。"
+        "notion_page_trash 只接受 { id }（yes/recursive 已不再需要，传了也会被忽略）。"
       );
       if (exec.signal?.aborted) throw abortError();
-      if (args.yes === undefined || !readBoolean(args.yes, "yes")) {
-        throw new InputError(PAGE_ERRORS.createNotionPageTrashTool_1,
-          { yes: args.yes }
-        );
-      }
-      const params = {
-        id: requireId(args.id, "trash"),
-        recursive: args.recursive === undefined ? false : readBoolean(args.recursive, "recursive"),
-      };
-      return await trashPage(params, bindSignal(runner, exec.signal));
+
+      return await trashPage(
+        { id: requireId(args.id, "trash") },
+        bindSignal(runner, exec.signal),
+        { exec, getDoublecheck: deps.getDoublecheck }
+      );
     },
   });
 }
+
+/** Narrow a trash value to the pending branch (the success branch has `ok`, this has `kind`). */
+function isPendingValue(value: PageToolValue | PendingValue): value is PendingValue {
+  return (value as { kind?: unknown }).kind === "pending";
+}
+
