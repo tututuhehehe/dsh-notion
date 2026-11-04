@@ -1745,6 +1745,23 @@ describe("notion_page_trash: a page with children is NOT deleted by the call tha
     assert.equal(risk.details.child_count, 24);
   });
 
+  it("keeps the risk snapshot inside doublecheck's JSON and size limits", async () => {
+    // doublecheck snapshots the risk with a lossless-JSON walk (no undefined, no accessor,
+    // no cycles) and refuses anything over 32 KiB. This is the contract at the boundary:
+    // a snapshot it cannot store turns into a fail-closed error instead of a review.
+    const dc = fakeDoublecheck(echoRisk);
+    const { tool } = trashHarness(withChildren(), dc.get);
+    await tool.execute("t-json", { id: EDIT_PAGE_ID });
+
+    const risk = dc.seen[0]!.risk;
+    assert.ok(risk.code.length <= 160);
+    assert.ok(risk.reason.length <= 2048);
+    const json = JSON.stringify(risk);
+    assert.deepEqual(JSON.parse(json), risk, "the risk must survive a JSON round trip unchanged");
+    assert.ok(Buffer.byteLength(json) <= 32768, `risk was ${Buffer.byteLength(json)} bytes`);
+    assert.doesNotMatch(json, /undefined/);
+  });
+
   it("fails closed when the review channel is missing", async () => {
     const { tool, calls } = trashHarness(withChildren());
     const result = await tool.execute("t-nodc", { id: EDIT_PAGE_ID });
